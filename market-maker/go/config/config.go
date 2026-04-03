@@ -55,6 +55,13 @@ type Config struct {
 	FlattenAggression float64
 	DryRun            bool
 
+	// ── Adaptive spread ───────────────────────────────────────────────────────
+	AutoSpread         bool
+	SpreadMin          float64
+	SpreadMax          float64
+	SpreadNoFillCycles int
+	SpreadStep         float64
+
 	// ── Credentials / addresses ───────────────────────────────────────────────
 	BearerToken             string
 	SubaccountAddress       string
@@ -97,6 +104,12 @@ func Load() (*Config, error) {
 		FlattenAggression: envFloat("FLATTEN_AGGRESSION", 0.001),
 		DryRun:            envBool("DRY_RUN", false),
 
+		AutoSpread:         envBool("AUTO_SPREAD", false),
+		SpreadMin:          envFloat("SPREAD_MIN", 0.0004),
+		SpreadMax:          envFloat("SPREAD_MAX", 0.02),
+		SpreadNoFillCycles: int(envFloat("SPREAD_NO_FILL_CYCLES", 3)),
+		SpreadStep:         envFloat("SPREAD_STEP", 0.0002),
+
 		BearerToken:             os.Getenv("BEARER_TOKEN"),
 		SubaccountAddress:       os.Getenv("SUBACCOUNT_ADDRESS"),
 		PrivateKey:              os.Getenv("PRIVATE_KEY"),
@@ -125,6 +138,11 @@ func Load() (*Config, error) {
 	flag.BoolVar(&cfg.AutoFlatten, "auto-flatten", cfg.AutoFlatten, "Auto reduce-only order when inventory hits limit")
 	flag.Float64Var(&cfg.FlattenAggression, "flatten-aggression", cfg.FlattenAggression, "Flatten order price offset from mid")
 	flag.BoolVar(&cfg.DryRun, "dry-run", cfg.DryRun, "Log without sending transactions")
+	flag.BoolVar(&cfg.AutoSpread, "auto-spread", cfg.AutoSpread, "Automatically narrow spread after spread-no-fill-cycles cycles with no fill")
+	flag.Float64Var(&cfg.SpreadMin, "spread-min", cfg.SpreadMin, "Minimum spread the auto-adjuster will narrow to")
+	flag.Float64Var(&cfg.SpreadMax, "spread-max", cfg.SpreadMax, "Maximum spread ceiling")
+	flag.IntVar(&cfg.SpreadNoFillCycles, "spread-no-fill-cycles", cfg.SpreadNoFillCycles, "Cycles without fill before adjusting spread")
+	flag.Float64Var(&cfg.SpreadStep, "spread-step", cfg.SpreadStep, "Amount to narrow spread per adjustment step")
 	flag.StringVar(&cfg.PackageAddress, "package-address", cfg.PackageAddress, "Move package address (overrides network profile)")
 	flag.StringVar(&cfg.AptosFullnodeURL, "fullnode-url", cfg.AptosFullnodeURL, "Aptos fullnode URL (overrides network profile)")
 	flag.StringVar(&cfg.RestAPIBase, "api-base", cfg.RestAPIBase, "Decibel REST API base URL (overrides network profile)")

@@ -98,6 +98,29 @@ pub struct Args {
     #[arg(long, env = "DRY_RUN", default_value_t = false)]
     pub dry_run: bool,
 
+    // ── Adaptive spread ───────────────────────────────────────────────────────
+
+    /// Automatically narrow spread when no fills occur for spread_no_fill_cycles cycles.
+    /// When false, only log a suggestion without changing anything.
+    #[arg(long, env = "AUTO_SPREAD", default_value_t = false)]
+    pub auto_spread: bool,
+
+    /// Minimum spread the auto-adjuster will narrow down to (fraction)
+    #[arg(long, env = "SPREAD_MIN", default_value_t = 0.0004)]
+    pub spread_min: f64,
+
+    /// Maximum spread the auto-adjuster will widen up to (fraction); also the reset ceiling
+    #[arg(long, env = "SPREAD_MAX", default_value_t = 0.02)]
+    pub spread_max: f64,
+
+    /// Consecutive cycles with no fill before narrowing spread by one step
+    #[arg(long, env = "SPREAD_NO_FILL_CYCLES", default_value_t = 3u32)]
+    pub spread_no_fill_cycles: u32,
+
+    /// Amount to narrow spread per adjustment step (fraction)
+    #[arg(long, env = "SPREAD_STEP", default_value_t = 0.0002)]
+    pub spread_step: f64,
+
     // ── Credentials / addresses ───────────────────────────────────────────────
 
     /// REST API bearer token

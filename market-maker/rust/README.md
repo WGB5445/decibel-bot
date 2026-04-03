@@ -44,12 +44,12 @@ You can mix all three — e.g. keep credentials in `.env` and tweak trading para
 **Testnet defaults**
 - REST API: `https://api.testnet.aptoslabs.com/decibel/api/v1`
 - Fullnode: `https://api.testnet.aptoslabs.com/v1`
-- Package: `0x952535c3049e52f195f26798c2f1340d7dd5100edbe0f464e520a974d16fbe9f`
+- Package: `0xe7da2794b1d8af76532ed95f38bfdf1136abfd8ea3a240189971988a83101b7f`
 
 **Mainnet defaults**
 - REST API: `https://api.mainnet.aptoslabs.com/decibel/api/v1`
 - Fullnode: `https://api.mainnet.aptoslabs.com/v1`
-- Package: `0xb8a5788314451ce4d2fbbad32e1bad88d4184b73943b7fe5166eab93cf1a5a95`
+- Package: `0x2a4e9bee4b09f5b8e9c996a489c6993abe1e9e45e61e81bb493e38e53a3e7e3d`
 
 ---
 
@@ -69,6 +69,20 @@ You can mix all three — e.g. keep credentials in `.env` and tweak trading para
 | `AUTO_FLATTEN` | `--auto-flatten` | `false` | When `true`, automatically place a reduce-only GTC order to cut inventory when `MAX_INVENTORY` is hit. |
 | `FLATTEN_AGGRESSION` | `--flatten-aggression` | `0.001` | Price offset from mid for the flatten order, as a fraction. `0.001` = 0.1% through mid. |
 | `DRY_RUN` | `--dry-run` | `false` | Log all actions without submitting any on-chain transactions. Use this to verify configuration before going live. |
+
+---
+
+### Adaptive spread (auto-tuning)
+
+When enabled, the bot automatically adjusts spread based on fill activity.
+
+| Env var | CLI flag | Default | Description |
+|---------|----------|---------|-------------|
+| `AUTO_SPREAD` | `--auto-spread` | `false` | When `true`, automatically narrow the spread after `SPREAD_NO_FILL_CYCLES` consecutive cycles with no fill. Also widens slightly (up to the initial `SPREAD`) when a fill is detected. When `false`, only logs a suggestion without changing anything. |
+| `SPREAD_MIN` | `--spread-min` | `0.0004` | Minimum spread the auto-adjuster will narrow down to (fraction). **Do not set below 0.0004 (0.04%) to avoid posting at a loss on volatile markets.** |
+| `SPREAD_MAX` | `--spread-max` | `0.02` | Maximum spread the auto-adjuster will widen up to (fraction). Also used as the reset ceiling on fill. |
+| `SPREAD_NO_FILL_CYCLES` | `--spread-no-fill-cycles` | `3` | Number of consecutive cycles with no detected fill before narrowing spread by one step. |
+| `SPREAD_STEP` | `--spread-step` | `0.0002` | Amount (fraction) to narrow spread per adjustment step. On fill, widens by `SPREAD_STEP * 0.5`. |
 
 ---
 

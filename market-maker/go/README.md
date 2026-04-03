@@ -79,6 +79,20 @@ You can mix all three — e.g. keep credentials in `.env` and tweak trading para
 
 ---
 
+### Adaptive spread (auto-tuning)
+
+When enabled, the bot automatically adjusts spread based on fill activity.
+
+| Env var | CLI flag | Default | Description |
+|---------|----------|---------|-------------|
+| `AUTO_SPREAD` | `-auto-spread` | `false` | When `true`, automatically narrow the spread after `SPREAD_NO_FILL_CYCLES` consecutive cycles with no fill. Also widens slightly (up to the initial `SPREAD`) when a fill is detected. When `false`, only logs a suggestion without changing anything. |
+| `SPREAD_MIN` | `-spread-min` | `0.0004` | Minimum spread the auto-adjuster will narrow down to (fraction). **Do not set below 0.0004 (0.04%) to avoid posting at a loss on volatile markets.** |
+| `SPREAD_MAX` | `-spread-max` | `0.02` | Maximum spread the auto-adjuster will widen up to (fraction). Also used as the reset ceiling on fill. |
+| `SPREAD_NO_FILL_CYCLES` | `-spread-no-fill-cycles` | `3` | Number of consecutive cycles with no detected fill before narrowing spread by one step. |
+| `SPREAD_STEP` | `-spread-step` | `0.0002` | Amount (fraction) to narrow spread per adjustment step. On fill, widens by `SPREAD_STEP * 0.5`. |
+
+---
+
 ### Optional overrides
 
 These override the values set by `NETWORK`. Leave unset to use the network profile defaults.

@@ -51,10 +51,12 @@ func Run(ctx context.Context, cfg *config.Config) error {
 	)
 
 	b := &bot{
-		cfg:    cfg,
-		api:    apiClient,
-		aptos:  aptosClient,
-		market: market,
+		cfg:             cfg,
+		api:             apiClient,
+		aptos:           aptosClient,
+		market:          market,
+		effectiveSpread: cfg.Spread,
+		firstCycle:      true,
 	}
 	return b.runLoop(ctx)
 }
@@ -66,6 +68,11 @@ type bot struct {
 	api    *api.Client
 	aptos  *aptos.Client
 	market *api.MarketConfig
+	// adaptive spread state
+	effectiveSpread float64
+	lastInventory   float64
+	noFillCycles    int
+	firstCycle      bool
 }
 
 func (b *bot) runLoop(ctx context.Context) error {
@@ -105,7 +112,47 @@ func (b *bot) runCycle(ctx context.Context) error {
 		"mid", midStr,
 	)
 
-	// ── 2. Risk guard: margin ─────────────────────────────────────────────────
+	// ── 2. Adaptive spread: fill detection ───────────────────────────────────
+	if !b.firstCycle {
+		invChange := math.Abs(state.Inventory - b.lastInventory)
+		fillDetected := invChange > b.market.LotSize*0.5
+		if fillDetected {
+			// Fill happened — spread is working; widen slightly back toward initial
+			b.noFillCycles = 0
+			newSpread := math.Min(b.effectiveSpread+b.cfg.SpreadStep*0.5, b.cfg.Spread)
+			if newSpread > b.effectiveSpread {
+				b.effectiveSpread = newSpread
+				slog.Info("fill detected, spread widened slightly",
+					"inv_change", invChange, "spread", b.effectiveSpread)
+			} else {
+				slog.Info("fill detected", "inv_change", invChange, "spread", b.effectiveSpread)
+			}
+		} else {
+			b.noFillCycles++
+			if b.noFillCycles >= b.cfg.SpreadNoFillCycles {
+				suggested := math.Max(b.effectiveSpread-b.cfg.SpreadStep, b.cfg.SpreadMin)
+				if suggested < b.effectiveSpread {
+					if b.cfg.AutoSpread {
+						b.effectiveSpread = suggested
+						b.noFillCycles = 0
+						slog.Warn("auto-spread narrowed (no fill)",
+							"spread", b.effectiveSpread,
+							"no_fill_cycles", b.cfg.SpreadNoFillCycles)
+					} else {
+						slog.Warn("suggestion: spread may be too wide",
+							"current_spread", b.effectiveSpread,
+							"suggested_spread", suggested,
+							"no_fill_cycles", b.noFillCycles,
+							"tip", "add --auto-spread to automate")
+					}
+				}
+			}
+		}
+	}
+	b.lastInventory = state.Inventory
+	b.firstCycle = false
+
+	// ── 3. Risk guard: margin ─────────────────────────────────────────────────
 	if state.MarginUsage > b.cfg.MaxMarginUsage {
 		slog.Warn("PAUSED: margin usage too high",
 			"margin_usage", state.MarginUsage,
@@ -125,7 +172,7 @@ func (b *bot) runCycle(ctx context.Context) error {
 	quotes, err := pricing.ComputeQuotes(
 		mid,
 		state.Inventory,
-		b.cfg.Spread,
+		b.effectiveSpread,
 		b.cfg.SkewPerUnit,
 		b.cfg.MaxInventory,
 		b.market.TickSize,

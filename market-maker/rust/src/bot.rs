@@ -78,12 +78,17 @@ pub async fn run(args: Args) -> Result<()> {
         "Market config loaded"
     );
 
-    let bot = MarketMaker {
+    let initial_spread = args.spread;
+    let mut bot = MarketMaker {
         args,
         api,
         aptos,
         market_cfg,
         package_address,
+        effective_spread: initial_spread,
+        last_inventory: 0.0,
+        no_fill_cycles: 0,
+        first_cycle: true,
     };
 
     bot.run_loop().await
@@ -100,11 +105,20 @@ struct MarketMaker {
     market_cfg: MarketConfig,
     /// Resolved Move package address (from network profile or explicit override).
     package_address: String,
+    // ── Adaptive spread state ─────────────────────────────────────────────────
+    /// Current effective spread (may differ from args.spread when auto_spread is on).
+    effective_spread: f64,
+    /// Inventory observed at end of previous cycle (for fill detection).
+    last_inventory: f64,
+    /// Consecutive cycles without a detected fill.
+    no_fill_cycles: u32,
+    /// Skip fill detection on the very first cycle.
+    first_cycle: bool,
 }
 
 impl MarketMaker {
     /// Main infinite loop.  Errors inside a cycle are logged but do not exit.
-    async fn run_loop(&self) -> Result<()> {
+    async fn run_loop(&mut self) -> Result<()> {
         let mut cycle: u64 = 1;
         loop {
             info!(cycle, "─── Cycle start ───────────────────────────────────");
@@ -118,7 +132,7 @@ impl MarketMaker {
     }
 
     /// Single cycle: fetch → guard → quote → cancel → place.
-    async fn run_cycle(&self) -> Result<()> {
+    async fn run_cycle(&mut self) -> Result<()> {
         // ── 1. Parallel state fetch ───────────────────────────────────────────
         let state = self
             .api
@@ -134,7 +148,48 @@ impl MarketMaker {
             "State snapshot"
         );
 
-        // ── 2. Risk guard: margin ─────────────────────────────────────────────
+        // ── 2. Adaptive spread: fill detection ───────────────────────────────
+        if !self.first_cycle {
+            let inv_change = (state.inventory - self.last_inventory).abs();
+            let fill_detected = inv_change > self.market_cfg.lot_size * 0.5;
+            if fill_detected {
+                info!(
+                    inv_change,
+                    effective_spread = self.effective_spread,
+                    "Fill detected — spread is working"
+                );
+                self.no_fill_cycles = 0;
+            } else {
+                self.no_fill_cycles += 1;
+                let suggested = (self.effective_spread - self.args.spread_step)
+                    .max(self.args.spread_min);
+                if self.no_fill_cycles >= self.args.spread_no_fill_cycles
+                    && suggested < self.effective_spread
+                {
+                    if self.args.auto_spread {
+                        self.effective_spread = suggested;
+                        self.no_fill_cycles = 0;
+                        warn!(
+                            spread = self.effective_spread,
+                            "Auto-spread: narrowed (no fill for {} cycles)",
+                            self.args.spread_no_fill_cycles
+                        );
+                    } else {
+                        warn!(
+                            current_spread  = self.effective_spread,
+                            suggested_spread = suggested,
+                            no_fill_cycles  = self.no_fill_cycles,
+                            "Suggestion: spread may be too wide — consider narrowing \
+                             (add --auto-spread to automate)"
+                        );
+                    }
+                }
+            }
+        }
+        self.last_inventory = state.inventory;
+        self.first_cycle = false;
+
+        // ── 3. Risk guard: margin ─────────────────────────────────────────────
         if state.margin_usage > self.args.max_margin_usage {
             warn!(
                 margin_usage = state.margin_usage,
@@ -157,7 +212,7 @@ impl MarketMaker {
         let quotes = match compute_quotes(
             mid,
             state.inventory,
-            self.args.spread,
+            self.effective_spread,
             self.args.skew_per_unit,
             self.args.max_inventory,
             self.market_cfg.tick_size,
