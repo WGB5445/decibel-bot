@@ -1,5 +1,9 @@
 # Decibel Market Maker — Rust
 
+> **Note:** Pre-built binaries for Rust are temporarily unavailable in CI releases.
+> The source code is fully functional — build manually with `cargo build --release`.
+> Go binaries are available on the [releases page](../../releases).
+
 A perpetual-futures market-maker bot for the [Decibel DEX](https://decibel.trade) on Aptos.
 
 ## Quick start
