@@ -1,0 +1,246 @@
+name: Release
+
+# Trigger manually from the GitHub Actions tab.
+# Select a component folder and enter a version tag (e.g. v1.0.0).
+# The workflow builds Go + Rust binaries for 5 platforms, then publishes
+# a GitHub Release with all binaries and a SHA256SUMS checksum file.
+on:
+  workflow_dispatch:
+    inputs:
+      folder:
+        description: 'Component to release'
+        required: true
+        default: 'market-maker'
+        type: choice
+        options:
+          - market-maker
+      version:
+        description: 'Version tag (e.g. v1.0.0)'
+        required: true
+        type: string
+
+# Full tag written to git will be: {folder}/{version}  e.g. market-maker/v1.0.0
+# This lets each component in the monorepo version independently.
+
+jobs:
+  # ────────────────────────────────────────────────────────────────────────────
+  # Build job — runs once per target platform
+  # ────────────────────────────────────────────────────────────────────────────
+  build:
+    name: Build (${{ matrix.suffix }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # ── Linux x86-64 (static musl) ──────────────────────────────────────
+          - os: ubuntu-latest
+            go_os: linux
+            go_arch: amd64
+            rust_target: x86_64-unknown-linux-musl
+            suffix: linux-amd64
+
+          # ── Linux ARM64 (static musl, cross-compiled) ───────────────────────
+          - os: ubuntu-latest
+            go_os: linux
+            go_arch: arm64
+            rust_target: aarch64-unknown-linux-musl
+            suffix: linux-arm64
+            use_cross: 'true'
+
+          # ── macOS Intel ─────────────────────────────────────────────────────
+          - os: macos-13
+            go_os: darwin
+            go_arch: amd64
+            rust_target: x86_64-apple-darwin
+            suffix: darwin-amd64
+
+          # ── macOS Apple Silicon ─────────────────────────────────────────────
+          - os: macos-latest
+            go_os: darwin
+            go_arch: arm64
+            rust_target: aarch64-apple-darwin
+            suffix: darwin-arm64
+
+          # ── Windows x86-64 ──────────────────────────────────────────────────
+          - os: windows-latest
+            go_os: windows
+            go_arch: amd64
+            rust_target: x86_64-pc-windows-msvc
+            suffix: windows-amd64
+            ext: .exe
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # ── Go binary ────────────────────────────────────────────────────────────
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: ${{ inputs.folder }}/go/go.mod
+          cache-dependency-path: ${{ inputs.folder }}/go/go.sum
+
+      - name: Build Go binary
+        shell: bash
+        working-directory: ${{ inputs.folder }}/go
+        env:
+          GOOS: ${{ matrix.go_os }}
+          GOARCH: ${{ matrix.go_arch }}
+          CGO_ENABLED: '0'
+        run: |
+          EXT="${{ matrix.ext }}"
+          go build \
+            -ldflags="-s -w -X main.version=${{ inputs.version }}" \
+            -o "decibel-mm-go-${{ matrix.suffix }}${EXT}" \
+            .
+
+      # ── Rust binary ──────────────────────────────────────────────────────────
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.rust_target }}
+
+      # cross is only needed for the Linux ARM64 job (cross-compilation)
+      - uses: taiki-e/install-action@v2
+        if: matrix.use_cross == 'true'
+        with:
+          tool: cross
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ${{ inputs.folder }}/rust
+
+      - name: Build Rust binary
+        shell: bash
+        working-directory: ${{ inputs.folder }}/rust
+        run: |
+          if [ "${{ matrix.use_cross }}" = "true" ]; then
+            cross build --release --target ${{ matrix.rust_target }}
+          else
+            cargo build --release --target ${{ matrix.rust_target }}
+          fi
+
+      # ── Stage both binaries as artifacts ─────────────────────────────────────
+      - name: Stage artifacts
+        shell: bash
+        run: |
+          mkdir -p dist
+          EXT="${{ matrix.ext }}"
+          # Go binary (built in the go/ subdirectory)
+          cp "${{ inputs.folder }}/go/decibel-mm-go-${{ matrix.suffix }}${EXT}" dist/
+          # Rust binary (in target/<triple>/release/)
+          cp "${{ inputs.folder }}/rust/target/${{ matrix.rust_target }}/release/decibel-mm${EXT}" \
+             "dist/decibel-mm-rust-${{ matrix.suffix }}${EXT}"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: binaries-${{ matrix.suffix }}
+          path: dist/
+          retention-days: 1
+
+  # ────────────────────────────────────────────────────────────────────────────
+  # Release job — collects artifacts and publishes to GitHub Releases
+  # ────────────────────────────────────────────────────────────────────────────
+  release:
+    name: Create GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write   # required to create tags and releases
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: binaries-*
+          merge-multiple: true
+          path: dist/
+
+      - name: Generate SHA256 checksums
+        working-directory: dist
+        run: sha256sum * | tee SHA256SUMS.txt
+
+      - name: List release assets
+        run: ls -lh dist/
+
+      # Derive a clean display name from the folder input
+      # e.g. "market-maker" → "Market Maker"
+      - name: Set release metadata
+        id: meta
+        run: |
+          FOLDER="${{ inputs.folder }}"
+          DISPLAY=$(echo "$FOLDER" | sed 's/-/ /g; s/\b\(.\)/\u\1/g')
+          echo "display=${DISPLAY}" >> "$GITHUB_OUTPUT"
+          echo "tag=${FOLDER}/${{ inputs.version }}" >> "$GITHUB_OUTPUT"
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.meta.outputs.tag }}
+          name: "${{ steps.meta.outputs.display }} ${{ inputs.version }}"
+          files: dist/*
+          generate_release_notes: true
+          body: |
+            ## Decibel Market Maker Bot ${{ inputs.version }}
+
+            全自动做市商机器人，为 [Decibel DEX](https://decibel.markets) 永续合约市场提供双边报价。
+            Automated market-maker bot for perpetual futures on Decibel DEX (Aptos blockchain).
+
+            ### 功能亮点 / Highlights
+
+            - **双语言实现 / Dual implementation** — Go 和 Rust 两个版本逻辑完全一致，按喜好选择
+            - **库存偏斜定价 / Inventory-skew pricing** — 根据持仓自动调整报价中心，鼓励仓位均值回归
+            - **自适应价差 / Adaptive spread** — 无成交时自动收窄价差，成交后自动放宽
+            - **Dry-run 模式** — 无需真实交易即可验证配置
+            - **支持 testnet / mainnet**，一键切换
+
+            ---
+
+            ### 下载说明 / Download
+
+            每个平台提供两个二进制文件（Go 版和 Rust 版），功能完全相同，选其一即可：
+
+            | 文件名 / File | 平台 / Platform | 语言 |
+            |---|---|---|
+            | `decibel-mm-go-linux-amd64` | Linux x86-64 | Go |
+            | `decibel-mm-rust-linux-amd64` | Linux x86-64 | Rust |
+            | `decibel-mm-go-linux-arm64` | Linux ARM64 | Go |
+            | `decibel-mm-rust-linux-arm64` | Linux ARM64 | Rust |
+            | `decibel-mm-go-darwin-amd64` | macOS Intel | Go |
+            | `decibel-mm-rust-darwin-amd64` | macOS Intel | Rust |
+            | `decibel-mm-go-darwin-arm64` | macOS Apple Silicon | Go |
+            | `decibel-mm-rust-darwin-arm64` | macOS Apple Silicon | Rust |
+            | `decibel-mm-go-windows-amd64.exe` | Windows x86-64 | Go |
+            | `decibel-mm-rust-windows-amd64.exe` | Windows x86-64 | Rust |
+
+            Linux 二进制使用静态 musl 编译，无需任何运行时依赖。
+
+            ---
+
+            ### 快速开始 / Quick Start
+
+            ```bash
+            # 1. 下载对应平台的二进制文件并赋予执行权限 (Linux/macOS)
+            chmod +x decibel-mm-go-linux-amd64
+
+            # 2. 创建配置文件
+            cp .env.example .env
+            # 填写: BEARER_TOKEN, SUBACCOUNT_ADDRESS, PRIVATE_KEY, PERP_ENGINE_GLOBAL_ADDRESS
+
+            # 3. 先用 dry-run 模式验证配置（不会发送真实交易）
+            ./decibel-mm-go-linux-amd64 -dry-run          # Go 版
+            ./decibel-mm-rust-linux-amd64 --dry-run       # Rust 版
+
+            # 4. 确认无误后去掉 dry-run 正式运行
+            ./decibel-mm-go-linux-amd64
+            ```
+
+            详细参数说明请参阅 `market-maker/做市参数调优指南.md`。
+
+            ---
+
+            ### 校验文件完整性 / Verify Integrity
+
+            ```bash
+            sha256sum -c SHA256SUMS.txt
+            ```
