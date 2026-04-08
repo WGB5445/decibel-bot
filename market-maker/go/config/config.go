@@ -214,8 +214,9 @@ func (c *Config) validate() error {
 
 // ParsePrivateKey decodes and validates the 32-byte Ed25519 seed.
 // Supported inputs:
-//  - raw hex (with or without 0x prefix)
-//  - AIP-80 formatted keys: ed25519-priv-<hex> or secp256k1-priv-<hex>
+//   - raw hex (with or without 0x prefix)
+//   - AIP-80 formatted keys: ed25519-priv-<hex> or secp256k1-priv-<hex>
+//
 // For ed25519 (or unspecified) the first 32 bytes are returned as the seed.
 // secp256k1 keys are recognised but not usable for signing in this client.
 func (c *Config) ParsePrivateKey() ([32]byte, error) {

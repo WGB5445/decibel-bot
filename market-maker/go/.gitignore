@@ -4,3 +4,23 @@
 *.tmp
 bin/
 vendor/
+# Local credential files
+.env
+.env.local
+.env.*
+
+# Binary artifacts
+*.exe
+
+# Editor directories
+.vscode/
+.idea/
+
+# Keys and certs
+*.pem
+*.key
+*.p12
+
+# Swap / temp files
+*.swp
+*.swo
