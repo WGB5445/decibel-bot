@@ -30,7 +30,7 @@ var networkProfiles = map[string]NetworkProfile{
 	"mainnet": {
 		RestAPIBase:      "https://api.mainnet.aptoslabs.com/decibel/api/v1",
 		AptosFullnodeURL: "https://api.mainnet.aptoslabs.com/v1",
-		PackageAddress:   "0x2a4e9bee4b09f5b8e9c996a489c6993abe1e9e45e61e81bb493e38e53a3e7e3d",
+		PackageAddress:   "0x50ead22afd6ffd9769e3b3d6e0e64a2a350d68e8b102c4e72e33d0b8cfdfdb06",
 	},
 }
 
