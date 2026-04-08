@@ -43,11 +43,11 @@ func (r *TxResult) CancelSucceeded() bool {
 
 // Client signs and submits Aptos entry-function transactions.
 type Client struct {
-	http           *http.Client
-	baseURL        string
-	apiKey         string
-	privKey        ed25519.PrivateKey
-	senderAddress  string
+	http          *http.Client
+	baseURL       string
+	apiKey        string
+	privKey       ed25519.PrivateKey
+	senderAddress string
 }
 
 // NewClient derives the sender address from the 32-byte private key seed.
@@ -188,7 +188,7 @@ func (c *Client) SubmitEntryFunction(
 	unsignedTx := map[string]any{
 		"sender":                    c.senderAddress,
 		"sequence_number":           fmt.Sprintf("%d", seqNum),
-		"max_gas_amount":            "200000",
+		"max_gas_amount":            "20000",
 		"gas_unit_price":            fmt.Sprintf("%d", gasPrice),
 		"expiration_timestamp_secs": fmt.Sprintf("%d", expiry),
 		"payload": map[string]any{

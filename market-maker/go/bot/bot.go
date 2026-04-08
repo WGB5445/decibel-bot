@@ -289,17 +289,19 @@ func (b *bot) cancelSingleOrder(ctx context.Context, orderID string) error {
 	}
 
 	result, err := b.aptos.SubmitEntryFunction(ctx, fn, nil, []any{
-		b.cfg.SubaccountAddress,  // 1. subaccount_addr
-		orderID,                  // 2. order_id (u128 as string)
-		b.market.MarketAddr,      // 3. market_addr
+		b.cfg.SubaccountAddress, // 1. subaccount_addr
+		orderID,                 // 2. order_id (u128 as string)
+		b.market.MarketAddr,     // 3. market_addr
 	})
 	if err != nil {
+		slog.Error("cancel transaction failed", "order_id", orderID, "err", err, "sender", b.aptos.SenderAddress())
 		return err
 	}
 	if !result.CancelSucceeded() {
+		slog.Error("cancel rejected", "order_id", orderID, "vm_status", result.VMStatus, "sender", b.aptos.SenderAddress())
 		return fmt.Errorf("cancel rejected: vm_status=%s", result.VMStatus)
 	}
-	slog.Debug("cancel accepted", "order_id", orderID, "vm_status", result.VMStatus)
+	slog.Debug("cancel accepted", "order_id", orderID, "vm_status", result.VMStatus, "sender", b.aptos.SenderAddress())
 	return nil
 }
 
@@ -333,12 +335,23 @@ func (b *bot) placePostOnlyOrder(ctx context.Context, price, size float64, isBuy
 		),
 	)
 	if err != nil {
+		slog.Error("place order submit failed",
+			"side", side, "price", price, "size", size,
+			"price_int", priceInt, "size_int", sizeInt,
+			"err", err, "sender", b.aptos.SenderAddress(),
+		)
 		return err
 	}
 	if !result.Success {
+		slog.Error("place order rejected",
+			"side", side, "price", price, "size", size,
+			"vm_status", result.VMStatus, "tx_hash", result.Hash, "sender", b.aptos.SenderAddress(),
+		)
 		return fmt.Errorf("place order failed: side=%s vm_status=%s", side, result.VMStatus)
 	}
-	slog.Info("order placed", "side", side, "price", price, "size", size, "tx_hash", result.Hash)
+	slog.Info("order placed",
+		"side", side, "price", price, "size", size, "tx_hash", result.Hash, "sender", b.aptos.SenderAddress(),
+	)
 	return nil
 }
 
@@ -390,12 +403,20 @@ func (b *bot) placeFlattenOrder(ctx context.Context, inventory, mid float64) err
 		),
 	)
 	if err != nil {
+		slog.Error("flatten submit failed",
+			"side", side, "price", rawPrice, "size", size,
+			"err", err, "sender", b.aptos.SenderAddress(),
+		)
 		return err
 	}
 	if !result.Success {
+		slog.Error("flatten order rejected",
+			"side", side, "price", rawPrice, "size", size,
+			"vm_status", result.VMStatus, "tx_hash", result.Hash, "sender", b.aptos.SenderAddress(),
+		)
 		return fmt.Errorf("flatten order failed: vm_status=%s", result.VMStatus)
 	}
-	slog.Info("flatten order placed", "side", side, "price", rawPrice, "size", size, "tx_hash", result.Hash)
+	slog.Info("flatten order placed", "side", side, "price", rawPrice, "size", size, "tx_hash", result.Hash, "sender", b.aptos.SenderAddress())
 	return nil
 }
 
@@ -415,21 +436,21 @@ func buildPlaceOrderArgs(
 	none := func() map[string][]any { return map[string][]any{"vec": {}} }
 
 	return []any{
-		subaccountAddr,                      //  1. subaccount_addr
-		marketAddr,                          //  2. market_addr
-		fmt.Sprintf("%d", priceInt),         //  3. price (u64 as string)
-		fmt.Sprintf("%d", sizeInt),          //  4. size  (u64 as string)
-		isBuy,                               //  5. is_buy
-		int(timeInForce),                    //  6. time_in_force (u8 as integer)
-		isReduceOnly,                        //  7. is_reduce_only
-		none(),                              //  8. client_order_id  Option<String>
-		none(),                              //  9. stop_price       Option<u64>
-		none(),                              // 10. tp_trigger        Option<u64>
-		none(),                              // 11. tp_limit           Option<u64>
-		none(),                              // 12. sl_trigger         Option<u64>
-		none(),                              // 13. sl_limit            Option<u64>
-		none(),                              // 14. builder_addr    Option<address>
-		none(),                              // 15. builder_fees       Option<u64>
+		subaccountAddr,              //  1. subaccount_addr
+		marketAddr,                  //  2. market_addr
+		fmt.Sprintf("%d", priceInt), //  3. price (u64 as string)
+		fmt.Sprintf("%d", sizeInt),  //  4. size  (u64 as string)
+		isBuy,                       //  5. is_buy
+		int(timeInForce),            //  6. time_in_force (u8 as integer)
+		isReduceOnly,                //  7. is_reduce_only
+		none(),                      //  8. client_order_id  Option<String>
+		none(),                      //  9. stop_price       Option<u64>
+		none(),                      // 10. tp_trigger        Option<u64>
+		none(),                      // 11. tp_limit           Option<u64>
+		none(),                      // 12. sl_trigger         Option<u64>
+		none(),                      // 13. sl_limit            Option<u64>
+		none(),                      // 14. builder_addr    Option<address>
+		none(),                      // 15. builder_fees       Option<u64>
 	}
 }
 

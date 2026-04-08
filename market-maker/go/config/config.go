@@ -9,6 +9,8 @@ import (
 	"os"
 	"strconv"
 	"strings"
+
+	"decibel-mm-bot/aptos"
 )
 
 // ── Network profiles ──────────────────────────────────────────────────────────
@@ -148,6 +150,10 @@ func Load() (*Config, error) {
 	flag.StringVar(&cfg.RestAPIBase, "api-base", cfg.RestAPIBase, "Decibel REST API base URL (overrides network profile)")
 	flag.Parse()
 
+	// DRY_RUN is intentionally controlled explicitly by the operator via the
+	// `DRY_RUN` environment variable or the `-dry-run` CLI flag. No automatic
+	// testnet/mainnet defaults are applied here.
+
 	// ── Step 3: re-apply profile if --network flag changed the network ─────────
 	// Only overwrite URL fields that weren't set via an explicit env var, so the
 	// priority chain (flag > env var > profile) is preserved.
@@ -167,6 +173,8 @@ func Load() (*Config, error) {
 		}
 	}
 
+	// No automatic dry-run defaults; operator must set `DRY_RUN` explicitly.
+
 	return cfg, cfg.validate()
 }
 
@@ -182,11 +190,25 @@ func (c *Config) validate() error {
 		missing = append(missing, "PRIVATE_KEY")
 	}
 	if c.PerpEngineGlobalAddress == "" {
-		missing = append(missing, "PERP_ENGINE_GLOBAL_ADDRESS")
+		if c.PackageAddress != "" {
+			// Try to derive the global perp engine address automatically from
+			// the package address. This avoids requiring users to paste the
+			// value in environments where PACKAGE_ADDRESS is known.
+			addr, err := aptos.CreatePerpEngineGlobalAddress(c.PackageAddress)
+			if err != nil {
+				return fmt.Errorf("derive PERP_ENGINE_GLOBAL_ADDRESS: %w", err)
+			}
+			c.PerpEngineGlobalAddress = addr
+		} else {
+			missing = append(missing, "PERP_ENGINE_GLOBAL_ADDRESS")
+		}
 	}
 	if len(missing) > 0 {
 		return fmt.Errorf("missing required environment variables: %s", strings.Join(missing, ", "))
 	}
+
+	// No automatic mainnet guard; operator must control `DRY_RUN` explicitly.
+
 	return nil
 }
 

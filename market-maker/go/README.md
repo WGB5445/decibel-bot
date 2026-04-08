@@ -38,7 +38,7 @@ You can mix all three — e.g. keep credentials in `.env` and tweak trading para
 | `BEARER_TOKEN` | `-bearer-token` | REST API bearer token from the Decibel dashboard |
 | `SUBACCOUNT_ADDRESS` | `-subaccount-address` | Your subaccount object address (`0x…`) |
 | `PRIVATE_KEY` | `-private-key` | 32-byte Ed25519 private key, hex-encoded (with or without `0x` prefix) |
-| `PERP_ENGINE_GLOBAL_ADDRESS` | `-perp-engine-global-address` | Perp engine global object address |
+| `PERP_ENGINE_GLOBAL_ADDRESS` | `-perp-engine-global-address` | Perp engine global object address (optional — when blank and `PACKAGE_ADDRESS` is set, the bot will auto-derive this value from `PACKAGE_ADDRESS` using the named-object seed "GlobalPerpEngine") |
 
 ---
 
@@ -75,9 +75,14 @@ You can mix all three — e.g. keep credentials in `.env` and tweak trading para
 | `CANCEL_RESYNC_S` | `-cancel-resync-s` | `8.0` | Seconds to wait before re-fetching open orders after a cancel fails. |
 | `AUTO_FLATTEN` | `-auto-flatten` | `false` | When `true`, automatically place a reduce-only GTC order to cut inventory when `MAX_INVENTORY` is hit. |
 | `FLATTEN_AGGRESSION` | `-flatten-aggression` | `0.001` | Price offset from mid for the flatten order, as a fraction. `0.001` = 0.1% through mid. |
-| `DRY_RUN` | `-dry-run` | `false` | Log all actions without submitting any on-chain transactions. Use this to verify configuration before going live. |
+| `DRY_RUN` | `-dry-run` | `false` | Log all actions without submitting any on-chain transactions. Must be explicitly set via the `DRY_RUN` environment variable or the `-dry-run` CLI flag; no automatic testnet/mainnet defaults are applied. |
 
 ---
+
+**Safety note — Manual DRY_RUN**
+
+- The program does not enable dry-run automatically and does not require `ALLOW_MAINNET` to run. Operators must explicitly set `DRY_RUN=true` (env) or pass `-dry-run` on the CLI when they want a non-broadcasting dry run.
+- Always validate behavior thoroughly on `testnet` with `DRY_RUN=true` using a test subaccount and minimal-privilege tokens before running against mainnet.
 
 ### Adaptive spread (auto-tuning)
 
