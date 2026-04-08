@@ -212,20 +212,50 @@ func (c *Config) validate() error {
 	return nil
 }
 
-// ParsePrivateKey decodes and validates the 32-byte Ed25519 seed from hex.
-// Accepts 32-byte (seed only) or 64-byte (seed || public key) inputs.
+// ParsePrivateKey decodes and validates the 32-byte Ed25519 seed.
+// Supported inputs:
+//  - raw hex (with or without 0x prefix)
+//  - AIP-80 formatted keys: ed25519-priv-<hex> or secp256k1-priv-<hex>
+// For ed25519 (or unspecified) the first 32 bytes are returned as the seed.
+// secp256k1 keys are recognised but not usable for signing in this client.
 func (c *Config) ParsePrivateKey() ([32]byte, error) {
-	s := strings.TrimPrefix(c.PrivateKey, "0x")
+	var seed [32]byte
+	s := strings.TrimSpace(c.PrivateKey)
+	if s == "" {
+		return seed, fmt.Errorf("PRIVATE_KEY is empty")
+	}
+
+	algo := ""
+	// Accept AIP-80 style prefix like "ed25519-priv-" or "secp256k1-priv-".
+	if strings.Contains(s, "-priv-") {
+		parts := strings.SplitN(s, "-priv-", 2)
+		algo = strings.ToLower(parts[0])
+		s = parts[1]
+	}
+
+	// Strip optional 0x prefix.
+	s = strings.TrimPrefix(s, "0x")
+	s = strings.TrimSpace(s)
+
 	b, err := hex.DecodeString(s)
 	if err != nil {
-		return [32]byte{}, fmt.Errorf("PRIVATE_KEY is not valid hex: %w", err)
+		return seed, fmt.Errorf("PRIVATE_KEY is not valid hex: %w", err)
 	}
 	if len(b) < 32 {
-		return [32]byte{}, fmt.Errorf("PRIVATE_KEY must be at least 32 bytes, got %d", len(b))
+		return seed, fmt.Errorf("PRIVATE_KEY must be at least 32 bytes, got %d", len(b))
 	}
-	var seed [32]byte
-	copy(seed[:], b[:32])
-	return seed, nil
+
+	switch algo {
+	case "", "ed25519":
+		copy(seed[:], b[:32])
+		return seed, nil
+	case "secp256k1":
+		return seed, fmt.Errorf("secp256k1 private keys are not supported by this client; please provide an ed25519 seed (ed25519-priv-... or raw hex)")
+	default:
+		// Unknown algorithm prefix: fall back to interpreting as raw hex.
+		copy(seed[:], b[:32])
+		return seed, nil
+	}
 }
 
 // NodeKey returns the effective fullnode API key (NODE_API_KEY or BEARER_TOKEN fallback).
