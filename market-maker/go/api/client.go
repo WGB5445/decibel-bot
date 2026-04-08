@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"math"
 	"net/http"
 	"strings"
@@ -110,10 +111,19 @@ func (c *Client) getJSON(ctx context.Context, path string, dst any) error {
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return fmt.Errorf("HTTP %d: GET %s", resp.StatusCode, path)
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return fmt.Errorf("read response body: %w", err)
 	}
-	return json.NewDecoder(resp.Body).Decode(dst)
+
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return fmt.Errorf("HTTP %d: GET %s: %s", resp.StatusCode, path, strings.TrimSpace(string(body)))
+	}
+
+	if err := json.Unmarshal(body, dst); err != nil {
+		return fmt.Errorf("decode JSON: %w; body=%s", err, string(body))
+	}
+	return nil
 }
 
 // ── Public endpoints ──────────────────────────────────────────────────────────
