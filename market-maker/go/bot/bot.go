@@ -25,13 +25,11 @@ func Run(ctx context.Context, cfg *config.Config) error {
 	)
 	slog.Info("perp engine", "address", cfg.PerpEngineGlobalAddress)
 
-	seed, err := cfg.ParsePrivateKey()
-	if err != nil {
-		return fmt.Errorf("parse private key: %w", err)
-	}
-
 	apiClient := api.NewClient(cfg.RestAPIBase, cfg.BearerToken)
-	aptosClient := aptos.NewClient(cfg.AptosFullnodeURL, cfg.NodeKey(), seed)
+	aptosClient, err := aptos.NewClient(cfg.AptosFullnodeURL, cfg.NodeKey(), cfg.PrivateKey)
+	if err != nil {
+		return fmt.Errorf("create aptos client: %w", err)
+	}
 
 	slog.Info("derived sender address", "address", aptosClient.SenderAddress())
 	slog.Info("using subaccount", "address", cfg.SubaccountAddress)

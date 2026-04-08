@@ -14,6 +14,9 @@ import (
 	"strings"
 	"time"
 
+	aptsdk "github.com/aptos-labs/aptos-go-sdk/v2"
+	sdkacct "github.com/aptos-labs/aptos-go-sdk/v2/account"
+
 	"golang.org/x/crypto/sha3"
 	"golang.org/x/sync/errgroup"
 )
@@ -48,18 +51,96 @@ type Client struct {
 	apiKey        string
 	privKey       ed25519.PrivateKey
 	senderAddress string
+	// sdk client (optional). If non-nil, SubmitEntryFunction will prefer using the SDK
+	sdk        aptsdk.Client
+	sdkAccount *sdkacct.Account
 }
 
-// NewClient derives the sender address from the 32-byte private key seed.
-func NewClient(fullnodeURL, apiKey string, seed [32]byte) *Client {
-	privKey := ed25519.NewKeyFromSeed(seed[:])
-	return &Client{
-		http:          &http.Client{Timeout: 30 * time.Second},
-		baseURL:       strings.TrimRight(fullnodeURL, "/"),
-		apiKey:        apiKey,
-		privKey:       privKey,
-		senderAddress: DeriveAddress(privKey),
+// httpDoerAdapter wraps net/http.Client and implements the SDK HTTPDoer
+// interface (Do(ctx, req)). It also injects headers (e.g. Authorization).
+type httpDoerAdapter struct {
+	client  *http.Client
+	headers map[string]string
+}
+
+func (a *httpDoerAdapter) Do(ctx context.Context, req *http.Request) (*http.Response, error) {
+	req = req.WithContext(ctx)
+	for k, v := range a.headers {
+		req.Header.Set(k, v)
 	}
+	return a.client.Do(req)
+}
+
+// NewClient creates a Client from a private-key string. The key can be either
+// raw hex (optionally prefixed with 0x) or AIP-80 form like "ed25519-priv-...".
+// The function prefers creating an SDK account; if SDK client creation fails
+// the legacy HTTP fallback is preserved.
+func NewClient(fullnodeURL, apiKey, privKeyStr string) (*Client, error) {
+	// Validate and extract seed bytes from the provided key string.
+	s := strings.TrimSpace(privKeyStr)
+	if s == "" {
+		return nil, fmt.Errorf("private key is empty")
+	}
+
+	algo := ""
+	if strings.Contains(s, "-priv-") {
+		parts := strings.SplitN(s, "-priv-", 2)
+		algo = strings.ToLower(parts[0])
+		s = parts[1]
+	}
+	s = strings.TrimPrefix(s, "0x")
+	s = strings.TrimSpace(s)
+	b, err := hex.DecodeString(s)
+	if err != nil {
+		return nil, fmt.Errorf("private key is not valid hex: %w", err)
+	}
+	if len(b) < 32 {
+		return nil, fmt.Errorf("private key must be at least 32 bytes, got %d", len(b))
+	}
+	if algo == "secp256k1" {
+		return nil, fmt.Errorf("secp256k1 private keys are not supported; provide an ed25519 private key")
+	}
+
+	var seed [32]byte
+	copy(seed[:], b[:32])
+
+	// Prepare base client (legacy HTTP behaviour kept for fallback).
+	c := &Client{
+		http:    &http.Client{Timeout: 30 * time.Second},
+		baseURL: strings.TrimRight(fullnodeURL, "/"),
+		apiKey:  apiKey,
+	}
+
+	// Legacy private key used for manual signing fallback.
+	privKey := ed25519.NewKeyFromSeed(seed[:])
+	c.privKey = privKey
+	c.senderAddress = DeriveAddress(privKey)
+
+	// Attempt SDK client creation. Wrap the standard http.Client to match the
+	// SDK's HTTPDoer interface (Do(ctx, req)). Also inject the API key header.
+	sdkCfg := aptsdk.NetworkConfig{NodeURL: strings.TrimRight(fullnodeURL, "/")}
+	adapter := &httpDoerAdapter{client: c.http, headers: map[string]string{}}
+	if apiKey != "" {
+		adapter.headers["Authorization"] = "Bearer " + apiKey
+	}
+	sdkClient, err := aptsdk.NewClient(sdkCfg, aptsdk.WithHTTPClient(adapter))
+	if err != nil {
+		// Warn but do not fail — keep legacy HTTP path as a fallback.
+		slog.Warn("aptsdk.NewClient failed, using legacy HTTP client", "err", err)
+		return c, nil
+	}
+
+	// Build an SDK account from the ed25519 seed using the account helper.
+	acct, err := sdkacct.FromEd25519PrivateKey(seed[:])
+	if err != nil {
+		slog.Warn("failed to create sdk account from seed, using legacy HTTP client", "err", err)
+		return c, nil
+	}
+
+	c.sdk = sdkClient
+	c.sdkAccount = acct
+	c.senderAddress = acct.Address().String()
+	return c, nil
 }
 
 // SenderAddress returns the on-chain address derived from the private key.
@@ -163,6 +244,70 @@ func (c *Client) SubmitEntryFunction(
 	// nil type_arguments serialises to JSON null; Aptos requires an empty array.
 	if typeArgs == nil {
 		typeArgs = []string{}
+	}
+
+	// If we have a configured SDK client, prefer the SDK path (build/sign/submit/wait).
+	if c.sdk != nil && c.sdkAccount != nil {
+		if typeArgs == nil {
+			typeArgs = []string{}
+		}
+
+		// Parse function spec: 0xaddr::module::function
+		parts := strings.Split(function, "::")
+		if len(parts) != 3 {
+			return nil, fmt.Errorf("invalid function spec: %s", function)
+		}
+		moduleAddr, err := aptsdk.ParseAddress(parts[0])
+		if err != nil {
+			return nil, fmt.Errorf("parse module address %s: %w", parts[0], err)
+		}
+
+		// Convert type argument strings to SDK TypeTag values
+		typeTags := make([]aptsdk.TypeTag, 0, len(typeArgs))
+		for _, t := range typeArgs {
+			tt, err := aptsdk.ParseTypeTag(t)
+			if err != nil {
+				return nil, fmt.Errorf("parse type tag %q: %w", t, err)
+			}
+			typeTags = append(typeTags, *tt)
+		}
+
+		// Convert simple string address arguments like "0x..." into AccountAddress
+		convertedArgs := make([]any, len(args))
+		for i, a := range args {
+			switch v := a.(type) {
+			case string:
+				if strings.HasPrefix(v, "0x") {
+					if addr, err := aptsdk.ParseAddress(v); err == nil {
+						convertedArgs[i] = addr
+						continue
+					}
+				}
+				convertedArgs[i] = v
+			default:
+				convertedArgs[i] = v
+			}
+		}
+
+		payload := &aptsdk.EntryFunctionPayload{
+			Module:   aptsdk.ModuleID{Address: moduleAddr, Name: parts[1]},
+			Function: parts[2],
+			TypeArgs: typeTags,
+			Args:     convertedArgs,
+		}
+
+		// Sign and submit via SDK; set max gas to 20000 units.
+		submitRes, err := c.sdk.SignAndSubmitTransaction(ctx, c.sdkAccount, payload, aptsdk.WithMaxGas(20000))
+		if err != nil {
+			return nil, fmt.Errorf("sdk sign and submit: %w", err)
+		}
+
+		tx, err := c.sdk.WaitForTransaction(ctx, submitRes.Hash)
+		if err != nil {
+			return nil, fmt.Errorf("wait for transaction: %w", err)
+		}
+
+		return &TxResult{Hash: submitRes.Hash, Success: tx.Success, VMStatus: tx.VMStatus}, nil
 	}
 
 	// 1. Fetch chain state in parallel.
