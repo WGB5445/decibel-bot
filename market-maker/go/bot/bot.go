@@ -12,6 +12,8 @@ import (
 	"decibel-mm-bot/aptos"
 	"decibel-mm-bot/config"
 	"decibel-mm-bot/pricing"
+
+	aptossdk "github.com/aptos-labs/aptos-go-sdk"
 )
 
 // Run is the top-level entry point: validates config, discovers market, then loops.
@@ -23,17 +25,24 @@ func Run(ctx context.Context, cfg *config.Config) error {
 		"max_inventory", cfg.MaxInventory,
 		"dry_run", cfg.DryRun,
 	)
-	slog.Info("perp engine", "address", cfg.PerpEngineGlobalAddress)
-
-	seed, err := cfg.ParsePrivateKey()
-	if err != nil {
-		return fmt.Errorf("parse private key: %w", err)
+	if perpGlobal, err := aptos.CreatePerpEngineGlobalAddress(cfg.PackageAddress); err != nil {
+		slog.Warn("could not derive GlobalPerpEngine address for logging", "err", err)
+	} else {
+		slog.Info("perp engine global (derived)", "address", perpGlobal)
 	}
 
 	apiClient := api.NewClient(cfg.RestAPIBase, cfg.BearerToken)
-	aptosClient := aptos.NewClient(cfg.AptosFullnodeURL, cfg.NodeKey(), seed)
+	aptosNode, err := aptos.NewNodeClient(cfg.AptosFullnodeURL, cfg.NodeKey(), aptos.ChainIDForNetwork(cfg.Network))
+	if err != nil {
+		return fmt.Errorf("create aptos node client: %w", err)
+	}
+	aptosSigner, err := aptos.ParseAccount(cfg.PrivateKey)
+	if err != nil {
+		return fmt.Errorf("parse aptos signing account: %w", err)
+	}
 
-	slog.Info("derived sender address", "address", aptosClient.SenderAddress())
+	senderAddr := aptosSigner.AccountAddress()
+	slog.Info("derived sender address", "address", senderAddr.String())
 	slog.Info("using subaccount", "address", cfg.SubaccountAddress)
 
 	// ── Market discovery ──────────────────────────────────────────────────────
@@ -53,7 +62,8 @@ func Run(ctx context.Context, cfg *config.Config) error {
 	b := &bot{
 		cfg:             cfg,
 		api:             apiClient,
-		aptos:           aptosClient,
+		aptosNode:       aptosNode,
+		aptosSigner:     aptosSigner,
 		market:          market,
 		effectiveSpread: cfg.Spread,
 		firstCycle:      true,
@@ -64,10 +74,11 @@ func Run(ctx context.Context, cfg *config.Config) error {
 // ─────────────────────────────────────────────────────────────────────────────
 
 type bot struct {
-	cfg    *config.Config
-	api    *api.Client
-	aptos  *aptos.Client
-	market *api.MarketConfig
+	cfg         *config.Config
+	api         *api.Client
+	aptosNode   *aptos.NodeClient
+	aptosSigner *aptossdk.Account
+	market      *api.MarketConfig
 	// adaptive spread state
 	effectiveSpread float64
 	lastInventory   float64
@@ -288,10 +299,10 @@ func (b *bot) cancelSingleOrder(ctx context.Context, orderID string) error {
 		return nil
 	}
 
-	result, err := b.aptos.SubmitEntryFunction(ctx, fn, nil, []any{
-		b.cfg.SubaccountAddress,  // 1. subaccount_addr
-		orderID,                  // 2. order_id (u128 as string)
-		b.market.MarketAddr,      // 3. market_addr
+	result, err := b.aptosNode.SubmitEntryFunction(ctx, b.aptosSigner, fn, nil, []any{
+		b.cfg.SubaccountAddress, // 1. subaccount_addr
+		orderID,                 // 2. order_id (u128 as string)
+		b.market.MarketAddr,     // 3. market_addr
 	})
 	if err != nil {
 		return err
@@ -322,7 +333,7 @@ func (b *bot) placePostOnlyOrder(ctx context.Context, price, size float64, isBuy
 	}
 
 	fn := b.cfg.PackageAddress + "::dex_accounts_entry::place_order_to_subaccount"
-	result, err := b.aptos.SubmitEntryFunction(ctx, fn, nil,
+	result, err := b.aptosNode.SubmitEntryFunction(ctx, b.aptosSigner, fn, nil,
 		buildPlaceOrderArgs(
 			b.cfg.SubaccountAddress,
 			b.market.MarketAddr,
@@ -379,7 +390,7 @@ func (b *bot) placeFlattenOrder(ctx context.Context, inventory, mid float64) err
 	}
 
 	fn := b.cfg.PackageAddress + "::dex_accounts_entry::place_order_to_subaccount"
-	result, err := b.aptos.SubmitEntryFunction(ctx, fn, nil,
+	result, err := b.aptosNode.SubmitEntryFunction(ctx, b.aptosSigner, fn, nil,
 		buildPlaceOrderArgs(
 			b.cfg.SubaccountAddress,
 			b.market.MarketAddr,
@@ -404,7 +415,7 @@ func (b *bot) placeFlattenOrder(ctx context.Context, inventory, mid float64) err
 // ─────────────────────────────────────────────────────────────────────────────
 
 // buildPlaceOrderArgs constructs the 15 ABI arguments for place_order_to_subaccount.
-// All Option<u64> / Option<address> fields use the {"vec": []} encoding.
+// Option<T>::None is passed as nil for aptos-go-sdk v1 EntryFunctionWithArgs (ConvertToOption).
 func buildPlaceOrderArgs(
 	subaccountAddr, marketAddr string,
 	priceInt, sizeInt uint64,
@@ -412,24 +423,22 @@ func buildPlaceOrderArgs(
 	timeInForce uint8, // 0=GTC, 1=POST_ONLY, 2=IOC
 	isReduceOnly bool,
 ) []any {
-	none := func() map[string][]any { return map[string][]any{"vec": {}} }
-
 	return []any{
-		subaccountAddr,                      //  1. subaccount_addr
-		marketAddr,                          //  2. market_addr
-		fmt.Sprintf("%d", priceInt),         //  3. price (u64 as string)
-		fmt.Sprintf("%d", sizeInt),          //  4. size  (u64 as string)
-		isBuy,                               //  5. is_buy
-		int(timeInForce),                    //  6. time_in_force (u8 as integer)
-		isReduceOnly,                        //  7. is_reduce_only
-		none(),                              //  8. client_order_id  Option<String>
-		none(),                              //  9. stop_price       Option<u64>
-		none(),                              // 10. tp_trigger        Option<u64>
-		none(),                              // 11. tp_limit           Option<u64>
-		none(),                              // 12. sl_trigger         Option<u64>
-		none(),                              // 13. sl_limit            Option<u64>
-		none(),                              // 14. builder_addr    Option<address>
-		none(),                              // 15. builder_fees       Option<u64>
+		subaccountAddr,              //  1. subaccount_addr
+		marketAddr,                  //  2. market_addr
+		fmt.Sprintf("%d", priceInt), //  3. price (u64 as string)
+		fmt.Sprintf("%d", sizeInt),  //  4. size  (u64 as string)
+		isBuy,                       //  5. is_buy
+		timeInForce,                 //  6. time_in_force (u8; SDK rejects Go int)
+		isReduceOnly,                //  7. is_reduce_only
+		nil,                         //  8. client_order_id  Option<String>
+		nil,                         //  9. stop_price       Option<u64>
+		nil,                         // 10. tp_trigger        Option<u64>
+		nil,                         // 11. tp_limit           Option<u64>
+		nil,                         // 12. sl_trigger         Option<u64>
+		nil,                         // 13. sl_limit            Option<u64>
+		nil,                         // 14. builder_addr    Option<address>
+		nil,                         // 15. builder_fees       Option<u64>
 	}
 }
 

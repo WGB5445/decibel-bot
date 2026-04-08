@@ -2,6 +2,12 @@
 
 A perpetual-futures market-maker bot for the [Decibel DEX](https://decibel.trade) on Aptos.
 
+Requires **Go 1.24+**. On-chain transactions use [aptos-go-sdk](https://github.com/aptos-labs/aptos-go-sdk) **v1** (`github.com/aptos-labs/aptos-go-sdk`, currently **v1.12.1** in [`go.mod`](go.mod)). Aptos officially recommends v2 for new projects; this bot stays on v1 for a stable path: load module ABI from the node (`EntryFunctionWithArgs`), `BuildTransaction`, sign with `SignedTransaction`, `SubmitTransaction`, then `WaitForTransaction` (poll timeout up to about **60s**, shorter if the request `context` has a deadline).
+
+**Fullnode connection:** [`aptos.NewNodeClient`](aptos/client.go) takes `(fullnodeURL, apiKey, chainID)`. The API key is sent as `Authorization: Bearer …` when non-empty (from `NODE_API_KEY`, else `BEARER_TOKEN`). **`chainID`** comes from [`aptos.ChainIDForNetwork(cfg.Network)`](aptos/client.go): **testnet = 2**, **mainnet = 1**; any other network name uses **0** and the SDK may fetch chain id from the node.
+
+**Signing account:** [`aptos.ParseAccount`](aptos/client.go) accepts raw hex (optional `0x`), **64-byte hex seed‖pubkey** (only the **first 32 bytes** are used as the Ed25519 seed), or AIP-80 `ed25519-priv-…`. **secp256k1** keys are rejected.
+
 ## Quick start
 
 ```bash
@@ -36,9 +42,11 @@ You can mix all three — e.g. keep credentials in `.env` and tweak trading para
 | Env var | CLI flag | Description |
 |---------|----------|-------------|
 | `BEARER_TOKEN` | `-bearer-token` | REST API bearer token from the Decibel dashboard |
-| `SUBACCOUNT_ADDRESS` | `-subaccount-address` | Your subaccount object address (`0x…`) |
-| `PRIVATE_KEY` | `-private-key` | 32-byte Ed25519 private key, hex-encoded (with or without `0x` prefix) |
-| `PERP_ENGINE_GLOBAL_ADDRESS` | `-perp-engine-global-address` | Perp engine global object address |
+| `SUBACCOUNT_ADDRESS` | `-subaccount` | Your subaccount object address (`0x…`) |
+| `PRIVATE_KEY` | `-private-key` | Ed25519: hex (optional `0x`), 64-byte hex **seed‖pubkey** (first 32 bytes used as seed), or AIP-80 `ed25519-priv-…`. **Avoid passing via CLI in production** (shell history, `ps`). |
+| `NODE_API_KEY` | `-node-api-key` | Fullnode API key; sent as `Authorization: Bearer`. Defaults to `BEARER_TOKEN` when unset. |
+
+The **GlobalPerpEngine** object address is **not configurable**: it is always derived from `PACKAGE_ADDRESS` (including the value set by `-network`) for logging only; it is not passed as a transaction argument.
 
 ---
 
@@ -46,17 +54,17 @@ You can mix all three — e.g. keep credentials in `.env` and tweak trading para
 
 | Env var | CLI flag | Default | Description |
 |---------|----------|---------|-------------|
-| `NETWORK` | `-network` | `testnet` | Network preset: `testnet` or `mainnet`. Sets the REST API base URL, fullnode URL, and Move package address automatically. |
+| `NETWORK` | `-network` | `testnet` | Network preset: `testnet` or `mainnet`. Sets the REST API base URL, fullnode URL, Move package address, and the **Aptos chain id** used by the SDK client (**2** / **1**). |
 
 **Testnet defaults**
 - REST API: `https://api.testnet.aptoslabs.com/decibel/api/v1`
 - Fullnode: `https://api.testnet.aptoslabs.com/v1`
-- Package: `0x952535c3049e52f195f26798c2f1340d7dd5100edbe0f464e520a974d16fbe9f`
+- Package: `0xe7da2794b1d8af76532ed95f38bfdf1136abfd8ea3a240189971988a83101b7f`
 
 **Mainnet defaults**
 - REST API: `https://api.mainnet.aptoslabs.com/decibel/api/v1`
 - Fullnode: `https://api.mainnet.aptoslabs.com/v1`
-- Package: `0xb8a5788314451ce4d2fbbad32e1bad88d4184b73943b7fe5166eab93cf1a5a95`
+- Package: `0x2a4e9bee4b09f5b8e9c996a489c6993abe1e9e45e61e81bb493e38e53a3e7e3d`
 
 ---
 
@@ -102,7 +110,6 @@ These override the values set by `NETWORK`. Leave unset to use the network profi
 | `REST_API_BASE` | `-api-base` | Decibel REST API base URL |
 | `APTOS_FULLNODE_URL` | `-fullnode-url` | Aptos-compatible fullnode URL |
 | `PACKAGE_ADDRESS` | `-package-address` | Move package address |
-| `NODE_API_KEY` | _(env only)_ | API key for the fullnode. Falls back to `BEARER_TOKEN` when not set. |
 | `MARKET_ADDR` | _(env only)_ | Skip market discovery and use this PerpMarket object address directly. |
 
 ---
@@ -127,6 +134,8 @@ go run .
 
 ### 3. CLI flags (recommended for one-off overrides)
 
+Changing `-network` after other defaults were loaded updates REST/fullnode/package **from the new preset** unless you already set the matching URL fields via **CLI** or **environment variables** (CLI wins, then env, then preset).
+
 > **Note:** Go's `flag` package uses a single dash. Both `-flag value` and `-flag=value` work.
 
 ```bash
@@ -143,7 +152,7 @@ go run . \
 Credentials in `.env`, trading params as flags:
 
 ```bash
-# .env has BEARER_TOKEN, PRIVATE_KEY, SUBACCOUNT_ADDRESS, PERP_ENGINE_GLOBAL_ADDRESS
+# .env has BEARER_TOKEN, PRIVATE_KEY, SUBACCOUNT_ADDRESS
 go run . -spread 0.002 -order-size 0.01
 ```
 

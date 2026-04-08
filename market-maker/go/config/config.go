@@ -1,5 +1,5 @@
 // Package config loads bot parameters from environment variables and CLI flags.
-// Environment variables set the defaults; flags override them.
+// CLI flags override environment variables when explicitly set.
 package config
 
 import (
@@ -63,33 +63,31 @@ type Config struct {
 	SpreadStep         float64
 
 	// ── Credentials / addresses ───────────────────────────────────────────────
-	BearerToken             string
-	SubaccountAddress       string
-	PrivateKey              string // hex, 0x-prefix optional
-	PerpEngineGlobalAddress string
-	PackageAddress          string
-	NodeAPIKey              string // falls back to BearerToken
-	AptosFullnodeURL        string
-	MarketAddrOverride      string // skips API discovery
-	RestAPIBase             string
+	BearerToken        string
+	SubaccountAddress  string
+	PrivateKey         string // hex, 0x-prefix optional
+	PackageAddress     string
+	NodeAPIKey         string // falls back to BearerToken
+	AptosFullnodeURL   string
+	MarketAddrOverride string // skips API discovery
+	RestAPIBase        string
 }
 
-// Load reads env vars (defaults) then parses CLI flags (overrides), then validates.
+// Load reads env vars, applies network defaults, parses CLI flags (overrides), then validates.
 //
-// Priority for network-dependent URLs (highest → lowest):
+// Effective priority (highest → lowest):
 //
-//	CLI flag  >  explicit env var  >  network profile  >  (testnet default)
+//	CLI flag (if set on command line)  >  explicit env var  >  network profile  >  built-in default
 func Load() (*Config, error) {
-	// ── Step 1: resolve network and apply profile as URL defaults ─────────────
-	network := envStr("NETWORK", "testnet")
-	profile, ok := networkProfiles[network]
+	// Step 1: network from env only (baseline before flags).
+	networkFromEnv := envStr("NETWORK", "testnet")
+	profile, ok := networkProfiles[networkFromEnv]
 	if !ok {
-		return nil, fmt.Errorf("unknown network %q; valid values: testnet, mainnet", network)
+		return nil, fmt.Errorf("unknown network %q; valid values: testnet, mainnet", networkFromEnv)
 	}
 
-	// Explicit env vars beat the network profile; flags (parsed below) beat both.
 	cfg := &Config{
-		Network: network,
+		Network: networkFromEnv,
 
 		MarketName:        envStr("MARKET_NAME", "BTC/USD"),
 		Spread:            envFloat("SPREAD", 0.001),
@@ -110,20 +108,17 @@ func Load() (*Config, error) {
 		SpreadNoFillCycles: int(envFloat("SPREAD_NO_FILL_CYCLES", 3)),
 		SpreadStep:         envFloat("SPREAD_STEP", 0.0002),
 
-		BearerToken:             os.Getenv("BEARER_TOKEN"),
-		SubaccountAddress:       os.Getenv("SUBACCOUNT_ADDRESS"),
-		PrivateKey:              os.Getenv("PRIVATE_KEY"),
-		PerpEngineGlobalAddress: os.Getenv("PERP_ENGINE_GLOBAL_ADDRESS"),
-		NodeAPIKey:              os.Getenv("NODE_API_KEY"),
-		MarketAddrOverride:      os.Getenv("MARKET_ADDR"),
+		BearerToken:        os.Getenv("BEARER_TOKEN"),
+		SubaccountAddress:  os.Getenv("SUBACCOUNT_ADDRESS"),
+		PrivateKey:         os.Getenv("PRIVATE_KEY"),
+		NodeAPIKey:         os.Getenv("NODE_API_KEY"),
+		MarketAddrOverride: os.Getenv("MARKET_ADDR"),
 
-		// URL fields: explicit env var wins over profile, flag wins over both.
 		RestAPIBase:      envStr("REST_API_BASE", profile.RestAPIBase),
 		AptosFullnodeURL: envStr("APTOS_FULLNODE_URL", profile.AptosFullnodeURL),
 		PackageAddress:   envStr("PACKAGE_ADDRESS", profile.PackageAddress),
 	}
 
-	// ── Step 2: register CLI flags (override everything set above) ────────────
 	flag.StringVar(&cfg.Network, "network", cfg.Network,
 		"Network preset: testnet | mainnet  (sets default URLs and package address)")
 	flag.StringVar(&cfg.MarketName, "market-name", cfg.MarketName, "Market symbol (e.g. BTC/USD)")
@@ -146,23 +141,33 @@ func Load() (*Config, error) {
 	flag.StringVar(&cfg.PackageAddress, "package-address", cfg.PackageAddress, "Move package address (overrides network profile)")
 	flag.StringVar(&cfg.AptosFullnodeURL, "fullnode-url", cfg.AptosFullnodeURL, "Aptos fullnode URL (overrides network profile)")
 	flag.StringVar(&cfg.RestAPIBase, "api-base", cfg.RestAPIBase, "Decibel REST API base URL (overrides network profile)")
+
+	flag.StringVar(&cfg.BearerToken, "bearer-token", cfg.BearerToken, "Decibel REST bearer token (overrides BEARER_TOKEN)")
+	flag.StringVar(&cfg.SubaccountAddress, "subaccount", cfg.SubaccountAddress, "Subaccount object address (overrides SUBACCOUNT_ADDRESS)")
+	flag.StringVar(&cfg.PrivateKey, "private-key", cfg.PrivateKey, "Ed25519 private key hex or AIP-80 (overrides PRIVATE_KEY); visible in process list")
+	flag.StringVar(&cfg.NodeAPIKey, "node-api-key", cfg.NodeAPIKey, "Fullnode API key (overrides NODE_API_KEY; falls back to bearer token)")
+
 	flag.Parse()
 
-	// ── Step 3: re-apply profile if --network flag changed the network ─────────
-	// Only overwrite URL fields that weren't set via an explicit env var, so the
-	// priority chain (flag > env var > profile) is preserved.
-	if cfg.Network != network {
+	flagsSet := make(map[string]struct{})
+	flag.Visit(func(f *flag.Flag) {
+		flagsSet[f.Name] = struct{}{}
+	})
+
+	// Step 3: if --network changed the preset, refresh URL/package from the new profile
+	// unless the operator set them via CLI or env.
+	if cfg.Network != networkFromEnv {
 		p2, ok := networkProfiles[cfg.Network]
 		if !ok {
 			return nil, fmt.Errorf("unknown network %q; valid values: testnet, mainnet", cfg.Network)
 		}
-		if !isExplicitEnv("REST_API_BASE") {
+		if _, cli := flagsSet["api-base"]; !cli && !isExplicitEnv("REST_API_BASE") {
 			cfg.RestAPIBase = p2.RestAPIBase
 		}
-		if !isExplicitEnv("APTOS_FULLNODE_URL") {
+		if _, cli := flagsSet["fullnode-url"]; !cli && !isExplicitEnv("APTOS_FULLNODE_URL") {
 			cfg.AptosFullnodeURL = p2.AptosFullnodeURL
 		}
-		if !isExplicitEnv("PACKAGE_ADDRESS") {
+		if _, cli := flagsSet["package-address"]; !cli && !isExplicitEnv("PACKAGE_ADDRESS") {
 			cfg.PackageAddress = p2.PackageAddress
 		}
 	}
@@ -173,37 +178,50 @@ func Load() (*Config, error) {
 func (c *Config) validate() error {
 	var missing []string
 	if c.BearerToken == "" {
-		missing = append(missing, "BEARER_TOKEN")
+		missing = append(missing, "BEARER_TOKEN (-bearer-token)")
 	}
 	if c.SubaccountAddress == "" {
-		missing = append(missing, "SUBACCOUNT_ADDRESS")
+		missing = append(missing, "SUBACCOUNT_ADDRESS (-subaccount)")
 	}
 	if c.PrivateKey == "" {
-		missing = append(missing, "PRIVATE_KEY")
+		missing = append(missing, "PRIVATE_KEY (-private-key)")
 	}
-	if c.PerpEngineGlobalAddress == "" {
-		missing = append(missing, "PERP_ENGINE_GLOBAL_ADDRESS")
+	if c.PackageAddress == "" {
+		missing = append(missing, "PACKAGE_ADDRESS (-package-address) or NETWORK preset")
 	}
 	if len(missing) > 0 {
-		return fmt.Errorf("missing required environment variables: %s", strings.Join(missing, ", "))
+		return fmt.Errorf("missing required configuration: %s", strings.Join(missing, ", "))
 	}
 	return nil
 }
 
-// ParsePrivateKey decodes and validates the 32-byte Ed25519 seed from hex.
-// Accepts 32-byte (seed only) or 64-byte (seed || public key) inputs.
+// ParsePrivateKey decodes the 32-byte Ed25519 seed from the configured private key string.
+// Supports raw hex (with optional 0x), 64-byte seed||pubkey hex, and ed25519 AIP-80.
+// secp256k1 keys are rejected.
 func (c *Config) ParsePrivateKey() ([32]byte, error) {
-	s := strings.TrimPrefix(c.PrivateKey, "0x")
+	var zero [32]byte
+	s := strings.TrimSpace(c.PrivateKey)
+	if s == "" {
+		return zero, fmt.Errorf("PRIVATE_KEY is empty")
+	}
+	if strings.Contains(s, "-priv-") {
+		parts := strings.SplitN(s, "-priv-", 2)
+		algo := strings.ToLower(parts[0])
+		s = parts[1]
+		if algo == "secp256k1" {
+			return zero, fmt.Errorf("secp256k1 private keys are not supported")
+		}
+	}
+	s = strings.TrimPrefix(strings.TrimSpace(s), "0x")
 	b, err := hex.DecodeString(s)
 	if err != nil {
-		return [32]byte{}, fmt.Errorf("PRIVATE_KEY is not valid hex: %w", err)
+		return zero, fmt.Errorf("PRIVATE_KEY is not valid hex: %w", err)
 	}
 	if len(b) < 32 {
-		return [32]byte{}, fmt.Errorf("PRIVATE_KEY must be at least 32 bytes, got %d", len(b))
+		return zero, fmt.Errorf("PRIVATE_KEY must be at least 32 bytes, got %d", len(b))
 	}
-	var seed [32]byte
-	copy(seed[:], b[:32])
-	return seed, nil
+	copy(zero[:], b[:32])
+	return zero, nil
 }
 
 // NodeKey returns the effective fullnode API key (NODE_API_KEY or BEARER_TOKEN fallback).
@@ -226,8 +244,6 @@ func NormalizeMarket(name string) string {
 
 // ── Env helpers ──────────────────────────────────────────────────────────────
 
-// isExplicitEnv returns true when the environment variable was explicitly set
-// (non-empty), meaning it should take priority over any network profile default.
 func isExplicitEnv(key string) bool {
 	return os.Getenv(key) != ""
 }

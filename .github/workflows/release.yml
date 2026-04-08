@@ -2,7 +2,7 @@ name: Release
 
 # Trigger manually from the GitHub Actions tab.
 # Select a component folder and enter a version tag (e.g. v1.0.0).
-# The workflow builds Go + Rust binaries for 5 platforms, then publishes
+# The workflow builds Go binaries for 5 platforms, then publishes
 # a GitHub Release with all binaries and a SHA256SUMS checksum file.
 on:
   workflow_dispatch:
@@ -148,16 +148,17 @@ jobs:
           body: |
             ## Decibel Market Maker Bot ${{ inputs.version }}
 
-            全自动做市商机器人，为 [Decibel DEX](https://decibel.markets) 永续合约市场提供双边报价。
+            全自动做市商机器人，为 [Decibel DEX](https://decibel.trade) 永续合约市场提供双边报价。
             Automated market-maker bot for perpetual futures on Decibel DEX (Aptos blockchain).
 
             ### 功能亮点 / Highlights
 
-            - **双语言实现 / Dual implementation** — Go 和 Rust 两个版本逻辑完全一致，按喜好选择
+            - **Go 实现** — 单一 Go 二进制，静态链接、无额外运行时依赖
             - **库存偏斜定价 / Inventory-skew pricing** — 根据持仓自动调整报价中心，鼓励仓位均值回归
             - **自适应价差 / Adaptive spread** — 无成交时自动收窄价差，成交后自动放宽
             - **Dry-run 模式** — 无需真实交易即可验证配置
-            - **支持 testnet / mainnet**，一键切换
+            - **支持 testnet / mainnet**，一键切换（Aptos 链 ID 由 `NETWORK` 自动匹配：testnet=2，mainnet=1）
+            - **链上提交** — Go 侧使用 `aptos-go-sdk` **v1**（`EntryFunctionWithArgs` + `BuildTransaction` + 签名提交）
 
             ---
 
@@ -178,21 +179,34 @@ jobs:
             ### 快速开始 / Quick Start
 
             ```bash
-            # 1. 下载对应平台的二进制文件并赋予执行权限 (Linux/macOS)
-            chmod +x decibel-mm-go-linux-amd64
+            # 1. 下载对应平台的二进制（示例：Linux x86-64）并赋予执行权限
+            chmod +x decibel-mm-linux-amd64
 
-            # 2. 创建配置文件
-            cp .env.example .env
-            # 填写: BEARER_TOKEN, SUBACCOUNT_ADDRESS, PRIVATE_KEY, PERP_ENGINE_GLOBAL_ADDRESS
-
-            # 3. 先用 dry-run 模式验证配置（不会发送真实交易）
-            ./decibel-mm-linux-amd64 -dry-run
-
-            # 4. 确认无误后去掉 dry-run 正式运行
-            ./decibel-mm-linux-amd64
+            # 2. 可选：从仓库复制 market-maker/go/.env.example 为 .env，用环境变量提供凭证
             ```
 
-            详细参数说明请参阅 `market-maker/做市参数调优指南.md`。
+            Go 标准库 `flag` 使用**单横线**长选项（如 `-network`），不是 Rust/clap 的 `--network`。
+
+            #### Testnet · BTC/USD（命令行示例，凭证为占位，必须替换）
+
+            `-bearer-token`、`-subaccount`、`-private-key` 以下为**虚构示例**；`-node-api-key` 可整行省略（未设置时与 bot 一致，回退为 bearer）。**不要在共享机器上用 `-private-key`（会出现在进程列表）。**
+
+            ```bash
+            ./decibel-mm-linux-amd64 \
+              -network testnet \
+              -market-name 'BTC/USD' \
+              -bearer-token 'decibel_testnet_PLACEHOLDER_replace_with_dashboard_token' \
+              -subaccount '0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb' \
+              -private-key '0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' \
+              -dry-run
+
+            # 确认无误后去掉 -dry-run 实际上链（自行评估风险）
+            # ./decibel-mm-linux-amd64 -network testnet -market-name 'BTC/USD' ...（同上，无 -dry-run）
+            ```
+
+            Windows：使用 `decibel-mm-windows-amd64.exe`，参数相同；含空格的值在 PowerShell 用单引号包裹。
+
+            详细参数说明请参阅 `market-maker/go/README.md` 与 `market-maker/做市参数调优指南.md`。
 
             ---
 

@@ -4,30 +4,8 @@
 
 This is a perpetual futures **market-maker bot** for [Decibel DEX](https://decibel.markets) on the
 Aptos blockchain. Every cycle the bot fetches state, computes bid/ask quotes using an inventory-skew
-model, cancels its resting orders, and places fresh POST_ONLY limit orders on both sides. It has two
-complete, logically-identical implementations — Go 1.21 and Rust/tokio — that must always be kept in sync.
-
----
-
-## CRITICAL: Dual-Language Rule
-
-> **Any change to market-making logic MUST be applied to both implementations simultaneously.**
->
-> - `market-maker/go/` — Go 1.21, `log/slog`, `errgroup`
-> - `market-maker/rust/src/` — Rust + tokio, `tracing`, `tokio::try_join!`
->
-> Idiomatic differences are allowed (goroutine vs async/await, slog vs tracing).
-> The numeric output of `ComputeQuotes` / `compute_quotes` must be bit-identical.
-
-Counterpart file map — always edit both sides:
-
-| Go | Rust |
-|----|------|
-| `go/bot/bot.go` | `rust/src/bot.rs` |
-| `go/pricing/pricing.go` | `rust/src/pricing.rs` |
-| `go/config/config.go` | `rust/src/config.rs` |
-| `go/api/client.go` | `rust/src/api.rs` |
-| `go/aptos/client.go` | `rust/src/aptos.rs` |
+model, cancels its resting orders, and places fresh POST_ONLY limit orders on both sides. This
+repository ships a **Go 1.24+** implementation under `market-maker/go/` (Aptos I/O via `aptos-go-sdk` **v1** — root module, not `/v2`).
 
 ---
 
@@ -36,30 +14,20 @@ Counterpart file map — always edit both sides:
 ```
 decibel-bot/
 └── market-maker/
-    ├── go/                          Go 1.21 implementation
+    ├── go/                          Go 1.24+ implementation
     │   ├── main.go                  Entry: load .env → config.Load() → bot.Run()
-    │   ├── go.mod                   Module: decibel-mm-bot, go 1.21
+    │   ├── go.mod                   Module: decibel-mm-bot, go 1.24+
     │   ├── .env.example             Credential + trading param template
-    │   ├── README.md                Go-specific usage and parameter reference
-    │   ├── config/config.go         30+ params; CLI flag > env > .env > default layering
+    │   ├── README.md                Usage and parameter reference
+    │   ├── config/config.go         Params; CLI flag > env > .env > default layering
     │   ├── bot/bot.go               Main loop, runCycle(), adaptive spread state machine
     │   ├── api/client.go            Decibel REST API; FetchState() parallel fetch
-    │   ├── aptos/client.go          Ed25519 sign + submit; SubmitEntryFunction(); DeriveAddress()
+    │   ├── aptos/client.go          aptos-go-sdk v1; SubmitEntryFunction()
+    │   ├── aptos/address.go         Named-object derivation (e.g. GlobalPerpEngine for logs)
     │   └── pricing/
     │       ├── pricing.go           Pure ComputeQuotes() — no I/O, no side effects
     │       └── pricing_test.go      Table-driven unit tests
-    ├── rust/                        Rust implementation (mirrors Go exactly)
-    │   ├── Cargo.toml               Crate: decibel-mm-bot, binary: decibel-mm
-    │   ├── Cargo.lock               Locked for reproducible builds
-    │   ├── README.md                Rust-specific usage and parameter reference
-    │   └── src/
-    │       ├── main.rs              Entry: dotenvy → Args::parse() → bot::run()
-    │       ├── config.rs            clap::Parser Args; effective_urls(); parse_private_key()
-    │       ├── bot.rs               Async MarketMaker struct; run_loop(); run_cycle()
-    │       ├── api.rs               reqwest ApiClient; fetch_state() via tokio::try_join!
-    │       ├── aptos.rs             ed25519-dalek; submit_entry_function(); derive_address()
-    │       └── pricing.rs           compute_quotes() + #[cfg(test)] inline tests
-    └── 做市参数调优指南.md           Chinese parameter tuning guide (applies to both impls)
+    └── 做市参数调优指南.md           Chinese parameter tuning guide
 ```
 
 ---
@@ -69,28 +37,16 @@ decibel-bot/
 ```bash
 # ── Go ──────────────────────────────────────────────────────────────────────
 cd market-maker/go
+# Go 1.24+ required (aptos-go-sdk v1)
 
 go run .                                        # run with .env / env vars
 go run . -dry-run                               # no transactions sent
 go run . -network mainnet -spread 0.0005        # override specific params
 go build -o decibel-mm .                        # build binary
 go test ./...                                   # run all tests
-
-# ── Rust ────────────────────────────────────────────────────────────────────
-cd market-maker/rust
-
-cargo run --release                             # run with .env / env vars
-cargo run --release -- --dry-run               # note: -- before flags
-cargo run --release -- --network mainnet --spread 0.0005
-cargo build --release                           # binary: target/release/decibel-mm
-cargo test                                      # run all tests
-
-RUST_LOG=debug cargo run --release              # verbose logging
 ```
 
-**Flag syntax gotcha:** Go uses single dashes (`-dry-run`, `-spread`); Rust/clap uses double
-dashes (`--dry-run`, `--spread`). The `--` separator before Rust flags is required when using
-`cargo run`.
+**Flags:** Go `flag` package uses single dashes (`-dry-run`, `-spread`); `-flag=value` is also valid.
 
 ---
 
@@ -98,8 +54,7 @@ dashes (`--dry-run`, `--spread`). The `--` separator before Rust flags is requir
 
 ### Inventory-skew pricing model
 
-The core algorithm lives in `pricing/pricing.go` (Go) and `pricing.rs` (Rust). It is pure math
-with no I/O — safe to unit test in isolation.
+The core algorithm lives in `pricing/pricing.go`. It is pure math with no I/O — safe to unit test in isolation.
 
 ```
 half_spread = spread / 2
@@ -120,11 +75,11 @@ The skew term is the key: a long position (positive inventory) shifts both quote
 making the ask cheaper and the bid farther from market, which encourages fills that reduce
 the position (mean-reversion).
 
-Returns `nil` / `None` when `|inventory| >= max_inventory` (stop quoting) or size rounds to zero.
+Returns `nil` when `|inventory| >= max_inventory` (stop quoting) or size rounds to zero.
 
 ### Adaptive spread
 
-`effectiveSpread` (`effective_spread` in Rust) is mutable state on the bot struct, starting at
+`effectiveSpread` is mutable state on the bot struct, starting at
 `cfg.Spread`. Adjusted each cycle:
 
 - **Fill detected** (inventory changed by > `lot_size × 0.5`): widen by `spread_step × 0.5`,
@@ -135,14 +90,13 @@ Returns `nil` / `None` when `|inventory| >= max_inventory` (stop quoting) or siz
 
 ### Aptos transaction lifecycle
 
-The fullnode REST API requires this 6-step protocol — it cannot be simplified:
+**Go** uses `aptos-go-sdk` v1 (`EntryFunctionWithArgs` from on-chain ABI, `BuildTransaction`, `SignedTransaction`, `SubmitTransaction`, `WaitForTransaction`), which performs the same logical steps as the classic fullnode flow (sequence + gas, BCS signing, submit, poll).
 
-1. Parallel-fetch sequence number (`GET /accounts/{addr}`) and gas price (`GET /estimate_gas_price`)
-2. Build unsigned JSON transaction with `entry_function_payload`
-3. `POST /transactions/encode_submission` → receive BCS-encoded bytes as hex string
-4. Ed25519-sign the **BCS bytes** (not the JSON)
-5. Attach `{"type": "ed25519_signature", "public_key": "0x...", "signature": "0x..."}` to the JSON
-6. `POST /transactions` → get hash; poll `GET /transactions/by_hash/{hash}` until committed (12 attempts)
+Reference sequence if implementing against raw REST instead of the SDK:
+
+1. Parallel-fetch sequence number and gas price
+2. Build unsigned transaction with `entry_function_payload`
+3. Encode for signing, Ed25519-sign BCS payload, submit, poll by hash until committed
 
 ### Move ABI argument encoding
 
@@ -155,29 +109,21 @@ The fullnode REST API requires this 6-step protocol — it cannot be simplified:
 
 ### Market config scaling
 
-The `/markets` API returns `tick_size`, `lot_size`, `min_size` as raw chain integers. Both
-implementations divide by `10^decimals` immediately after fetching (`FetchMarkets` /
-`fetch_markets`). All internal math uses human-readable floats (e.g. `1.0` = $1, `0.001` = 0.001 BTC).
-Values are scaled back up in `scale_price()` / `scale_size()` when building transactions.
+The `/markets` API returns `tick_size`, `lot_size`, `min_size` as raw chain integers. The bot divides by `10^decimals` immediately after fetching (`FetchMarkets`). All internal math uses human-readable floats (e.g. `1.0` = $1, `0.001` = 0.001 BTC). Values are scaled back up in `scale_price()` / `scale_size()` when building transactions.
 
 ### Address normalization
 
-Aptos addresses may have varying `0x` prefixes and leading zeros. Both implementations normalize
-before comparison: strip `0x`, lowercase, strip leading zeros. See `AddrEqual` (Go) / `addr_eq` (Rust).
+Aptos addresses may have varying `0x` prefixes and leading zeros. The API client normalizes before comparison: strip `0x`, lowercase, strip leading zeros (`AddrEqual`).
 
 ### Cancel semantics
 
 A cancel that fails with `ERESOURCE_DOES_NOT_EXIST` or `EORDER_NOT_FOUND` is treated as
 **success** — the order is already gone. Only genuine VM failures trigger the `CANCEL_RESYNC_S` wait.
-See `TxResult.CancelSucceeded()` (Go) / `tx_result.cancel_succeeded()` (Rust).
+See `TxResult.CancelSucceeded()`.
 
 ### State fetch is always parallel
 
-Every cycle, account overview + positions + open orders + mid-price are fetched concurrently:
-- Go: `errgroup.WithContext`
-- Rust: `tokio::try_join!`
-
-This is intentional. Serial fetching adds ~200 ms per cycle.
+Every cycle, account overview + positions + open orders + mid-price are fetched concurrently via `errgroup.WithContext`. Serial fetching adds ~200 ms per cycle.
 
 ---
 
@@ -197,7 +143,8 @@ which can then be individually overridden.
 | `BEARER_TOKEN` | REST API bearer token from Decibel dashboard |
 | `SUBACCOUNT_ADDRESS` | Your subaccount object address (`0x...`) |
 | `PRIVATE_KEY` | 32-byte Ed25519 seed, hex-encoded (`0x` prefix optional; also accepts 64-byte seed‖pubkey) |
-| `PERP_ENGINE_GLOBAL_ADDRESS` | Perp engine global object address |
+
+`PACKAGE_ADDRESS` must be non-empty (set explicitly or via `NETWORK` preset). The **GlobalPerpEngine** address is derived from the package address for logging only (not configurable).
 
 **Network (defaults apply per preset):**
 
@@ -221,7 +168,7 @@ which can then be individually overridden.
 **Quick start:**
 ```bash
 cp market-maker/go/.env.example market-maker/go/.env
-# Fill in: BEARER_TOKEN, SUBACCOUNT_ADDRESS, PRIVATE_KEY, PERP_ENGINE_GLOBAL_ADDRESS
+# Fill in: BEARER_TOKEN, SUBACCOUNT_ADDRESS, PRIVATE_KEY
 go run . -dry-run    # validate config before going live
 ```
 
@@ -229,18 +176,16 @@ go run . -dry-run    # validate config before going live
 
 ## Testing Conventions
 
-- Pricing logic is unit-tested in isolation in **both** languages — no network, no state
-- Test parameters are matched across Go and Rust: `mid=100_000`, `spread=0.001`, `tick=1.0`, `lot=0.00001`
-- **When changing pricing logic: run `go test ./...` AND `cargo test`**
-- Rust also has unit tests for address derivation in `aptos.rs`
-- No integration tests exist — use `--dry-run` against a live network for end-to-end validation
+- Pricing logic is unit-tested in isolation — no network, no state (`go test ./...`)
+- Typical test parameters: `mid=100_000`, `spread=0.001`, `tick=1.0`, `lot=0.00001`
+- Aptos named-object derivation is tested in `aptos/address_test.go`
+- No integration tests — use `--dry-run` against a live network for end-to-end validation
 
 ---
 
 ## Notes for AI Assistants
 
-- Always open both language counterparts before editing any module
-- The pricing module is the most common change target — tests exist for it in both languages
+- The pricing module is the most common change target — unit tests live in `pricing_test.go`
 - `做市参数调优指南.md` is operational guidance for human traders; it does not require code changes
-- Go module name: `decibel-mm-bot`; Rust crate name: `decibel-mm-bot`, binary: `decibel-mm`
+- Go module name: `decibel-mm-bot`
 - Do not add error handling for impossible states (e.g. mid-price always positive inside `runCycle` — it's already guarded before the call)
