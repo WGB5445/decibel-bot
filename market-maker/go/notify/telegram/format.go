@@ -66,7 +66,7 @@ func formatPositions(snap botstate.Snapshot) string {
 		if botstate.IDEqual(p.MarketID, snap.TargetMarketID) {
 			name = snap.TargetMarketName
 		}
-		sb.WriteString(fmt.Sprintf("• *%s*  %s  `%.5f`\n", name, dir, math.Abs(p.Size)))
+		sb.WriteString(fmt.Sprintf("• *%s*  %s  `%.5f`\n", escapeMarkdown(name), dir, math.Abs(p.Size)))
 
 		if botstate.IDEqual(p.MarketID, snap.TargetMarketID) {
 			if snap.Mid != nil {
@@ -108,7 +108,7 @@ func formatInventoryAlert(snap botstate.Snapshot, maxInventory float64) string {
 			"方向: `%s`\n"+
 			"仓位: `%.5f` (限制: `%.5f`)"+
 			"\n当前价: `%s`%s",
-		snap.TargetMarketName, dir,
+		escapeMarkdown(snap.TargetMarketName), dir,
 		math.Abs(snap.Inventory), maxInventory,
 		midStr, pnlLine,
 	)
@@ -140,4 +140,16 @@ func formatPnL(pnl, pct float64) string {
 		sign = ""
 	}
 	return fmt.Sprintf("`%s$%.2f (%s%.2f%%)`", sign, pnl, sign, pct)
+}
+
+// escapeMarkdown escapes Telegram MarkdownV1 special characters.
+// Special chars: _ * ` [
+func escapeMarkdown(s string) string {
+	r := strings.NewReplacer(
+		"_", "\\_",
+		"*", "\\*",
+		"`", "\\`",
+		"[", "\\[",
+	)
+	return r.Replace(s)
 }

@@ -108,10 +108,18 @@ func (t *TelegramNotifier) handleUpdate(ctx context.Context, update tgbotapi.Upd
 
 	switch {
 	case update.Message != nil && update.Message.IsCommand():
+		// Only respond in private chats from admin
+		if update.Message.Chat.Type != "private" {
+			return
+		}
 		if t.isAdmin(update.Message.From.ID) {
 			t.handleCommand(ctx, update.Message)
 		}
 	case update.CallbackQuery != nil:
+		// Only respond to callbacks in private chats from admin
+		if update.CallbackQuery.Message != nil && update.CallbackQuery.Message.Chat.Type != "private" {
+			return
+		}
 		if t.isAdmin(update.CallbackQuery.From.ID) {
 			t.handleCallback(ctx, update.CallbackQuery)
 		}
