@@ -73,8 +73,8 @@ type Config struct {
 	RestAPIBase        string
 
 	// ── Telegram ─────────────────────────────────────────────────────────────
-	TGBotToken               string // TG_BOT_TOKEN or -tg-token
-	TGAdminID                int64  // TG_ADMIN_ID  or -tg-admin-id
+	TGBotToken               string // TG_BOT_TOKEN
+	TGAdminID                int64  // TG_ADMIN_ID
 	TGAlertInventory         bool   // TG_ALERT_INVENTORY or -tg-alert-inventory
 	TGAlertInventoryInterval int    // TG_ALERT_INVENTORY_INTERVAL_MIN or -tg-alert-interval
 }
