@@ -2,11 +2,62 @@
 
 A perpetual-futures market-maker bot for the [Decibel DEX](https://decibel.trade) on Aptos.
 
+**Built with a three-layer pluggable architecture** for extensibility:
+- **Exchange Layer** — abstraction for different DEX/chains (currently Decibel/Aptos)
+- **Strategy Layer** — market-making logic decoupled from exchange details
+- **Notification Layer** — monitoring/control via Telegram (extensible to Discord, Slack, etc.)
+
 Requires **Go 1.24+**. On-chain transactions use [aptos-go-sdk](https://github.com/aptos-labs/aptos-go-sdk) **v1** (`github.com/aptos-labs/aptos-go-sdk`, currently **v1.12.1** in [`go.mod`](go.mod)). Aptos officially recommends v2 for new projects; this bot stays on v1 for a stable path: load module ABI from the node (`EntryFunctionWithArgs`), `BuildTransaction`, sign with `SignedTransaction`, `SubmitTransaction`, then `WaitForTransaction` (poll timeout up to about **60s**, shorter if the request `context` has a deadline).
 
 **Fullnode connection:** [`aptos.NewNodeClient`](aptos/client.go) takes `(fullnodeURL, apiKey, chainID)`. The API key is sent as `Authorization: Bearer …` when non-empty (from `NODE_API_KEY`, else `BEARER_TOKEN`). **`chainID`** comes from [`aptos.ChainIDForNetwork(cfg.Network)`](aptos/client.go): **testnet = 2**, **mainnet = 1**; any other network name uses **0** and the SDK may fetch chain id from the node.
 
 **Signing account:** [`aptos.ParseAccount`](aptos/client.go) accepts raw hex (optional `0x`), **64-byte hex seed‖pubkey** (only the **first 32 bytes** are used as the Ed25519 seed), or AIP-80 `ed25519-priv-…`. **secp256k1** keys are rejected.
+
+## Architecture
+
+**Package Structure:**
+- `exchange/` — Exchange interface + Decibel implementation
+  - `exchange.Exchange` — abstract interface: FindMarket, FetchState, PlaceOrder, CancelOrder, GasBalance
+  - `exchange/decibel/` — Decibel DEX on Aptos (wraps `api/` + `aptos/`)
+- `strategy/` — Market-making cycle (inventory-skew pricing, adaptive spread)
+  - Only uses the `Exchange` interface (no knowledge of Decibel/Aptos)
+  - Embeds `botstate.BotState` for notification layer access
+- `notify/` — Notifier interface + Telegram implementation
+  - `notify.Notifier` — abstract interface: Run()
+  - `notify.InfoProvider` — read-only interface for querying bot state
+  - `notify/telegram/` — Telegram commands and alerts
+- `botstate/` — Thread-safe shared state (no external dependencies except `config`)
+- `api/` — Decibel REST client (internal to `exchange/decibel/`)
+- `aptos/` — Aptos chain client (internal to `exchange/decibel/`)
+- `pricing/` — Inventory-skew quote computation (pure logic, no I/O)
+- `config/` — Configuration loading (CLI flags, env vars, .env file)
+
+**Future extensibility**: Adding Binance requires only implementing `Exchange` in `exchange/binance/`. Adding Discord requires only implementing `Notifier` in `notify/discord/`. The strategy layer and main orchestration remain unchanged.
+
+## Telegram Notifications (Optional)
+
+The bot can run Telegram commands and send inventory-limit alerts when configured. To enable, set:
+
+```bash
+export TG_BOT_TOKEN="<your-bot-token>"
+export TG_ADMIN_ID="<your-telegram-user-id>"
+export TG_ALERT_INVENTORY=true        # optional: enable inventory alerts
+export TG_ALERT_INVENTORY_INTERVAL_MIN=30  # optional: minutes between alerts
+```
+
+**Commands** (send to the bot via Telegram chat):
+- `/balance` — Account equity, available balance, margin usage, last update time
+- `/gas` — Wallet APT balance (gas for on-chain transactions)
+- `/positions` — All open positions with P&L (for the target market)
+- `/help` — Available command list
+
+**Alerts**: When `abs(inventory) ≥ MAX_INVENTORY`, the bot automatically sends an alert message with buttons to:
+- **Close** — Places a reduce-only market order to flatten the position
+- **Refresh** — Updates the alert message with current state
+
+The alert auto-refreshes every `TG_ALERT_INVENTORY_INTERVAL_MIN` minutes (default 30). For more details, see the **Telegram notifications** section under [Configuration](#configuration).
+
+---
 
 ## Quick start
 
@@ -111,6 +162,28 @@ These override the values set by `NETWORK`. Leave unset to use the network profi
 | `APTOS_FULLNODE_URL` | `-fullnode-url` | Aptos-compatible fullnode URL |
 | `PACKAGE_ADDRESS` | `-package-address` | Move package address |
 | `MARKET_ADDR` | _(env only)_ | Skip market discovery and use this PerpMarket object address directly. |
+
+---
+
+### Telegram notifications (optional)
+
+Enable Telegram monitoring and alerts by setting **both** `TG_BOT_TOKEN` and `TG_ADMIN_ID`. When either is unset, Telegram is disabled.
+
+| Env var | CLI flag | Default | Description |
+|---------|----------|---------|-------------|
+| `TG_BOT_TOKEN` | _(env only)_ | _(unset)_ | Telegram bot token from BotFather. **Do not pass via CLI flag** (security: visible in process list). |
+| `TG_ADMIN_ID` | _(env only)_ | _(unset)_ | Your Telegram user ID (numeric). Get it from the `/start` message after talking to your bot. |
+| `TG_ALERT_INVENTORY` | `-tg-alert-inventory` | `false` | Enable automatic alerts when `abs(inventory) ≥ MAX_INVENTORY`. |
+| `TG_ALERT_INVENTORY_INTERVAL_MIN` | `-tg-alert-interval` | `30` | Minutes between repeated inventory-limit alerts. |
+
+**Example:**
+```bash
+export TG_BOT_TOKEN="123456:ABCDefGHijKLmnoPQRstUVwxyz"
+export TG_ADMIN_ID="987654321"
+export TG_ALERT_INVENTORY=true
+export TG_ALERT_INVENTORY_INTERVAL_MIN=15
+go run .
+```
 
 ---
 
