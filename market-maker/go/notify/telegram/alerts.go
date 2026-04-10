@@ -22,6 +22,12 @@ type alertState struct {
 // runInventoryAlertLoop periodically checks whether the inventory exceeds the
 // configured limit and sends (or updates) a Telegram alert message.
 func (t *TelegramNotifier) runInventoryAlertLoop(ctx context.Context) {
+	defer func() {
+		if r := recover(); r != nil {
+			slog.Error("tgbot: inventory alert loop panic", "err", r)
+		}
+	}()
+
 	interval := time.Duration(t.cfg.AlertInventoryInterval) * time.Minute
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
