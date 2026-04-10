@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"log/slog"
 	"math"
-	"strings"
 
 	aptossdk "github.com/aptos-labs/aptos-go-sdk"
 
@@ -92,6 +91,9 @@ func (d *DecibelExchange) SetMarket(m *exchange.MarketConfig) {
 
 // FetchState fetches the full state snapshot for one cycle.
 func (d *DecibelExchange) FetchState(ctx context.Context) (*exchange.StateSnapshot, error) {
+	if d.market == nil {
+		return nil, fmt.Errorf("market not set: call SetMarket first")
+	}
 	snap, err := d.apiClient.FetchState(ctx, d.cfg.SubaccountAddress, d.market.MarketID)
 	if err != nil {
 		return nil, fmt.Errorf("fetch state: %w", err)
@@ -101,6 +103,9 @@ func (d *DecibelExchange) FetchState(ctx context.Context) (*exchange.StateSnapsh
 
 // FetchOpenOrders fetches open orders (used for resync after cancel failures).
 func (d *DecibelExchange) FetchOpenOrders(ctx context.Context) ([]exchange.OpenOrder, error) {
+	if d.market == nil {
+		return nil, fmt.Errorf("market not set: call SetMarket first")
+	}
 	orders, err := d.apiClient.FetchOpenOrders(ctx, d.cfg.SubaccountAddress)
 	if err != nil {
 		return nil, err
@@ -120,6 +125,9 @@ func (d *DecibelExchange) FetchOpenOrders(ctx context.Context) ([]exchange.OpenO
 
 // PlaceOrder places a limit order on Decibel via Aptos entry function.
 func (d *DecibelExchange) PlaceOrder(ctx context.Context, req exchange.PlaceOrderRequest) error {
+	if d.market == nil {
+		return fmt.Errorf("market not set: call SetMarket first")
+	}
 	side := "ASK"
 	if req.IsBuy {
 		side = "BID"
@@ -163,6 +171,9 @@ func (d *DecibelExchange) PlaceOrder(ctx context.Context, req exchange.PlaceOrde
 
 // CancelOrder cancels a single order on Decibel via Aptos entry function.
 func (d *DecibelExchange) CancelOrder(ctx context.Context, orderID string) error {
+	if d.market == nil {
+		return fmt.Errorf("market not set: call SetMarket first")
+	}
 	fn := d.cfg.PackageAddress + "::dex_accounts_entry::cancel_order_to_subaccount"
 
 	slog.Info("cancelling order", "order_id", orderID, "dry_run", d.dryRun)
@@ -271,18 +282,4 @@ func apiStateToExchange(s *api.StateSnapshot) *exchange.StateSnapshot {
 		OpenOrders:   orders,
 		AllPositions: positions,
 	}
-}
-
-// AddrEqual compares two addresses using the same normalization as the api package.
-func AddrEqual(a, b string) bool {
-	return normalizeAddr(a) == normalizeAddr(b)
-}
-
-func normalizeAddr(addr string) string {
-	s := strings.TrimPrefix(strings.ToLower(addr), "0x")
-	s = strings.TrimLeft(s, "0")
-	if s == "" {
-		return "0"
-	}
-	return s
 }

@@ -94,7 +94,11 @@ func main() {
 			slog.Warn("telegram bot init failed, continuing without it", "err", err)
 		} else {
 			slog.Info("telegram bot started")
-			go tg.Run(ctx)
+			go func() {
+				if err := tg.Run(ctx); err != nil && ctx.Err() == nil {
+					slog.Error("telegram bot exited with error", "err", err)
+				}
+			}()
 		}
 	}
 

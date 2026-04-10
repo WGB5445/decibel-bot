@@ -163,11 +163,7 @@ func Load() (*Config, error) {
 	flag.StringVar(&cfg.PrivateKey, "private-key", cfg.PrivateKey, "Ed25519 private key hex or AIP-80 (overrides PRIVATE_KEY); visible in process list")
 	flag.StringVar(&cfg.NodeAPIKey, "node-api-key", cfg.NodeAPIKey, "Fullnode API key (overrides NODE_API_KEY; falls back to bearer token)")
 
-	// Telegram
-	flag.StringVar(&cfg.TGBotToken, "tg-token", cfg.TGBotToken,
-		"Telegram bot token (overrides TG_BOT_TOKEN)")
-	flag.Int64Var(&cfg.TGAdminID, "tg-admin-id", cfg.TGAdminID,
-		"Telegram admin user ID (overrides TG_ADMIN_ID)")
+	// Telegram (TG_BOT_TOKEN and TG_ADMIN_ID are env-only for security - not exposed via CLI)
 	flag.BoolVar(&cfg.TGAlertInventory, "tg-alert-inventory", cfg.TGAlertInventory,
 		"Enable Telegram alert when position exceeds max-inventory (overrides TG_ALERT_INVENTORY)")
 	flag.IntVar(&cfg.TGAlertInventoryInterval, "tg-alert-interval", cfg.TGAlertInventoryInterval,

@@ -69,7 +69,7 @@ func (t *TelegramNotifier) Run(ctx context.Context) error {
 			if !ok {
 				return nil
 			}
-			go t.handleUpdate(ctx, update)
+			t.handleUpdate(ctx, update)
 		}
 	}
 }

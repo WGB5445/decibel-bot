@@ -128,6 +128,8 @@ func normalizeID(id string) string {
 }
 
 // estimateEntryPrice updates a VWAP entry-price estimate when a fill is detected.
+// Handles three cases: position increase (VWAP), position decrease (keep entry),
+// and position flip (reset to current price).
 func estimateEntryPrice(prevEntry, prevSize, newSize float64, mid *float64) float64 {
 	if math.Abs(newSize) < 1e-9 {
 		return 0 // position closed
@@ -139,6 +141,15 @@ func estimateEntryPrice(prevEntry, prevSize, newSize float64, mid *float64) floa
 	if mid == nil {
 		return prevEntry // can't update without a price
 	}
+	// Position flip (sign change) - reset to current price
+	if prevSize*newSize < 0 {
+		return *mid
+	}
+	// Position decrease (|newSize| < |prevSize|) - keep original entry
+	if math.Abs(newSize) < math.Abs(prevSize) {
+		return prevEntry
+	}
+	// Position increase - VWAP calculation
 	if prevEntry == 0 || math.Abs(prevSize) < 1e-9 {
 		return *mid // brand-new position
 	}

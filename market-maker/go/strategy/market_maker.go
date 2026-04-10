@@ -48,11 +48,10 @@ func (m *MarketMaker) State() *botstate.BotState { return m.state }
 // Safe to call from any goroutine (reads state via snapshot).
 func (m *MarketMaker) FlattenPosition(ctx context.Context) error {
 	snap := m.state.Get()
-	mid := 0.0
-	if snap.Mid != nil {
-		mid = *snap.Mid
+	if snap.Mid == nil {
+		return fmt.Errorf("cannot flatten position: mid price unavailable")
 	}
-	return m.placeFlattenOrder(ctx, snap.Inventory, mid)
+	return m.placeFlattenOrder(ctx, snap.Inventory, *snap.Mid)
 }
 
 // Run starts the main market-making loop. Blocks until ctx is cancelled.
