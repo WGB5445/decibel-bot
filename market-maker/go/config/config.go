@@ -71,6 +71,17 @@ type Config struct {
 	AptosFullnodeURL   string
 	MarketAddrOverride string // skips API discovery
 	RestAPIBase        string
+
+	// ── Telegram ─────────────────────────────────────────────────────────────
+	TGBotToken               string // TG_BOT_TOKEN or -tg-token
+	TGAdminID                int64  // TG_ADMIN_ID  or -tg-admin-id
+	TGAlertInventory         bool   // TG_ALERT_INVENTORY or -tg-alert-inventory
+	TGAlertInventoryInterval int    // TG_ALERT_INVENTORY_INTERVAL_MIN or -tg-alert-interval
+}
+
+// TelegramEnabled reports whether the Telegram bot should be started.
+func (c *Config) TelegramEnabled() bool {
+	return c.TGBotToken != "" && c.TGAdminID != 0
 }
 
 // Load reads env vars, applies network defaults, parses CLI flags (overrides), then validates.
@@ -117,6 +128,11 @@ func Load() (*Config, error) {
 		RestAPIBase:      envStr("REST_API_BASE", profile.RestAPIBase),
 		AptosFullnodeURL: envStr("APTOS_FULLNODE_URL", profile.AptosFullnodeURL),
 		PackageAddress:   envStr("PACKAGE_ADDRESS", profile.PackageAddress),
+
+		TGBotToken:               os.Getenv("TG_BOT_TOKEN"),
+		TGAdminID:                envInt64("TG_ADMIN_ID", 0),
+		TGAlertInventory:         envBool("TG_ALERT_INVENTORY", false),
+		TGAlertInventoryInterval: int(envFloat("TG_ALERT_INVENTORY_INTERVAL_MIN", 30)),
 	}
 
 	flag.StringVar(&cfg.Network, "network", cfg.Network,
@@ -147,6 +163,16 @@ func Load() (*Config, error) {
 	flag.StringVar(&cfg.PrivateKey, "private-key", cfg.PrivateKey, "Ed25519 private key hex or AIP-80 (overrides PRIVATE_KEY); visible in process list")
 	flag.StringVar(&cfg.NodeAPIKey, "node-api-key", cfg.NodeAPIKey, "Fullnode API key (overrides NODE_API_KEY; falls back to bearer token)")
 
+	// Telegram
+	flag.StringVar(&cfg.TGBotToken, "tg-token", cfg.TGBotToken,
+		"Telegram bot token (overrides TG_BOT_TOKEN)")
+	flag.Int64Var(&cfg.TGAdminID, "tg-admin-id", cfg.TGAdminID,
+		"Telegram admin user ID (overrides TG_ADMIN_ID)")
+	flag.BoolVar(&cfg.TGAlertInventory, "tg-alert-inventory", cfg.TGAlertInventory,
+		"Enable Telegram alert when position exceeds max-inventory (overrides TG_ALERT_INVENTORY)")
+	flag.IntVar(&cfg.TGAlertInventoryInterval, "tg-alert-interval", cfg.TGAlertInventoryInterval,
+		"Minutes between repeated inventory-limit Telegram alerts (overrides TG_ALERT_INVENTORY_INTERVAL_MIN)")
+
 	flag.Parse()
 
 	flagsSet := make(map[string]struct{})
@@ -176,6 +202,11 @@ func Load() (*Config, error) {
 }
 
 func (c *Config) validate() error {
+	// Clamp TGAlertInventoryInterval to avoid time.NewTicker(0) panic.
+	if c.TGAlertInventoryInterval <= 0 {
+		c.TGAlertInventoryInterval = 30
+	}
+
 	var missing []string
 	if c.BearerToken == "" {
 		missing = append(missing, "BEARER_TOKEN (-bearer-token)")
@@ -268,6 +299,15 @@ func envBool(key string, def bool) bool {
 	if v := os.Getenv(key); v != "" {
 		if b, err := strconv.ParseBool(v); err == nil {
 			return b
+		}
+	}
+	return def
+}
+
+func envInt64(key string, def int64) int64 {
+	if v := os.Getenv(key); v != "" {
+		if i, err := strconv.ParseInt(v, 10, 64); err == nil {
+			return i
 		}
 	}
 	return def
