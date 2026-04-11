@@ -74,36 +74,36 @@ func (p *PriceInfo) Mid() *float64 {
 
 // TradeHistoryItem is one element of GET /trade_history "items".
 type TradeHistoryItem struct {
-	Account                 string  `json:"account"`
-	Market                  string  `json:"market"`
-	Action                  string  `json:"action"`
-	Source                  string  `json:"source"`
-	TradeID                 string  `json:"trade_id"`
-	Size                    float64 `json:"size"`
-	Price                   float64 `json:"price"`
-	IsProfit                bool    `json:"is_profit"`
-	RealizedPnlAmount       float64 `json:"realized_pnl_amount"`
-	RealizedFundingAmount   float64 `json:"realized_funding_amount"`
-	IsRebate                bool    `json:"is_rebate"`
-	FeeAmount               float64 `json:"fee_amount"`
-	OrderID                 string  `json:"order_id"`
-	ClientOrderID           string  `json:"client_order_id"`
-	TransactionUnixMs       int64   `json:"transaction_unix_ms"`
-	TransactionVersion      int64   `json:"transaction_version"`
+	Account               string  `json:"account"`
+	Market                string  `json:"market"`
+	Action                string  `json:"action"`
+	Source                string  `json:"source"`
+	TradeID               string  `json:"trade_id"`
+	Size                  float64 `json:"size"`
+	Price                 float64 `json:"price"`
+	IsProfit              bool    `json:"is_profit"`
+	RealizedPnlAmount     float64 `json:"realized_pnl_amount"`
+	RealizedFundingAmount float64 `json:"realized_funding_amount"`
+	IsRebate              bool    `json:"is_rebate"`
+	FeeAmount             float64 `json:"fee_amount"`
+	OrderID               string  `json:"order_id"`
+	ClientOrderID         string  `json:"client_order_id"`
+	TransactionUnixMs     int64   `json:"transaction_unix_ms"`
+	TransactionVersion    int64   `json:"transaction_version"`
 }
 
 // TradeHistoryParams are query parameters for GET /trade_history.
 type TradeHistoryParams struct {
-	Account         string
-	Market          string
-	OrderID         string
-	Side            string // buy | sell
-	StartTimestamp  int64 // ms
-	EndTimestamp    int64 // ms
-	SortKey         string
-	SortDir         string
-	Limit           int
-	Offset          int
+	Account        string
+	Market         string
+	OrderID        string
+	Side           string // buy | sell
+	StartTimestamp int64  // ms
+	EndTimestamp   int64  // ms
+	SortKey        string
+	SortDir        string
+	Limit          int
+	Offset         int
 }
 
 type tradeHistoryPage struct {
@@ -112,17 +112,17 @@ type tradeHistoryPage struct {
 
 // MarketConfig is a single entry from GET /markets.
 type MarketConfig struct {
-	MarketAddr               string  `json:"market_addr"`
-	MarketName               string  `json:"market_name"`
-	TickSize                 float64 `json:"tick_size"`
-	LotSize                  float64 `json:"lot_size"`
-	MinSize                  float64 `json:"min_size"`
-	PxDecimals               int     `json:"px_decimals"`
-	SzDecimals               int     `json:"sz_decimals"`
-	MaxLeverage              int     `json:"max_leverage"`
-	Mode                     string  `json:"mode"`
-	MaxOpenInterest          float64 `json:"max_open_interest"`
-	UnrealizedPnlHaircutBps  int     `json:"unrealized_pnl_haircut_bps"`
+	MarketAddr              string  `json:"market_addr"`
+	MarketName              string  `json:"market_name"`
+	TickSize                float64 `json:"tick_size"`
+	LotSize                 float64 `json:"lot_size"`
+	MinSize                 float64 `json:"min_size"`
+	PxDecimals              int     `json:"px_decimals"`
+	SzDecimals              int     `json:"sz_decimals"`
+	MaxLeverage             int     `json:"max_leverage"`
+	Mode                    string  `json:"mode"`
+	MaxOpenInterest         float64 `json:"max_open_interest"`
+	UnrealizedPnlHaircutBps int     `json:"unrealized_pnl_haircut_bps"`
 }
 
 // StateSnapshot captures everything the bot needs for one cycle decision.

@@ -217,14 +217,14 @@ func (d *DecibelExchange) PlaceBulkOrders(ctx context.Context, bids, asks []exch
 	slog.Info("submitting bulk orders", "bids", len(bids), "asks", len(asks), "bulk_seq", d.bulkSeq)
 	result, err := d.aptosNode.SubmitEntryFunction(ctx, d.aptosSigner, fn, nil, []any{
 		d.cfg.SubaccountAddress, //  1. subaccount
-		d.market.MarketID,      //  2. market
-		d.bulkSeq,              //  3. sequence_number (u64)
-		bidPrices,              //  4. bid_prices vector<u64>
-		bidSizes,               //  5. bid_sizes  vector<u64>
-		askPrices,              //  6. ask_prices vector<u64>
-		askSizes,               //  7. ask_sizes  vector<u64>
-		nil,                    //  8. builder_address Option<address>
-		nil,                    //  9. builder_fees    Option<u64>
+		d.market.MarketID,       //  2. market
+		d.bulkSeq,               //  3. sequence_number (u64)
+		bidPrices,               //  4. bid_prices vector<u64>
+		bidSizes,                //  5. bid_sizes  vector<u64>
+		askPrices,               //  6. ask_prices vector<u64>
+		askSizes,                //  7. ask_sizes  vector<u64>
+		nil,                     //  8. builder_address Option<address>
+		nil,                     //  9. builder_fees    Option<u64>
 	})
 	if err != nil {
 		d.bulkSeq-- // revert on submission error so next retry uses same seq
