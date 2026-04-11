@@ -1,0 +1,178 @@
+// Package telegram — formatting functions. All functions in this file are pure
+// (no I/O, no side effects).
+package telegram
+
+import (
+	"fmt"
+	"math"
+	"strings"
+	"time"
+
+	"decibel-mm-bot/botstate"
+)
+
+// ── Balance ──────────────────────────────────────────────────────────────────
+
+func formatBalance(snap botstate.Snapshot) string {
+	available := snap.Equity * (1.0 - snap.MarginUsage)
+	return fmt.Sprintf(
+		"*💰 账户余额*\n"+
+			"可用余额: `$%.2f`\n"+
+			"总权益: `$%.2f`\n"+
+			"保证金占用: `%.1f%%`\n"+
+			"_%s_",
+		available, snap.Equity, snap.MarginUsage*100, cycleAge(snap.LastCycleAt),
+	)
+}
+
+// ── Gas ──────────────────────────────────────────────────────────────────────
+
+func formatGas(walletAddr string, aptBal float64, err error) string {
+	if err != nil {
+		return fmt.Sprintf("*⛽ Gas 钱包*\n地址: `%s`\n❌ 查询失败: %v", walletAddr, err)
+	}
+	return fmt.Sprintf("*⛽ Gas 钱包*\n地址: `%s`\nAPT 余额: `%.4f APT`", walletAddr, aptBal)
+}
+
+// ── Positions ────────────────────────────────────────────────────────────────
+
+func formatPositions(snap botstate.Snapshot) string {
+	hasNonZero := false
+	for _, p := range snap.AllPositions {
+		if math.Abs(p.Size) >= 1e-9 {
+			hasNonZero = true
+			break
+		}
+	}
+	if !hasNonZero {
+		return "*📊 当前仓位*\n暂无持仓。"
+	}
+
+	var sb strings.Builder
+	sb.WriteString("*📊 当前仓位*\n")
+	for _, p := range snap.AllPositions {
+		if math.Abs(p.Size) < 1e-9 {
+			continue
+		}
+		dir := "LONG ▲"
+		if p.Size < 0 {
+			dir = "SHORT ▼"
+		}
+		name := p.MarketID
+		if botstate.IDEqual(p.MarketID, snap.TargetMarketID) {
+			name = snap.TargetMarketName
+		}
+		sb.WriteString(fmt.Sprintf("• *%s*  %s  `%.5f`\n", escapeMarkdown(name), dir, math.Abs(p.Size)))
+
+		if botstate.IDEqual(p.MarketID, snap.TargetMarketID) {
+			if snap.Mid != nil {
+				sb.WriteString(fmt.Sprintf("  当前价: `$%.2f`\n", *snap.Mid))
+			}
+			if snap.EntryPrice > 0 && snap.Mid != nil {
+				pnl := (*snap.Mid - snap.EntryPrice) * p.Size
+				pct := (*snap.Mid - snap.EntryPrice) / snap.EntryPrice * 100
+				sb.WriteString(fmt.Sprintf("  ~盈亏: %s\n", formatPnL(pnl, pct)))
+			}
+		}
+	}
+	sb.WriteString(fmt.Sprintf("_%s_", cycleAge(snap.LastCycleAt)))
+	return sb.String()
+}
+
+// ── Inventory alert ──────────────────────────────────────────────────────────
+
+func formatInventoryAlert(snap botstate.Snapshot, maxInventory float64) string {
+	dir := "LONG ▲"
+	if snap.Inventory < 0 {
+		dir = "SHORT ▼"
+	}
+	midStr := "N/A"
+	if snap.Mid != nil {
+		midStr = fmt.Sprintf("$%.2f", *snap.Mid)
+	}
+
+	var pnlLine string
+	if snap.EntryPrice > 0 && snap.Mid != nil {
+		pnl := (*snap.Mid - snap.EntryPrice) * snap.Inventory
+		pct := (*snap.Mid - snap.EntryPrice) / snap.EntryPrice * 100
+		pnlLine = fmt.Sprintf("\n~盈亏: %s", formatPnL(pnl, pct))
+	}
+
+	return fmt.Sprintf(
+		"⚠️ *仓位超限提醒*\n"+
+			"市场: `%s`\n"+
+			"方向: `%s`\n"+
+			"仓位: `%.5f` (限制: `%.5f`)"+
+			"\n当前价: `%s`%s",
+		escapeMarkdown(snap.TargetMarketName), dir,
+		math.Abs(snap.Inventory), maxInventory,
+		midStr, pnlLine,
+	)
+}
+
+// ── Help ─────────────────────────────────────────────────────────────────────
+
+func formatHelp(cfg Config) string {
+	var sb strings.Builder
+	sb.WriteString("*🤖 Decibel 做市机器人*\n\n")
+	sb.WriteString("*可用命令*\n")
+	sb.WriteString("/balance — 查看账户余额\n")
+	sb.WriteString("/gas — 查看钱包 APT 余额\n")
+	sb.WriteString("/positions — 查看当前仓位\n")
+	sb.WriteString("/help — 显示帮助\n")
+	sb.WriteString("下方按钮可快捷打开对应视图（与命令等价）。\n\n")
+
+	sb.WriteString("*Telegram 配置*\n")
+	sb.WriteString("启用 bot 需同时设置 `TG_BOT_TOKEN` 与 `TG_ADMIN_ID`（环境变量或 `--tg-token` / `--tg-admin-id`）。\n")
+	sb.WriteString("凭证优先用 `.env`；命令行传参会出现在进程列表。\n")
+	sb.WriteString("库存告警：`TG_ALERT_INVENTORY`（或 `--tg-alert-inventory`）\n")
+	sb.WriteString("告警间隔（分钟）：`TG_ALERT_INVENTORY_INTERVAL_MIN`（或 `--tg-alert-interval`）\n")
+	sb.WriteString("严格启动：`TG_STRICT_START`（或 `--tg-strict-start`）— Telegram 就绪失败则进程退出。\n\n")
+
+	alertLine := "仓位超限提醒: 关闭"
+	if cfg.AlertInventory {
+		alertLine = fmt.Sprintf("仓位超限提醒: 开启（每 %d 分钟检查）", cfg.AlertInventoryInterval)
+	}
+	sb.WriteString("*当前进程*\n")
+	sb.WriteString(alertLine)
+	sb.WriteString("\n\n")
+
+	sb.WriteString("*安全说明*\n")
+	sb.WriteString("仅在私聊中与配置的 admin 生效；群组内不响应。\n")
+
+	return sb.String()
+}
+
+// ── Internal helpers ─────────────────────────────────────────────────────────
+
+func cycleAge(lastCycleAt time.Time) string {
+	if lastCycleAt.IsZero() {
+		return "正在获取..."
+	}
+	t := lastCycleAt.Local()
+	now := time.Now().In(t.Location())
+	if t.Year() == now.Year() {
+		return "更新于 " + t.Format("1/2 15:04")
+	}
+	return "更新于 " + t.Format("2006/1/2 15:04")
+}
+
+func formatPnL(pnl, pct float64) string {
+	sign := "+"
+	if pnl < 0 {
+		sign = ""
+	}
+	return fmt.Sprintf("`%s$%.2f (%s%.2f%%)`", sign, pnl, sign, pct)
+}
+
+// escapeMarkdown escapes Telegram MarkdownV1 special characters.
+// Special chars: _ * ` [
+func escapeMarkdown(s string) string {
+	r := strings.NewReplacer(
+		"_", "\\_",
+		"*", "\\*",
+		"`", "\\`",
+		"[", "\\[",
+	)
+	return r.Replace(s)
+}

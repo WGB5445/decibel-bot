@@ -10,15 +10,15 @@ import (
 
 // Default test parameters.
 const (
-	mid       = 100_000.0
-	spread    = 0.001 // 0.1 %
-	tick      = 1.0
-	lot       = 0.00001
-	minSz     = 0.00002
-	orderSz   = 0.001
-	skew      = 0.0001
-	maxInv    = 0.005
-	eps       = 1e-9
+	mid     = 100_000.0
+	spread  = 0.001 // 0.1 %
+	tick    = 1.0
+	lot     = 0.00001
+	minSz   = 0.00002
+	orderSz = 0.001
+	skew    = 0.0001
+	maxInv  = 0.005
+	eps     = 1e-9
 )
 
 func mustQuote(t *testing.T, inventory float64) *pricing.Quotes {

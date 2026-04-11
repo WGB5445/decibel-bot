@@ -1,0 +1,285 @@
+// Package decibel implements the exchange.Exchange interface for the Decibel DEX
+// on Aptos. It composes the existing api and aptos packages.
+package decibel
+
+import (
+	"context"
+	"fmt"
+	"log/slog"
+	"math"
+
+	aptossdk "github.com/aptos-labs/aptos-go-sdk"
+
+	"decibel-mm-bot/api"
+	"decibel-mm-bot/aptos"
+	"decibel-mm-bot/config"
+	"decibel-mm-bot/exchange"
+)
+
+// DecibelExchange implements exchange.Exchange for Decibel DEX on Aptos.
+type DecibelExchange struct {
+	cfg         *config.Config
+	apiClient   *api.Client
+	aptosNode   *aptos.NodeClient
+	aptosSigner *aptossdk.Account
+	market      *exchange.MarketConfig
+	walletAddr  string
+	dryRun      bool
+}
+
+// New creates a DecibelExchange, initialising the Decibel REST client, Aptos
+// node client, and signing account from the provided config.
+func New(cfg *config.Config) (*DecibelExchange, error) {
+	apiClient := api.NewClient(cfg.RestAPIBase, cfg.BearerToken)
+
+	aptosNode, err := aptos.NewNodeClient(cfg.AptosFullnodeURL, cfg.NodeKey(), aptos.ChainIDForNetwork(cfg.Network))
+	if err != nil {
+		return nil, fmt.Errorf("create aptos node client: %w", err)
+	}
+	aptosSigner, err := aptos.ParseAccount(cfg.PrivateKey)
+	if err != nil {
+		return nil, fmt.Errorf("parse aptos signing account: %w", err)
+	}
+
+	addr := aptosSigner.AccountAddress()
+	slog.Info("derived sender address", "address", addr.String())
+
+	return &DecibelExchange{
+		cfg:         cfg,
+		apiClient:   apiClient,
+		aptosNode:   aptosNode,
+		aptosSigner: aptosSigner,
+		walletAddr:  addr.String(),
+		dryRun:      cfg.DryRun,
+	}, nil
+}
+
+// ── exchange.Exchange implementation ─────────────────────────────────────────
+
+// FindMarket discovers market metadata by name from the Decibel REST API.
+func (d *DecibelExchange) FindMarket(ctx context.Context, name string) (*exchange.MarketConfig, error) {
+	if d.cfg.MarketAddrOverride != "" {
+		m, err := d.apiClient.FindMarket(ctx, name)
+		if err != nil {
+			slog.Warn("could not fetch market metadata, using override with defaults", "err", err)
+			return &exchange.MarketConfig{
+				MarketID:   d.cfg.MarketAddrOverride,
+				MarketName: name,
+				TickSize:   1.0,
+				LotSize:    0.00001,
+				MinSize:    0.00002,
+				PxDecimals: 2,
+				SzDecimals: 5,
+			}, nil
+		}
+		mc := apiMarketToExchange(m)
+		mc.MarketID = d.cfg.MarketAddrOverride
+		return mc, nil
+	}
+
+	m, err := d.apiClient.FindMarket(ctx, name)
+	if err != nil {
+		return nil, err
+	}
+	return apiMarketToExchange(m), nil
+}
+
+// SetMarket configures the target market for subsequent FetchState / order calls.
+func (d *DecibelExchange) SetMarket(m *exchange.MarketConfig) {
+	d.market = m
+}
+
+// FetchState fetches the full state snapshot for one cycle.
+func (d *DecibelExchange) FetchState(ctx context.Context) (*exchange.StateSnapshot, error) {
+	if d.market == nil {
+		return nil, fmt.Errorf("market not set: call SetMarket first")
+	}
+	snap, err := d.apiClient.FetchState(ctx, d.cfg.SubaccountAddress, d.market.MarketID)
+	if err != nil {
+		return nil, fmt.Errorf("fetch state: %w", err)
+	}
+	return apiStateToExchange(snap), nil
+}
+
+// FetchOpenOrders fetches open orders (used for resync after cancel failures).
+func (d *DecibelExchange) FetchOpenOrders(ctx context.Context) ([]exchange.OpenOrder, error) {
+	if d.market == nil {
+		return nil, fmt.Errorf("market not set: call SetMarket first")
+	}
+	orders, err := d.apiClient.FetchOpenOrders(ctx, d.cfg.SubaccountAddress)
+	if err != nil {
+		return nil, err
+	}
+	// Filter to target market.
+	var result []exchange.OpenOrder
+	for _, o := range orders {
+		if api.AddrEqual(o.MarketAddr, d.market.MarketID) {
+			result = append(result, exchange.OpenOrder{
+				OrderID:  o.OrderID,
+				MarketID: o.MarketAddr,
+			})
+		}
+	}
+	return result, nil
+}
+
+// PlaceOrder places a limit order on Decibel via Aptos entry function.
+func (d *DecibelExchange) PlaceOrder(ctx context.Context, req exchange.PlaceOrderRequest) error {
+	if d.market == nil {
+		return fmt.Errorf("market not set: call SetMarket first")
+	}
+	side := "ASK"
+	if req.IsBuy {
+		side = "BID"
+	}
+	priceInt := scalePrice(req.Price, d.market.PxDecimals)
+	sizeInt := scaleSize(req.Size, d.market.SzDecimals)
+
+	label := "POST_ONLY"
+	if req.ReduceOnly {
+		label = "reduce-only GTC"
+	}
+	slog.Info(fmt.Sprintf("placing %s order", label),
+		"side", side, "price", req.Price, "size", req.Size,
+		"price_int", priceInt, "size_int", sizeInt,
+		"dry_run", d.dryRun,
+	)
+	if d.dryRun {
+		return nil
+	}
+
+	fn := d.cfg.PackageAddress + "::dex_accounts_entry::place_order_to_subaccount"
+	result, err := d.aptosNode.SubmitEntryFunction(ctx, d.aptosSigner, fn, nil,
+		buildPlaceOrderArgs(
+			d.cfg.SubaccountAddress,
+			d.market.MarketID,
+			priceInt, sizeInt,
+			req.IsBuy,
+			uint8(req.TimeInForce),
+			req.ReduceOnly,
+		),
+	)
+	if err != nil {
+		return err
+	}
+	if !result.Success {
+		return fmt.Errorf("place order failed: side=%s vm_status=%s", side, result.VMStatus)
+	}
+	slog.Info("order placed", "side", side, "price", req.Price, "size", req.Size, "tx_hash", result.Hash)
+	return nil
+}
+
+// CancelOrder cancels a single order on Decibel via Aptos entry function.
+func (d *DecibelExchange) CancelOrder(ctx context.Context, orderID string) error {
+	if d.market == nil {
+		return fmt.Errorf("market not set: call SetMarket first")
+	}
+	fn := d.cfg.PackageAddress + "::dex_accounts_entry::cancel_order_to_subaccount"
+
+	slog.Info("cancelling order", "order_id", orderID, "dry_run", d.dryRun)
+	if d.dryRun {
+		return nil
+	}
+
+	result, err := d.aptosNode.SubmitEntryFunction(ctx, d.aptosSigner, fn, nil, []any{
+		d.cfg.SubaccountAddress,
+		orderID,
+		d.market.MarketID,
+	})
+	if err != nil {
+		return err
+	}
+	if !result.CancelSucceeded() {
+		return fmt.Errorf("cancel rejected: vm_status=%s", result.VMStatus)
+	}
+	slog.Debug("cancel accepted", "order_id", orderID, "vm_status", result.VMStatus)
+	return nil
+}
+
+// WalletAddress returns the Aptos signing wallet address.
+func (d *DecibelExchange) WalletAddress() string { return d.walletAddr }
+
+// GasBalance returns the APT balance of the signing wallet.
+func (d *DecibelExchange) GasBalance(ctx context.Context) (float64, string, error) {
+	bal, err := d.aptosNode.APTBalance(ctx, d.walletAddr)
+	return bal, "APT", err
+}
+
+// DryRun reports whether the exchange is in dry-run mode.
+func (d *DecibelExchange) DryRun() bool { return d.dryRun }
+
+// ── Internal helpers ─────────────────────────────────────────────────────────
+
+// buildPlaceOrderArgs constructs the 15 ABI arguments for place_order_to_subaccount.
+func buildPlaceOrderArgs(
+	subaccountAddr, marketAddr string,
+	priceInt, sizeInt uint64,
+	isBuy bool,
+	timeInForce uint8,
+	isReduceOnly bool,
+) []any {
+	return []any{
+		subaccountAddr,              //  1. subaccount_addr
+		marketAddr,                  //  2. market_addr
+		fmt.Sprintf("%d", priceInt), //  3. price (u64 as string)
+		fmt.Sprintf("%d", sizeInt),  //  4. size  (u64 as string)
+		isBuy,                       //  5. is_buy
+		timeInForce,                 //  6. time_in_force (u8)
+		isReduceOnly,                //  7. is_reduce_only
+		nil,                         //  8. client_order_id  Option<String>
+		nil,                         //  9. stop_price       Option<u64>
+		nil,                         // 10. tp_trigger        Option<u64>
+		nil,                         // 11. tp_limit          Option<u64>
+		nil,                         // 12. sl_trigger        Option<u64>
+		nil,                         // 13. sl_limit          Option<u64>
+		nil,                         // 14. builder_addr     Option<address>
+		nil,                         // 15. builder_fees      Option<u64>
+	}
+}
+
+func scalePrice(price float64, pxDecimals int) uint64 {
+	return uint64(math.Round(price * math.Pow10(pxDecimals)))
+}
+
+func scaleSize(size float64, szDecimals int) uint64 {
+	return uint64(math.Round(size * math.Pow10(szDecimals)))
+}
+
+// apiMarketToExchange converts an api.MarketConfig to exchange.MarketConfig.
+func apiMarketToExchange(m *api.MarketConfig) *exchange.MarketConfig {
+	return &exchange.MarketConfig{
+		MarketID:   m.MarketAddr,
+		MarketName: m.MarketName,
+		TickSize:   m.TickSize,
+		LotSize:    m.LotSize,
+		MinSize:    m.MinSize,
+		PxDecimals: m.PxDecimals,
+		SzDecimals: m.SzDecimals,
+	}
+}
+
+// apiStateToExchange converts an api.StateSnapshot to exchange.StateSnapshot.
+func apiStateToExchange(s *api.StateSnapshot) *exchange.StateSnapshot {
+	positions := make([]exchange.Position, len(s.AllPositions))
+	for i, p := range s.AllPositions {
+		positions[i] = exchange.Position{
+			MarketID: p.MarketAddr,
+			Size:     p.Size,
+		}
+	}
+	orders := make([]exchange.OpenOrder, len(s.OpenOrders))
+	for i, o := range s.OpenOrders {
+		orders[i] = exchange.OpenOrder{
+			OrderID:  o.OrderID,
+			MarketID: o.MarketAddr,
+		}
+	}
+	return &exchange.StateSnapshot{
+		Equity:       s.Equity,
+		MarginUsage:  s.MarginUsage,
+		Inventory:    s.Inventory,
+		Mid:          s.Mid,
+		OpenOrders:   orders,
+		AllPositions: positions,
+	}
+}

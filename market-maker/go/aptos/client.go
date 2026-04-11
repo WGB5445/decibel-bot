@@ -203,3 +203,16 @@ func normalizeEntryArgs(args []any) []any {
 func NoneOption() []byte {
 	return nil
 }
+
+// APTBalance returns the APT balance (in APT, not octas) for the given address string.
+func (n *NodeClient) APTBalance(ctx context.Context, addrStr string) (float64, error) {
+	var addr aptossdk.AccountAddress
+	if err := addr.ParseStringRelaxed(addrStr); err != nil {
+		return 0, fmt.Errorf("parse address: %w", err)
+	}
+	octas, err := n.sdk.AccountAPTBalance(addr)
+	if err != nil {
+		return 0, fmt.Errorf("apt balance: %w", err)
+	}
+	return float64(octas) / 1e8, nil
+}

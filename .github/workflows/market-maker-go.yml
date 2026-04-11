@@ -1,0 +1,45 @@
+name: Market Maker Go
+
+# push: only on the default integration branches (avoids duplicate runs with
+# pull_request when updating a PR branch). pull_request: validates PRs into those branches.
+on:
+  push:
+    branches:
+      - main
+      - master
+    paths:
+      - "market-maker/go/**"
+      - ".github/workflows/market-maker-go.yml"
+  pull_request:
+    branches:
+      - main
+      - master
+    paths:
+      - "market-maker/go/**"
+      - ".github/workflows/market-maker-go.yml"
+
+defaults:
+  run:
+    working-directory: market-maker/go
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.24.x"
+
+      - name: gofmt
+        run: test -z "$(gofmt -l .)"
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: go test
+        run: go test ./...
+
+      - name: go build
+        run: go build -o /tmp/decibel-mm .
