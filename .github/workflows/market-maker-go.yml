@@ -1,11 +1,19 @@
 name: Market Maker Go
 
+# push: only on the default integration branches (avoids duplicate runs with
+# pull_request when updating a PR branch). pull_request: validates PRs into those branches.
 on:
   push:
+    branches:
+      - main
+      - master
     paths:
       - "market-maker/go/**"
       - ".github/workflows/market-maker-go.yml"
   pull_request:
+    branches:
+      - main
+      - master
     paths:
       - "market-maker/go/**"
       - ".github/workflows/market-maker-go.yml"
