@@ -259,6 +259,10 @@ func (t *TelegramNotifier) handleCallback(ctx context.Context, cb *tgbotapi.Call
 }
 
 // pollTradeHistoryByOrder retries trade_history until rows appear or attempts exhaust.
+// On success with rows, returns the items and a nil error.
+// After all attempts: if the last fetch attempt failed, returns (nil, lastErr).
+// If every attempt succeeded but returned no rows, returns an empty non-nil slice and nil error
+// (never (nil, nil)), so callers can rely on len(items)==0 without a three-valued ambiguity.
 func (t *TelegramNotifier) pollTradeHistoryByOrder(ctx context.Context, marketAddr, orderID string) ([]api.TradeHistoryItem, error) {
 	var lastErr error
 	for attempt := 0; attempt < 12; attempt++ {
@@ -275,11 +279,15 @@ func (t *TelegramNotifier) pollTradeHistoryByOrder(ctx context.Context, marketAd
 			slog.Warn("tgbot: trade_history poll failed", "err", err, "attempt", attempt+1)
 			continue
 		}
+		lastErr = nil // successful HTTP decode: do not carry stale errors from earlier attempts
 		if len(items) > 0 {
 			return items, nil
 		}
 	}
-	return nil, lastErr
+	if lastErr != nil {
+		return nil, lastErr
+	}
+	return []api.TradeHistoryItem{}, nil
 }
 
 // flattenFollowUpMessage builds the post-flatten caption. If plain is non-empty, send it
