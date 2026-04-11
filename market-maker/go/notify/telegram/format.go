@@ -497,7 +497,7 @@ func formatHelp(cfg Config) string {
 	sb.WriteString("/balance — 查看账户余额\n")
 	sb.WriteString("/gas — 查看钱包 APT 余额\n")
 	sb.WriteString("/positions — 查看当前仓位\n")
-	sb.WriteString("/trades — 最近成交（每页 5 条，可翻页）\n")
+	sb.WriteString("`/trade_history` — 最近成交（每页 5 条，可翻页）\n")
 	sb.WriteString("/help — 显示帮助\n")
 	sb.WriteString("下方按钮可快捷打开对应视图（与命令等价）。\n\n")
 
@@ -531,9 +531,9 @@ func cycleAge(lastCycleAt time.Time) string {
 	t := lastCycleAt.Local()
 	now := time.Now().In(t.Location())
 	if t.Year() == now.Year() {
-		return "更新于 " + t.Format("1/2 15:04")
+		return "更新于 " + t.Format("1/2 15:04:05")
 	}
-	return "更新于 " + t.Format("2006/1/2 15:04")
+	return "更新于 " + t.Format("2006/1/2 15:04:05")
 }
 
 func formatPnL(pnl, pct float64) string {

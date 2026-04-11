@@ -192,6 +192,37 @@ func TestFormatRecentTrades_pagingAndLayout(t *testing.T) {
 	}
 }
 
+func TestFormatHelp_tradeHistoryInCodeSpan(t *testing.T) {
+	got := formatHelp(Config{})
+	if !strings.Contains(got, "`/trade_history` —") {
+		t.Fatalf("want `/trade_history` wrapped in code span before em dash, got:\n%s", got)
+	}
+}
+
+func TestCycleAge_includesSeconds(t *testing.T) {
+	y := time.Now().Year()
+	sameYear := time.Date(y, 4, 11, 22, 17, 45, 0, time.Local)
+	got := cycleAge(sameYear)
+	if !strings.HasPrefix(got, "更新于 ") {
+		t.Fatalf("prefix: %q", got)
+	}
+	if !strings.Contains(got, "22:17:45") {
+		t.Fatalf("same-year branch want seconds 22:17:45, got %q", got)
+	}
+
+	crossYear := time.Date(1999, 4, 11, 22, 17, 45, 0, time.Local)
+	got2 := cycleAge(crossYear)
+	if !strings.HasPrefix(got2, "更新于 ") {
+		t.Fatalf("prefix: %q", got2)
+	}
+	if !strings.Contains(got2, "22:17:45") {
+		t.Fatalf("cross-year branch want seconds 22:17:45, got %q", got2)
+	}
+	if !strings.Contains(got2, "1999") {
+		t.Fatalf("cross-year branch want year in stamp, got %q", got2)
+	}
+}
+
 func TestFormatTradeFromHistory_noSource_cardLayout(t *testing.T) {
 	tr := api.TradeHistoryItem{
 		Action:                "CloseLong",

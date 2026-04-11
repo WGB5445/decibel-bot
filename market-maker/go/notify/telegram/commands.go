@@ -17,7 +17,7 @@ func (t *TelegramNotifier) handleCommand(ctx context.Context, msg *tgbotapi.Mess
 		t.sendGas(ctx, msg.Chat.ID)
 	case "positions":
 		t.sendPositions(ctx, msg.Chat.ID)
-	case "trades":
+	case "trade_history":
 		t.sendRecentTrades(ctx, msg.Chat.ID)
 	case "help":
 		t.sendHelp(msg.Chat.ID)

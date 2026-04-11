@@ -55,6 +55,7 @@ Commands (sent by `/...` to the bot in Telegram):
 - `/balance` — Account equity, available balance, margin usage
 - `/gas` — Wallet APT balance
 - `/positions` — Non-zero positions across markets (paged in one message; refresh resets to page 1); chain actions still use market addresses
+- `/trade_history` — Recent fills for the configured market from REST `trade_history` (5 per page, paginated)
 - `/help` — Command list
 
 Alerts: When `abs(inventory) ≥ MAX_INVENTORY`, the bot sends an alert with buttons to refresh or close the position. Auto-refresh period is configurable.
