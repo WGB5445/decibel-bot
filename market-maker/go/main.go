@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
 	"github.com/joho/godotenv"
 
@@ -91,14 +92,33 @@ func main() {
 		info := &infoAdapter{mm: mm, ex: ex, cfg: cfg}
 		tg, err := telegram.New(tgCfg, info)
 		if err != nil {
+			if cfg.TGStrictStart {
+				slog.Error("telegram bot init failed (tg-strict-start)", "err", err)
+				os.Exit(1)
+			}
 			slog.Warn("telegram bot init failed, continuing without it", "err", err)
 		} else {
-			slog.Info("telegram bot started")
-			go func() {
-				if err := tg.Run(ctx); err != nil && ctx.Err() == nil {
-					slog.Error("telegram bot exited with error", "err", err)
+			if err := tg.Ready(ctx); err != nil {
+				if cfg.TGStrictStart {
+					slog.Error("telegram ready failed (tg-strict-start)", "err", err)
+					os.Exit(1)
 				}
-			}()
+				slog.Warn("telegram ready failed, continuing without bot", "err", err)
+			} else {
+				if err := tg.SetBotCommands(ctx); err != nil {
+					if cfg.TGStrictStart {
+						slog.Error("telegram set commands failed (tg-strict-start)", "err", err)
+						os.Exit(1)
+					}
+					slog.Warn("telegram set commands failed", "err", err)
+				}
+				slog.Info("telegram bot starting update loop")
+				go func() {
+					if err := tg.Run(ctx); err != nil && ctx.Err() == nil {
+						slog.Error("telegram bot exited with error", "err", err)
+					}
+				}()
+			}
 		}
 	}
 
@@ -121,6 +141,37 @@ var _ notify.InfoProvider = (*infoAdapter)(nil)
 
 func (a *infoAdapter) GetSnapshot() botstate.Snapshot {
 	return a.mm.State().Get()
+}
+
+func (a *infoAdapter) FetchLiveSnapshot(ctx context.Context) (botstate.Snapshot, error) {
+	state, err := a.ex.FetchState(ctx)
+	if err != nil {
+		return botstate.Snapshot{}, err
+	}
+	base := a.mm.State().Get()
+
+	positions := make([]botstate.Position, len(state.AllPositions))
+	for i, p := range state.AllPositions {
+		positions[i] = botstate.Position{MarketID: p.MarketID, Size: p.Size}
+	}
+
+	var midCopy *float64
+	if state.Mid != nil {
+		v := *state.Mid
+		midCopy = &v
+	}
+
+	return botstate.Snapshot{
+		Equity:           state.Equity,
+		MarginUsage:      state.MarginUsage,
+		Inventory:        state.Inventory,
+		Mid:              midCopy,
+		AllPositions:     positions,
+		EntryPrice:       base.EntryPrice,
+		TargetMarketName: base.TargetMarketName,
+		TargetMarketID:   base.TargetMarketID,
+		LastCycleAt:      time.Now(),
+	}, nil
 }
 
 func (a *infoAdapter) FlattenPosition(ctx context.Context) error {

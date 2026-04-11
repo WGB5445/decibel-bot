@@ -4,6 +4,7 @@ package telegram
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"math"
@@ -13,6 +14,7 @@ import (
 
 	"decibel-mm-bot/botstate"
 	"decibel-mm-bot/notify"
+	"decibel-mm-bot/strategy"
 )
 
 // Config holds Telegram-specific configuration.
@@ -86,14 +88,34 @@ func (t *TelegramNotifier) send(msg tgbotapi.Chattable) {
 	}
 }
 
+// isTelegramMessageNotModified reports the Bot API case where editMessageText
+// is a no-op because text and markup are unchanged — not a real failure.
+func isTelegramMessageNotModified(err error) bool {
+	if err == nil {
+		return false
+	}
+	return strings.Contains(strings.ToLower(err.Error()), "message is not modified")
+}
+
 func (t *TelegramNotifier) edit(chatID int64, msgID int, text string, kb *tgbotapi.InlineKeyboardMarkup) {
 	edit := tgbotapi.NewEditMessageText(chatID, msgID, text)
 	edit.ParseMode = tgbotapi.ModeMarkdown
 	if kb != nil {
 		edit.ReplyMarkup = kb
 	}
-	if _, err := t.api.Send(edit); err != nil {
+	if _, err := t.api.Send(edit); err != nil && !isTelegramMessageNotModified(err) {
 		slog.Warn("tgbot: edit failed", "err", err)
+	}
+}
+
+// editPlain updates message text without Markdown (safe for arbitrary error strings).
+func (t *TelegramNotifier) editPlain(chatID int64, msgID int, text string, kb *tgbotapi.InlineKeyboardMarkup) {
+	edit := tgbotapi.NewEditMessageText(chatID, msgID, text)
+	if kb != nil {
+		edit.ReplyMarkup = kb
+	}
+	if _, err := t.api.Send(edit); err != nil && !isTelegramMessageNotModified(err) {
+		slog.Warn("tgbot: edit plain failed", "err", err)
 	}
 }
 
@@ -143,8 +165,21 @@ func (t *TelegramNotifier) handleCallback(ctx context.Context, cb *tgbotapi.Call
 	msgID := cb.Message.MessageID
 
 	switch action {
+	case "menu":
+		switch param {
+		case "help":
+			t.edit(chatID, msgID, formatHelp(t.cfg), helpKeyboard())
+		default:
+			slog.Warn("tgbot: unknown menu callback", "param", param)
+		}
+
 	case "balance":
-		snap := t.info.GetSnapshot()
+		snap, err := t.info.FetchLiveSnapshot(ctx)
+		if err != nil {
+			slog.Warn("tgbot: fetch live snapshot for balance callback failed", "err", err)
+			t.editPlain(chatID, msgID, fmt.Sprintf("刷新失败: %v", err), balanceKeyboard())
+			return
+		}
 		t.edit(chatID, msgID, formatBalance(snap), balanceKeyboard())
 
 	case "gas":
@@ -153,7 +188,12 @@ func (t *TelegramNotifier) handleCallback(ctx context.Context, cb *tgbotapi.Call
 		t.edit(chatID, msgID, formatGas(walletAddr, aptBal, err), gasKeyboard())
 
 	case "positions":
-		snap := t.info.GetSnapshot()
+		snap, err := t.info.FetchLiveSnapshot(ctx)
+		if err != nil {
+			slog.Warn("tgbot: fetch live snapshot for positions callback failed", "err", err)
+			t.editPlain(chatID, msgID, fmt.Sprintf("刷新失败: %v", err), positionsRefreshOnlyKeyboard())
+			return
+		}
 		t.edit(chatID, msgID, formatPositions(snap), positionsKeyboard(snap))
 
 	case "close":
@@ -166,21 +206,38 @@ func (t *TelegramNotifier) handleCallback(ctx context.Context, cb *tgbotapi.Call
 
 // handleCloseCallback places a flatten order and updates the message.
 func (t *TelegramNotifier) handleCloseCallback(ctx context.Context, chatID int64, msgID int) {
-	t.edit(chatID, msgID, "⏳ 正在平仓...", nil)
+	t.edit(chatID, msgID, "⏳ 正在平仓...", positionsRefreshOnlyKeyboard())
 
-	snap := t.info.GetSnapshot()
-	if err := t.info.FlattenPosition(ctx); err != nil {
-		t.edit(chatID, msgID, fmt.Sprintf("❌ 平仓失败: %v", err), nil)
+	err := t.info.FlattenPosition(ctx)
+	if err != nil {
+		kb := positionsRefreshOnlyKeyboard()
+		if snap, fetchErr := t.info.FetchLiveSnapshot(ctx); fetchErr == nil {
+			kb = positionsKeyboard(snap)
+		}
+		if errors.Is(err, strategy.ErrNoPositionToFlatten) {
+			t.editPlain(chatID, msgID, "ℹ️ 当前目标市场无仓位或仓位过小，无需重复平仓。", kb)
+			return
+		}
+		t.editPlain(chatID, msgID, fmt.Sprintf("❌ 平仓失败: %v", err), kb)
 		return
 	}
 
+	snapLive, err := t.info.FetchLiveSnapshot(ctx)
+	if err != nil {
+		slog.Warn("tgbot: fetch live snapshot after flatten failed", "err", err)
+		t.edit(chatID, msgID,
+			"✅ 平仓单已提交\n仓位正在关闭中，请点击刷新查看最新仓位。",
+			positionsRefreshOnlyKeyboard(),
+		)
+		return
+	}
 	midStr := "市价"
-	if snap.Mid != nil {
-		midStr = fmt.Sprintf("$%.2f", *snap.Mid)
+	if snapLive.Mid != nil {
+		midStr = fmt.Sprintf("$%.2f", *snapLive.Mid)
 	}
 	t.edit(chatID, msgID,
-		fmt.Sprintf("✅ 平仓单已提交 (~%s)\n仓位正在关闭中，请稍后刷新查看。", midStr),
-		nil,
+		fmt.Sprintf("✅ 平仓单已提交 (~%s)\n仓位正在关闭中，可点击下方刷新查看。", midStr),
+		positionsKeyboard(snapLive),
 	)
 }
 
@@ -190,6 +247,7 @@ func balanceKeyboard() *tgbotapi.InlineKeyboardMarkup {
 	kb := tgbotapi.NewInlineKeyboardMarkup(
 		tgbotapi.NewInlineKeyboardRow(
 			tgbotapi.NewInlineKeyboardButtonData("🔄 刷新", "balance:refresh"),
+			tgbotapi.NewInlineKeyboardButtonData("🔙 返回", "menu:help"),
 		),
 	)
 	return &kb
@@ -199,6 +257,30 @@ func gasKeyboard() *tgbotapi.InlineKeyboardMarkup {
 	kb := tgbotapi.NewInlineKeyboardMarkup(
 		tgbotapi.NewInlineKeyboardRow(
 			tgbotapi.NewInlineKeyboardButtonData("🔄 刷新", "gas:refresh"),
+			tgbotapi.NewInlineKeyboardButtonData("🔙 返回", "menu:help"),
+		),
+	)
+	return &kb
+}
+
+func helpKeyboard() *tgbotapi.InlineKeyboardMarkup {
+	kb := tgbotapi.NewInlineKeyboardMarkup(
+		tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData("💰 余额", "balance:help"),
+			tgbotapi.NewInlineKeyboardButtonData("⛽ Gas", "gas:help"),
+		),
+		tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData("📊 仓位", "positions:help"),
+		),
+	)
+	return &kb
+}
+
+func positionsRefreshOnlyKeyboard() *tgbotapi.InlineKeyboardMarkup {
+	kb := tgbotapi.NewInlineKeyboardMarkup(
+		tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData("🔄 刷新", "positions:refresh"),
+			tgbotapi.NewInlineKeyboardButtonData("🔙 返回", "menu:help"),
 		),
 	)
 	return &kb
@@ -220,6 +302,7 @@ func positionsKeyboard(snap botstate.Snapshot) *tgbotapi.InlineKeyboardMarkup {
 	}
 	rows = append(rows, tgbotapi.NewInlineKeyboardRow(
 		tgbotapi.NewInlineKeyboardButtonData("🔄 刷新", "positions:refresh"),
+		tgbotapi.NewInlineKeyboardButtonData("🔙 返回", "menu:help"),
 	))
 	kb := tgbotapi.NewInlineKeyboardMarkup(rows...)
 	return &kb

@@ -21,6 +21,11 @@ type InfoProvider interface {
 	// GetSnapshot returns a consistent copy of the current bot state.
 	GetSnapshot() botstate.Snapshot
 
+	// FetchLiveSnapshot pulls a fresh exchange state for monitoring UI (e.g.
+	// Telegram refresh). It does not call BotState.Update — VWAP/entry logic
+	// stays owned by the strategy.
+	FetchLiveSnapshot(ctx context.Context) (botstate.Snapshot, error)
+
 	// FlattenPosition places a reduce-only order to close the current position.
 	FlattenPosition(ctx context.Context) error
 

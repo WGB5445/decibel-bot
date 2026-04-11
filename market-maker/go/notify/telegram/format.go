@@ -28,14 +28,10 @@ func formatBalance(snap botstate.Snapshot) string {
 // ── Gas ──────────────────────────────────────────────────────────────────────
 
 func formatGas(walletAddr string, aptBal float64, err error) string {
-	short := walletAddr
-	if len(short) > 16 {
-		short = short[:8] + "..." + short[len(short)-6:]
-	}
 	if err != nil {
-		return fmt.Sprintf("*⛽ Gas 钱包*\n地址: `%s`\n❌ 查询失败: %v", short, err)
+		return fmt.Sprintf("*⛽ Gas 钱包*\n地址: `%s`\n❌ 查询失败: %v", walletAddr, err)
 	}
-	return fmt.Sprintf("*⛽ Gas 钱包*\n地址: `%s`\nAPT 余额: `%.4f APT`", short, aptBal)
+	return fmt.Sprintf("*⛽ Gas 钱包*\n地址: `%s`\nAPT 余额: `%.4f APT`", walletAddr, aptBal)
 }
 
 // ── Positions ────────────────────────────────────────────────────────────────
@@ -116,13 +112,35 @@ func formatInventoryAlert(snap botstate.Snapshot, maxInventory float64) string {
 
 // ── Help ─────────────────────────────────────────────────────────────────────
 
-func formatHelp() string {
-	return "*🤖 Decibel 做市机器人*\n\n" +
-		"可用命令:\n" +
-		"/balance — 查看账户余额\n" +
-		"/gas — 查看钱包 APT 余额\n" +
-		"/positions — 查看当前仓位\n" +
-		"/help — 显示帮助"
+func formatHelp(cfg Config) string {
+	var sb strings.Builder
+	sb.WriteString("*🤖 Decibel 做市机器人*\n\n")
+	sb.WriteString("*可用命令*\n")
+	sb.WriteString("/balance — 查看账户余额\n")
+	sb.WriteString("/gas — 查看钱包 APT 余额\n")
+	sb.WriteString("/positions — 查看当前仓位\n")
+	sb.WriteString("/help — 显示帮助\n")
+	sb.WriteString("下方按钮可快捷打开对应视图（与命令等价）。\n\n")
+
+	sb.WriteString("*Telegram 配置*\n")
+	sb.WriteString("启用 bot 需同时设置 `TG_BOT_TOKEN` 与 `TG_ADMIN_ID`（环境变量或 `--tg-token` / `--tg-admin-id`）。\n")
+	sb.WriteString("凭证优先用 `.env`；命令行传参会出现在进程列表。\n")
+	sb.WriteString("库存告警：`TG_ALERT_INVENTORY`（或 `--tg-alert-inventory`）\n")
+	sb.WriteString("告警间隔（分钟）：`TG_ALERT_INVENTORY_INTERVAL_MIN`（或 `--tg-alert-interval`）\n")
+	sb.WriteString("严格启动：`TG_STRICT_START`（或 `--tg-strict-start`）— Telegram 就绪失败则进程退出。\n\n")
+
+	alertLine := "仓位超限提醒: 关闭"
+	if cfg.AlertInventory {
+		alertLine = fmt.Sprintf("仓位超限提醒: 开启（每 %d 分钟检查）", cfg.AlertInventoryInterval)
+	}
+	sb.WriteString("*当前进程*\n")
+	sb.WriteString(alertLine)
+	sb.WriteString("\n\n")
+
+	sb.WriteString("*安全说明*\n")
+	sb.WriteString("仅在私聊中与配置的 admin 生效；群组内不响应。\n")
+
+	return sb.String()
 }
 
 // ── Internal helpers ─────────────────────────────────────────────────────────
@@ -131,7 +149,12 @@ func cycleAge(lastCycleAt time.Time) string {
 	if lastCycleAt.IsZero() {
 		return "正在获取..."
 	}
-	return fmt.Sprintf("更新于 %s 前", time.Since(lastCycleAt).Truncate(time.Second))
+	t := lastCycleAt.Local()
+	now := time.Now().In(t.Location())
+	if t.Year() == now.Year() {
+		return "更新于 " + t.Format("1/2 15:04")
+	}
+	return "更新于 " + t.Format("2006/1/2 15:04")
 }
 
 func formatPnL(pnl, pct float64) string {

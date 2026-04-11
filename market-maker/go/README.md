@@ -168,10 +168,11 @@ These override the values set by `NETWORK`. Leave unset to use the network profi
 
 | Env var | CLI flag | Default | Description |
 |---------|----------|---------|-------------|
-| `TG_BOT_TOKEN` | _(env only)_ | _(unset)_ | Telegram bot token. When unset or empty, Telegram is disabled. **Do not pass via `-cli` flag** (security: visible in `ps`). |
-| `TG_ADMIN_ID` | _(env only)_ | _(unset)_ | Your Telegram user ID (numeric). Telegram is only enabled when **both** `TG_BOT_TOKEN` and `TG_ADMIN_ID` are set. |
+| `TG_BOT_TOKEN` | `-tg-token` | _(unset)_ | Telegram bot token. When unset or empty, Telegram is disabled. **Prefer `.env`**; CLI values are visible in `ps`. |
+| `TG_ADMIN_ID` | `-tg-admin-id` | _(unset)_ | Your Telegram user ID (numeric). Telegram is only enabled when **both** `TG_BOT_TOKEN` and `TG_ADMIN_ID` are set. **Prefer `.env`**; CLI values are visible in `ps`. |
 | `TG_ALERT_INVENTORY` | `-tg-alert-inventory` | `false` | Enable automated alerts when `abs(inventory) ≥ MAX_INVENTORY`. |
 | `TG_ALERT_INVENTORY_INTERVAL_MIN` | `-tg-alert-interval` | `30` | Minutes between repeated inventory-limit alerts. |
+| `TG_STRICT_START` | `-tg-strict-start` | `false` | When Telegram is enabled, **exit the process** if bot init, API ready check (`getMe`), or `setMyCommands` fails. Default: log a warning and run the market maker without Telegram. |
 
 ---
 
@@ -197,7 +198,19 @@ go run .
 
 Changing `-network` after other defaults were loaded updates REST/fullnode/package **from the new preset** unless you already set the matching URL fields via **CLI** or **environment variables** (CLI wins, then env, then preset).
 
-> **Note:** Go's `flag` package uses a single dash. Both `-flag value` and `-flag=value` work.
+> **Note:** Go's `flag` package uses a single ASCII dash (`-`). For **non-boolean** flags, both `-spread 0.001` and `-spread=0.001` work.
+
+#### Boolean flags
+
+The boolean CLI flags are: `-auto-flatten`, `-dry-run`, `-auto-spread`, `-tg-alert-inventory`, `-tg-strict-start` (same set as `boolCLIFlagNames` in [`config/config.go`](config/config.go)).
+
+| Form | Meaning |
+|------|---------|
+| `-dry-run` | Sets the flag to `true` (flag present) |
+| `-dry-run=true` / `-dry-run=false` | **Recommended** in scripts; safe in any order with other flags |
+| `-auto-flatten false` then more flags | For the flags listed above, `config.Load` rewrites `-name <bool-token>` to `-name=<value>` before `flag.Parse`, so **`-auto-flatten false -spread 0.002` works** when the second token is a boolean literal (`true`, `false`, `0`, `1`, `yes`, `no`, …). |
+
+If the token after a boolean flag is **not** a boolean literal (e.g. `-auto-flatten 0.002`), standard `flag` parsing can still stop early and **skip later flags**. Use the right flag for numbers (e.g. `-flatten-aggression` for flatten price offset).
 
 ```bash
 go run . \
@@ -234,4 +247,7 @@ go run . \
 
 # Use a custom fullnode (e.g. your own node)
 go run . -fullnode-url https://my-node.example.com/v1
+
+# Explicit booleans (script-friendly) + spread
+go run . -auto-flatten=false -spread 0.0005 -dry-run
 ```

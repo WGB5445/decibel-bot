@@ -2,6 +2,7 @@ package telegram
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"math"
@@ -9,6 +10,8 @@ import (
 	"time"
 
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
+
+	"decibel-mm-bot/strategy"
 )
 
 // alertState tracks the single active inventory-limit alert message so that
@@ -61,7 +64,7 @@ func (t *TelegramNotifier) checkInventoryAlert(as *alertState) {
 		if activeMsgID != 0 {
 			edit := tgbotapi.NewEditMessageText(as.chatID, activeMsgID,
 				"✅ 仓位已恢复正常范围。")
-			if _, err := t.api.Send(edit); err != nil {
+			if _, err := t.api.Send(edit); err != nil && !isTelegramMessageNotModified(err) {
 				slog.Warn("tgbot: failed to update inventory alert (recovery)", "err", err)
 			}
 			as.mu.Lock()
@@ -92,7 +95,7 @@ func (t *TelegramNotifier) checkInventoryAlert(as *alertState) {
 		edit := tgbotapi.NewEditMessageText(as.chatID, activeMsgID, text)
 		edit.ParseMode = tgbotapi.ModeMarkdown
 		edit.ReplyMarkup = kb
-		if _, err := t.api.Send(edit); err != nil {
+		if _, err := t.api.Send(edit); err != nil && !isTelegramMessageNotModified(err) {
 			slog.Warn("tgbot: failed to refresh inventory alert", "err", err)
 		}
 	}
@@ -103,26 +106,45 @@ func (t *TelegramNotifier) handleInventoryCallback(ctx context.Context, cb *tgbo
 	chatID := cb.Message.Chat.ID
 	msgID := cb.Message.MessageID
 
-	snap := t.info.GetSnapshot()
-
 	switch action {
 	case "close":
-		t.edit(chatID, msgID, "⏳ 正在平仓...", nil)
+		t.edit(chatID, msgID, "⏳ 正在平仓...", inventoryAlertKeyboard(false))
 		if err := t.info.FlattenPosition(ctx); err != nil {
-			t.edit(chatID, msgID, fmt.Sprintf("❌ 平仓失败: %v", err), nil)
+			kb := inventoryAlertKeyboard(false)
+			if snap, fe := t.info.FetchLiveSnapshot(ctx); fe == nil {
+				kb = inventoryAlertKeyboard(math.Abs(snap.Inventory) >= 1e-9)
+			}
+			if errors.Is(err, strategy.ErrNoPositionToFlatten) {
+				t.editPlain(chatID, msgID, "ℹ️ 当前目标市场无仓位或仓位过小，无需重复平仓。", kb)
+				return
+			}
+			t.editPlain(chatID, msgID, fmt.Sprintf("❌ 平仓失败: %v", err), kb)
 			return
 		}
+		snap, err := t.info.FetchLiveSnapshot(ctx)
 		midStr := "市价"
-		if snap.Mid != nil {
+		if err == nil && snap.Mid != nil {
 			midStr = fmt.Sprintf("$%.2f", *snap.Mid)
+		} else if err != nil {
+			slog.Warn("tgbot: fetch live snapshot after inv flatten failed", "err", err)
 		}
-		kb := inventoryAlertKeyboard(false)
+		showClose := false
+		if err == nil {
+			showClose = math.Abs(snap.Inventory) >= 1e-9
+		}
+		kb := inventoryAlertKeyboard(showClose)
 		t.edit(chatID, msgID,
 			fmt.Sprintf("✅ 平仓单已提交 (~%s)\n仓位正在关闭中。", midStr),
 			kb,
 		)
 
 	case "refresh":
+		snap, err := t.info.FetchLiveSnapshot(ctx)
+		if err != nil {
+			slog.Warn("tgbot: inv refresh fetch live snapshot failed", "err", err)
+			t.editPlain(chatID, msgID, fmt.Sprintf("刷新失败: %v", err), inventoryAlertKeyboard(true))
+			return
+		}
 		maxInv := t.info.MaxInventory()
 		exceeded := math.Abs(snap.Inventory) >= maxInv
 		if !exceeded {

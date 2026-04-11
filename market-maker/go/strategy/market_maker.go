@@ -4,9 +4,11 @@ package strategy
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"math"
+	"sync"
 	"time"
 
 	"decibel-mm-bot/botstate"
@@ -15,12 +17,18 @@ import (
 	"decibel-mm-bot/pricing"
 )
 
+// ErrNoPositionToFlatten is returned when there is no target-market position
+// large enough to place a reduce-only flatten order (idempotent no-op).
+var ErrNoPositionToFlatten = errors.New("no position to flatten")
+
 // MarketMaker runs the inventory-skew market-making strategy.
 type MarketMaker struct {
 	cfg    *config.Config
 	ex     exchange.Exchange
 	market *exchange.MarketConfig
 	state  *botstate.BotState
+
+	flattenMu sync.Mutex // serializes Telegram / manual flatten attempts
 
 	// adaptive spread state
 	effectiveSpread float64
@@ -45,13 +53,28 @@ func New(cfg *config.Config, ex exchange.Exchange, market *exchange.MarketConfig
 func (m *MarketMaker) State() *botstate.BotState { return m.state }
 
 // FlattenPosition places a reduce-only order to close the current position.
-// Safe to call from any goroutine (reads state via snapshot).
+// Uses a live exchange snapshot (not BotState) so repeated calls are idempotent
+// once the chain reflects the closed position. Serialized with flattenMu.
 func (m *MarketMaker) FlattenPosition(ctx context.Context) error {
-	snap := m.state.Get()
-	if snap.Mid == nil {
+	m.flattenMu.Lock()
+	defer m.flattenMu.Unlock()
+
+	state, err := m.ex.FetchState(ctx)
+	if err != nil {
+		return fmt.Errorf("fetch state for flatten: %w", err)
+	}
+	if state.Mid == nil {
 		return fmt.Errorf("cannot flatten position: mid price unavailable")
 	}
-	return m.placeFlattenOrder(ctx, snap.Inventory, *snap.Mid)
+
+	inv := state.Inventory
+	absInv := math.Abs(inv)
+	size := math.Round(absInv/m.market.LotSize) * m.market.LotSize
+	if size <= 0 || size < m.market.MinSize {
+		return ErrNoPositionToFlatten
+	}
+
+	return m.placeFlattenOrder(ctx, inv, *state.Mid)
 }
 
 // Run starts the main market-making loop. Blocks until ctx is cancelled.
@@ -290,7 +313,7 @@ func (m *MarketMaker) placeFlattenOrder(ctx context.Context, inventory, mid floa
 	if size <= 0 || size < m.market.MinSize {
 		slog.Warn("flatten size too small, skipping",
 			"size", size, "min_size", m.market.MinSize)
-		return nil
+		return ErrNoPositionToFlatten
 	}
 
 	return m.ex.PlaceOrder(ctx, exchange.PlaceOrderRequest{
