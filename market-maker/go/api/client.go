@@ -216,6 +216,31 @@ func (c *Client) FetchOpenOrders(ctx context.Context, subaccount string) ([]Open
 	return page.Items, nil
 }
 
+// BulkOrderHistoryRow is one element of GET /bulk_orders (bulk quote history / snapshots).
+type BulkOrderHistoryRow struct {
+	SequenceNumber uint64 `json:"sequence_number"`
+	PreviousSeqNum uint64 `json:"previous_seq_num"`
+}
+
+// FetchBulkOrders calls GET /bulk_orders for a subaccount and market.
+func (c *Client) FetchBulkOrders(ctx context.Context, account, market string) ([]BulkOrderHistoryRow, error) {
+	if strings.TrimSpace(account) == "" {
+		return nil, fmt.Errorf("fetch_bulk_orders: account is required")
+	}
+	if strings.TrimSpace(market) == "" {
+		return nil, fmt.Errorf("fetch_bulk_orders: market is required")
+	}
+	q := url.Values{}
+	q.Set("account", strings.TrimSpace(account))
+	q.Set("market", strings.TrimSpace(market))
+	path := "/bulk_orders?" + q.Encode()
+	var rows []BulkOrderHistoryRow
+	if err := c.getJSON(ctx, path, &rows); err != nil {
+		return nil, fmt.Errorf("fetch_bulk_orders: %w", err)
+	}
+	return rows, nil
+}
+
 // FetchTradeHistory calls GET /trade_history with the given filters.
 func (c *Client) FetchTradeHistory(ctx context.Context, p TradeHistoryParams) ([]TradeHistoryItem, error) {
 	if strings.TrimSpace(p.Account) == "" {

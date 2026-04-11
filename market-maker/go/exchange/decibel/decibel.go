@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log/slog"
 	"math"
+	"sync"
 
 	aptossdk "github.com/aptos-labs/aptos-go-sdk"
 
@@ -26,9 +27,13 @@ type DecibelExchange struct {
 	walletAddr  string
 	dryRun      bool
 
-	// bulkSeq is the monotonically increasing sequence number for bulk order calls.
-	// Starts at 1 and increments each time PlaceBulkOrders is called successfully.
+	// bulkSeq is the last sequence_number used in a live place_bulk_orders call (or max from
+	// GET /bulk_orders after sync). Each live PlaceBulkOrders does bulkSeq++ before submit.
+	// It is never decremented so retries never reuse a consumed or ambiguous seq.
 	bulkSeq uint64
+
+	bulkMu        sync.Mutex
+	bulkSeqSynced bool
 }
 
 // New creates a DecibelExchange, initialising the Decibel REST client, Aptos
@@ -96,7 +101,11 @@ func (d *DecibelExchange) MarketsCatalog(ctx context.Context) ([]api.MarketConfi
 
 // SetMarket configures the target market for subsequent FetchState / order calls.
 func (d *DecibelExchange) SetMarket(m *exchange.MarketConfig) {
+	d.bulkMu.Lock()
+	defer d.bulkMu.Unlock()
 	d.market = m
+	d.bulkSeqSynced = false
+	d.bulkSeq = 0
 }
 
 // FetchState fetches the full state snapshot for one cycle.
@@ -192,11 +201,43 @@ func (d *DecibelExchange) FetchTradeHistory(ctx context.Context, p api.TradeHist
 	return d.apiClient.FetchTradeHistory(ctx, p)
 }
 
+// syncBulkSeqFromREST sets d.bulkSeq to max(sequence_number) from GET /bulk_orders
+// so the next live PlaceBulkOrders uses max+1. Caller must hold d.bulkMu.
+func (d *DecibelExchange) syncBulkSeqFromREST(ctx context.Context) error {
+	rows, err := d.apiClient.FetchBulkOrders(ctx, d.cfg.SubaccountAddress, d.market.MarketID)
+	if err != nil {
+		return err
+	}
+	var max uint64
+	for _, r := range rows {
+		if r.SequenceNumber > max {
+			max = r.SequenceNumber
+		}
+	}
+	d.bulkSeq = max
+	d.bulkSeqSynced = true
+	slog.Info("bulk sequence synced from REST",
+		"max_sequence_number", max,
+		"next_bulk_seq", max+1,
+		"rows", len(rows),
+	)
+	return nil
+}
+
 // PlaceBulkOrders atomically replaces all bulk quotes for the target market.
 // Bulk orders are POST_ONLY. Empty bids/asks clears that side.
 func (d *DecibelExchange) PlaceBulkOrders(ctx context.Context, bids, asks []exchange.BulkOrderEntry) error {
 	if d.market == nil {
 		return fmt.Errorf("market not set: call SetMarket first")
+	}
+
+	d.bulkMu.Lock()
+	defer d.bulkMu.Unlock()
+
+	if !d.bulkSeqSynced {
+		if err := d.syncBulkSeqFromREST(ctx); err != nil {
+			return fmt.Errorf("sync bulk sequence from REST: %w", err)
+		}
 	}
 
 	bidPrices := make([]string, len(bids))
@@ -212,15 +253,20 @@ func (d *DecibelExchange) PlaceBulkOrders(ctx context.Context, bids, asks []exch
 		askSizes[i] = fmt.Sprintf("%d", scaleSize(a.Size, d.market.SzDecimals))
 	}
 
+	if d.dryRun {
+		slog.Info("placing bulk orders (dry run)",
+			"bids", len(bids), "asks", len(asks),
+			"next_bulk_seq", d.bulkSeq+1,
+		)
+		return nil
+	}
+
 	d.bulkSeq++
 	slog.Info("placing bulk orders",
 		"bids", len(bids), "asks", len(asks),
 		"bulk_seq", d.bulkSeq,
 		"dry_run", d.dryRun,
 	)
-	if d.dryRun {
-		return nil
-	}
 
 	fn := d.cfg.PackageAddress + "::dex_accounts_entry::place_bulk_orders_to_subaccount"
 	slog.Info("submitting bulk orders", "bids", len(bids), "asks", len(asks), "bulk_seq", d.bulkSeq)
@@ -237,18 +283,15 @@ func (d *DecibelExchange) PlaceBulkOrders(ctx context.Context, bids, asks []exch
 	})
 	if err != nil {
 		if result != nil && result.Hash != "" {
-			// Tx may still land on-chain; do not reuse the same bulk_seq.
 			slog.Error("bulk orders: tx submitted but confirmation incomplete",
 				"tx_hash", result.Hash, "bids", len(bids), "asks", len(asks), "err", err)
 			return err
 		}
-		d.bulkSeq-- // only when submit did not return a hash (build/sign/submit path failed)
 		slog.Error("bulk orders submission failed", "bids", len(bids), "asks", len(asks), "err", err)
 		return err
 	}
 	slog.Info("bulk orders submitted", "tx_hash", result.Hash)
 	if !result.Success {
-		d.bulkSeq--
 		slog.Error("bulk orders execution failed", "vm_status", result.VMStatus)
 		return fmt.Errorf("place bulk orders failed: vm_status=%s", result.VMStatus)
 	}
