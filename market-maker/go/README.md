@@ -133,6 +133,7 @@ The **GlobalPerpEngine** object address is **not configurable**: it is always de
 | `SKEW_PER_UNIT` | `-skew-per-unit` | `0.0001` | Extra half-spread added per 1.0 unit of net inventory (inventory skew coefficient). Positive inventory shifts quotes down; negative shifts them up. |
 | `MAX_MARGIN_USAGE` | `-max-margin-usage` | `0.5` | Pause quoting when `cross_margin_ratio > this` (0–1). `0.5` = pause above 50% margin usage. |
 | `REFRESH_INTERVAL` | `-refresh-interval` | `20.0` | Seconds to sleep between full quote cycles. |
+| `REFRESH_INTERVAL_JITTER_S` | `-refresh-interval-jitter` | `0` | Half-width in seconds for **uniform** random jitter: each cycle sleeps in `[REFRESH_INTERVAL − jitter, REFRESH_INTERVAL + jitter]`. The lower bound is floored at `0.01` s if `interval − jitter` would be non-positive. `0` disables jitter (fixed interval). |
 | `COOLDOWN_S` | `-cooldown-s` | `1.5` | Seconds to wait between placing the bid and the ask within a single cycle. |
 | `CANCEL_RESYNC_S` | `-cancel-resync-s` | `8.0` | Seconds to wait before re-fetching open orders after a cancel fails. |
 | `AUTO_FLATTEN` | `-auto-flatten` | `false` | When `true`, automatically place a reduce-only GTC order to cut inventory when `MAX_INVENTORY` is hit. |

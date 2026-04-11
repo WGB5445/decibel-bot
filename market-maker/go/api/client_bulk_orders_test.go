@@ -24,7 +24,31 @@ func TestFetchBulkOrders_decodesSequence(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(rows) != 1 || rows[0].SequenceNumber != 57 || rows[0].PreviousSeqNum != 56 {
+	if len(rows) != 1 || rows[0].SequenceNumber != 57 ||
+		rows[0].PreviousSeqNum == nil || *rows[0].PreviousSeqNum != 56 {
 		t.Fatalf("got %#v", rows)
+	}
+	if rows[0].HasRestingQuotes() {
+		t.Fatal("expected no resting quotes when sizes absent")
+	}
+}
+
+func TestBulkOrderDto_HasRestingQuotes(t *testing.T) {
+	var b BulkOrderDto
+	if b.HasRestingQuotes() {
+		t.Fatal("zero value should not be active")
+	}
+	bid := 1.0
+	b = BulkOrderDto{BidSizes: []float64{bid}}
+	if !b.HasRestingQuotes() {
+		t.Fatal("expected active bid")
+	}
+	b = BulkOrderDto{AskSizes: []float64{0.0001}}
+	if !b.HasRestingQuotes() {
+		t.Fatal("expected active ask")
+	}
+	b = BulkOrderDto{BidSizes: []float64{0}, AskSizes: []float64{0}}
+	if b.HasRestingQuotes() {
+		t.Fatal("zeros should not be active")
 	}
 }

@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	"errors"
+	"flag"
 	"fmt"
 	"log/slog"
 	"math"
@@ -32,8 +34,21 @@ func main() {
 		slog.Info("loaded .env file")
 	}
 
+	args := config.NormalizeBoolCLIArgsForInit(os.Args)
+	if out, ok := config.ParseInitConfigFlag(args); ok {
+		if err := config.WriteInitConfigYAML(out); err != nil {
+			slog.Error("init-config failed", "err", err)
+			os.Exit(1)
+		}
+		fmt.Fprintf(os.Stdout, "wrote default YAML config to %s\n", out)
+		os.Exit(0)
+	}
+
 	cfg, err := config.Load()
 	if err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			os.Exit(0)
+		}
 		slog.Error("config error", "err", err)
 		os.Exit(1)
 	}

@@ -35,6 +35,11 @@ type MarketMaker struct {
 	lastInventory   float64
 	noFillCycles    int
 	firstCycle      bool
+
+	// When |inventory| >= MaxInventory we stop quoting; after one successful
+	// CancelBulkOrders we skip further on-chain cancels until inventory recovers,
+	// so we do not burn gas re-submitting noop cancels every cycle.
+	invLimitBulkCancelDone bool
 }
 
 // New creates a MarketMaker with the given exchange and market config.
@@ -86,12 +91,17 @@ func (m *MarketMaker) Run(ctx context.Context) error {
 			slog.Error("cycle failed", "cycle", cycle, "err", err)
 		}
 
-		slog.Info("sleeping", "seconds", m.cfg.RefreshInterval)
+		sleep := cycleSleepDuration(m.cfg.RefreshInterval, m.cfg.RefreshIntervalJitterS)
+		slog.Info("sleeping",
+			"refresh_interval", m.cfg.RefreshInterval,
+			"refresh_interval_jitter", m.cfg.RefreshIntervalJitterS,
+			"sleep_seconds", sleep.Seconds(),
+		)
 		select {
 		case <-ctx.Done():
 			slog.Info("shutting down")
 			return nil
-		case <-time.After(time.Duration(m.cfg.RefreshInterval * float64(time.Second))):
+		case <-time.After(sleep):
 		}
 	}
 }
@@ -124,6 +134,10 @@ func (m *MarketMaker) runCycle(ctx context.Context) error {
 		AllPositions:  exchangePositionsToBotstate(state.AllPositions),
 		PrevInventory: m.lastInventory,
 	})
+
+	if math.Abs(state.Inventory) < m.cfg.MaxInventory {
+		m.invLimitBulkCancelDone = false
+	}
 
 	// ── 2. First-cycle recovery ───────────────────────────────────────────────
 	if m.firstCycle {
@@ -205,9 +219,31 @@ func (m *MarketMaker) runCycle(ctx context.Context) error {
 	}
 
 	if quotes == nil {
-		slog.Info("inventory at limit, cancelling bulk orders",
-			"inventory", state.Inventory, "max", m.cfg.MaxInventory)
+		invExceeded := math.Abs(state.Inventory) >= m.cfg.MaxInventory
+		if invExceeded {
+			if !m.invLimitBulkCancelDone {
+				slog.Info("inventory at limit, cancelling bulk orders",
+					"inventory", state.Inventory, "max", m.cfg.MaxInventory)
+				if err := m.ex.CancelBulkOrders(ctx); err != nil {
+					return fmt.Errorf("cancel bulk orders: %w", err)
+				}
+				m.invLimitBulkCancelDone = true
+			} else {
+				slog.Info("inventory at limit; skipping cancel bulk until inventory recovers",
+					"inventory", state.Inventory, "max", m.cfg.MaxInventory)
+			}
+			if m.cfg.AutoFlatten {
+				if _, err := m.placeFlattenOrder(ctx, state.Inventory, mid); err != nil {
+					return fmt.Errorf("flatten order: %w", err)
+				}
+			} else {
+				slog.Warn("at max inventory; manually flatten or enable --auto-flatten")
+			}
+			return nil
+		}
 
+		slog.Info("cannot quote, cancelling bulk orders",
+			"inventory", state.Inventory, "reason", "size rounds to zero or below min_size")
 		if err := m.ex.CancelBulkOrders(ctx); err != nil {
 			return fmt.Errorf("cancel bulk orders: %w", err)
 		}
@@ -215,8 +251,6 @@ func (m *MarketMaker) runCycle(ctx context.Context) error {
 			if _, err := m.placeFlattenOrder(ctx, state.Inventory, mid); err != nil {
 				return fmt.Errorf("flatten order: %w", err)
 			}
-		} else {
-			slog.Warn("at max inventory; manually flatten or enable --auto-flatten")
 		}
 		return nil
 	}

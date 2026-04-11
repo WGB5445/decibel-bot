@@ -216,14 +216,36 @@ func (c *Client) FetchOpenOrders(ctx context.Context, subaccount string) ([]Open
 	return page.Items, nil
 }
 
-// BulkOrderHistoryRow is one element of GET /bulk_orders (bulk quote history / snapshots).
-type BulkOrderHistoryRow struct {
-	SequenceNumber uint64 `json:"sequence_number"`
-	PreviousSeqNum uint64 `json:"previous_seq_num"`
+// BulkOrderDto is one element of GET /bulk_orders (Decibel OpenAPI: BulkOrderDto).
+// Extra JSON fields are ignored by encoding/json.
+type BulkOrderDto struct {
+	SequenceNumber uint64    `json:"sequence_number"`
+	PreviousSeqNum *uint64   `json:"previous_seq_num"`
+	BidSizes       []float64 `json:"bid_sizes"`
+	AskSizes       []float64 `json:"ask_sizes"`
+}
+
+// HasRestingQuotes reports whether this snapshot still has non-zero bid or ask size on the book.
+func (b *BulkOrderDto) HasRestingQuotes() bool {
+	if b == nil {
+		return false
+	}
+	const eps = 1e-12
+	for _, s := range b.BidSizes {
+		if s > eps {
+			return true
+		}
+	}
+	for _, s := range b.AskSizes {
+		if s > eps {
+			return true
+		}
+	}
+	return false
 }
 
 // FetchBulkOrders calls GET /bulk_orders for a subaccount and market.
-func (c *Client) FetchBulkOrders(ctx context.Context, account, market string) ([]BulkOrderHistoryRow, error) {
+func (c *Client) FetchBulkOrders(ctx context.Context, account, market string) ([]BulkOrderDto, error) {
 	if strings.TrimSpace(account) == "" {
 		return nil, fmt.Errorf("fetch_bulk_orders: account is required")
 	}
@@ -234,7 +256,7 @@ func (c *Client) FetchBulkOrders(ctx context.Context, account, market string) ([
 	q.Set("account", strings.TrimSpace(account))
 	q.Set("market", strings.TrimSpace(market))
 	path := "/bulk_orders?" + q.Encode()
-	var rows []BulkOrderHistoryRow
+	var rows []BulkOrderDto
 	if err := c.getJSON(ctx, path, &rows); err != nil {
 		return nil, fmt.Errorf("fetch_bulk_orders: %w", err)
 	}

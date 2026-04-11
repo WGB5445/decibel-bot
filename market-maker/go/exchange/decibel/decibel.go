@@ -304,6 +304,23 @@ func (d *DecibelExchange) CancelBulkOrders(ctx context.Context) error {
 	if d.market == nil {
 		return fmt.Errorf("market not set: call SetMarket first")
 	}
+
+	rows, err := d.apiClient.FetchBulkOrders(ctx, d.cfg.SubaccountAddress, d.market.MarketID)
+	if err != nil {
+		return fmt.Errorf("fetch bulk orders before cancel: %w", err)
+	}
+	active := false
+	for i := range rows {
+		if rows[i].HasRestingQuotes() {
+			active = true
+			break
+		}
+	}
+	if !active {
+		slog.Info("skipping cancel bulk orders: no active bulk quotes on REST", "rows", len(rows))
+		return nil
+	}
+
 	slog.Info("cancelling bulk orders", "dry_run", d.dryRun)
 	if d.dryRun {
 		return nil
