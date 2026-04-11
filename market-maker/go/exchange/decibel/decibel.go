@@ -88,6 +88,12 @@ func (d *DecibelExchange) FindMarket(ctx context.Context, name string) (*exchang
 	return apiMarketToExchange(m), nil
 }
 
+// MarketsCatalog implements exchange.Exchange: full venue market list from GET /markets
+// (cached on the underlying api.Client after the first successful fetch).
+func (d *DecibelExchange) MarketsCatalog(ctx context.Context) ([]api.MarketConfig, error) {
+	return d.apiClient.FetchMarkets(ctx)
+}
+
 // SetMarket configures the target market for subsequent FetchState / order calls.
 func (d *DecibelExchange) SetMarket(m *exchange.MarketConfig) {
 	d.market = m
@@ -394,4 +400,13 @@ func apiStateToExchange(s *api.StateSnapshot) *exchange.StateSnapshot {
 		OpenOrders:   orders,
 		AllPositions: positions,
 	}
+}
+
+// APIClient returns the shared REST client used by ex when it is a *DecibelExchange; otherwise nil.
+func APIClient(ex exchange.Exchange) *api.Client {
+	d, ok := ex.(*DecibelExchange)
+	if !ok || d == nil {
+		return nil
+	}
+	return d.apiClient
 }

@@ -84,14 +84,15 @@ func main() {
 	)
 	slog.Info("using subaccount", "address", cfg.SubaccountAddress)
 
-	// Market catalog for Telegram display names (addr -> market_name from /markets).
+	// Global market catalog: on-chain market address -> name from GET /markets (multi-market
+	// display, notifications, etc.). Uses the same REST client as the exchange; cached in api.Client.
 	nameLookup := map[string]string(nil)
-	apiCatalog := api.NewClient(cfg.RestAPIBase, cfg.BearerToken)
-	if mkts, err := apiCatalog.FetchMarkets(ctx); err != nil {
-		slog.Warn("fetch markets for display name catalog failed", "err", err)
+	if mkts, err := ex.MarketsCatalog(ctx); err != nil {
+		slog.Warn("fetch markets catalog failed", "err", err)
 	} else {
 		nameLookup = buildMarketNameLookup(mkts)
 	}
+	apiCatalog := decibelExchange.APIClient(ex)
 
 	// ── 2. Strategy layer ────────────────────────────────────────────────────
 	mm := strategy.New(cfg, ex, market)

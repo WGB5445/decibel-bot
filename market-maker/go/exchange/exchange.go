@@ -14,6 +14,10 @@ type Exchange interface {
 	// FindMarket discovers market metadata by name (e.g. "BTC/USD").
 	FindMarket(ctx context.Context, name string) (*MarketConfig, error)
 
+	// MarketsCatalog returns all markets from the venue REST catalog (GET /markets on Decibel).
+	// Implementations may cache the result for the process lifetime after the first success.
+	MarketsCatalog(ctx context.Context) ([]api.MarketConfig, error)
+
 	// FetchState fetches the full state snapshot for the current cycle
 	// (account overview, positions, orders, mid price — in parallel where possible).
 	FetchState(ctx context.Context) (*StateSnapshot, error)

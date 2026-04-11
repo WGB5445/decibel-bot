@@ -10,6 +10,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"golang.org/x/sync/errgroup"
@@ -144,6 +145,19 @@ type Client struct {
 	http        *http.Client
 	baseURL     string
 	bearerToken string
+
+	marketsMu    sync.RWMutex
+	marketsCache []MarketConfig // scaled human-readable rows; populated after first successful GET /markets
+	marketsOK    bool           // true after at least one successful fetch (including empty list)
+}
+
+func cloneMarketConfigs(src []MarketConfig) []MarketConfig {
+	if src == nil {
+		return nil
+	}
+	out := make([]MarketConfig, len(src))
+	copy(out, src)
+	return out
 }
 
 // NewClient creates a Client with a 15-second timeout.
@@ -258,6 +272,20 @@ func (c *Client) FetchPrice(ctx context.Context, marketAddr string) (*PriceInfo,
 }
 
 func (c *Client) FetchMarkets(ctx context.Context) ([]MarketConfig, error) {
+	c.marketsMu.RLock()
+	if c.marketsOK {
+		out := cloneMarketConfigs(c.marketsCache)
+		c.marketsMu.RUnlock()
+		return out, nil
+	}
+	c.marketsMu.RUnlock()
+
+	c.marketsMu.Lock()
+	defer c.marketsMu.Unlock()
+	if c.marketsOK {
+		return cloneMarketConfigs(c.marketsCache), nil
+	}
+
 	var v []MarketConfig
 	if err := c.getJSON(ctx, "/markets", &v); err != nil {
 		return nil, fmt.Errorf("fetch_markets: %w", err)
@@ -270,7 +298,9 @@ func (c *Client) FetchMarkets(ctx context.Context) ([]MarketConfig, error) {
 		v[i].LotSize /= szScale
 		v[i].MinSize /= szScale
 	}
-	return v, nil
+	c.marketsCache = cloneMarketConfigs(v)
+	c.marketsOK = true
+	return cloneMarketConfigs(c.marketsCache), nil
 }
 
 // FindMarket finds a market by name (normalizing "/" ↔ "-", case-insensitive).
