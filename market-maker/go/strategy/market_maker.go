@@ -125,7 +125,15 @@ func (m *MarketMaker) runCycle(ctx context.Context) error {
 		PrevInventory: m.lastInventory,
 	})
 
-	// ── 2. Adaptive spread: fill detection ───────────────────────────────────
+	// ── 2. First-cycle recovery ───────────────────────────────────────────────
+	if m.firstCycle {
+		slog.Info("first cycle: recovering state from chain",
+			"inventory", state.Inventory,
+			"open_orders", len(state.OpenOrders),
+		)
+	}
+
+	// ── 2b. Adaptive spread: fill detection ──────────────────────────────────
 	if !m.firstCycle {
 		invChange := math.Abs(state.Inventory - m.lastInventory)
 		fillDetected := invChange > m.market.LotSize*0.5
@@ -197,11 +205,11 @@ func (m *MarketMaker) runCycle(ctx context.Context) error {
 	}
 
 	if quotes == nil {
-		slog.Info("inventory at limit, cancelling all orders",
+		slog.Info("inventory at limit, cancelling bulk orders",
 			"inventory", state.Inventory, "max", m.cfg.MaxInventory)
 
-		if _, _, err := m.cancelAllOrders(ctx, state.OpenOrders); err != nil {
-			return fmt.Errorf("cancel all orders: %w", err)
+		if err := m.ex.CancelBulkOrders(ctx); err != nil {
+			return fmt.Errorf("cancel bulk orders: %w", err)
 		}
 		if m.cfg.AutoFlatten {
 			if err := m.placeFlattenOrder(ctx, state.Inventory, mid); err != nil {
@@ -215,63 +223,12 @@ func (m *MarketMaker) runCycle(ctx context.Context) error {
 
 	slog.Info("computed quotes", "bid", quotes.Bid, "ask", quotes.Ask, "size", quotes.Size)
 
-	// ── 5. Cancel all resting orders ──────────────────────────────────────────
-	nOK, nFail, err := m.cancelAllOrders(ctx, state.OpenOrders)
-	if err != nil {
-		return fmt.Errorf("cancel all orders: %w", err)
-	}
-	if nOK > 0 || nFail > 0 {
-		slog.Info("cancel results", "cancelled", nOK, "failed", nFail)
-	}
-
-	if nFail > 0 {
-		slog.Warn("failed cancels, waiting for chain resync", "wait_s", m.cfg.CancelResyncS)
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-time.After(time.Duration(m.cfg.CancelResyncS * float64(time.Second))):
-		}
-
-		freshOrders, err := m.ex.FetchOpenOrders(ctx)
-		if err != nil {
-			return fmt.Errorf("re-fetch open orders: %w", err)
-		}
-		if len(freshOrders) > 0 {
-			slog.Warn("still have open orders after resync, skipping cycle",
-				"count", len(freshOrders))
-			return nil
-		}
-	}
-
-	// ── 6. Place bid ──────────────────────────────────────────────────────────
-	if err := m.ex.PlaceOrder(ctx, exchange.PlaceOrderRequest{
-		MarketID:    m.market.MarketID,
-		Price:       quotes.Bid,
-		Size:        quotes.Size,
-		IsBuy:       true,
-		TimeInForce: 1, // POST_ONLY
-		ReduceOnly:  false,
-	}); err != nil {
-		return fmt.Errorf("place bid: %w", err)
-	}
-
-	// ── 7. Cooldown ───────────────────────────────────────────────────────────
-	select {
-	case <-ctx.Done():
-		return ctx.Err()
-	case <-time.After(time.Duration(m.cfg.CooldownS * float64(time.Second))):
-	}
-
-	// ── 8. Place ask ──────────────────────────────────────────────────────────
-	if err := m.ex.PlaceOrder(ctx, exchange.PlaceOrderRequest{
-		MarketID:    m.market.MarketID,
-		Price:       quotes.Ask,
-		Size:        quotes.Size,
-		IsBuy:       false,
-		TimeInForce: 1, // POST_ONLY
-		ReduceOnly:  false,
-	}); err != nil {
-		return fmt.Errorf("place ask: %w", err)
+	// ── 5. Atomically replace bulk quotes (bid + ask in one transaction) ──────
+	if err := m.ex.PlaceBulkOrders(ctx,
+		[]exchange.BulkOrderEntry{{Price: quotes.Bid, Size: quotes.Size}},
+		[]exchange.BulkOrderEntry{{Price: quotes.Ask, Size: quotes.Size}},
+	); err != nil {
+		return fmt.Errorf("place bulk orders: %w", err)
 	}
 
 	slog.Info("cycle complete")

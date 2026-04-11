@@ -25,6 +25,10 @@ type DecibelExchange struct {
 	market      *exchange.MarketConfig
 	walletAddr  string
 	dryRun      bool
+
+	// bulkSeq is the monotonically increasing sequence number for bulk order calls.
+	// Starts at 1 and increments each time PlaceBulkOrders is called successfully.
+	bulkSeq uint64
 }
 
 // New creates a DecibelExchange, initialising the Decibel REST client, Aptos
@@ -166,6 +170,93 @@ func (d *DecibelExchange) PlaceOrder(ctx context.Context, req exchange.PlaceOrde
 		return fmt.Errorf("place order failed: side=%s vm_status=%s", side, result.VMStatus)
 	}
 	slog.Info("order placed", "side", side, "price", req.Price, "size", req.Size, "tx_hash", result.Hash)
+	return nil
+}
+
+// PlaceBulkOrders atomically replaces all bulk quotes for the target market.
+// Bulk orders are POST_ONLY. Empty bids/asks clears that side.
+func (d *DecibelExchange) PlaceBulkOrders(ctx context.Context, bids, asks []exchange.BulkOrderEntry) error {
+	if d.market == nil {
+		return fmt.Errorf("market not set: call SetMarket first")
+	}
+
+	bidPrices := make([]string, len(bids))
+	bidSizes := make([]string, len(bids))
+	for i, b := range bids {
+		bidPrices[i] = fmt.Sprintf("%d", scalePrice(b.Price, d.market.PxDecimals))
+		bidSizes[i] = fmt.Sprintf("%d", scaleSize(b.Size, d.market.SzDecimals))
+	}
+	askPrices := make([]string, len(asks))
+	askSizes := make([]string, len(asks))
+	for i, a := range asks {
+		askPrices[i] = fmt.Sprintf("%d", scalePrice(a.Price, d.market.PxDecimals))
+		askSizes[i] = fmt.Sprintf("%d", scaleSize(a.Size, d.market.SzDecimals))
+	}
+
+	d.bulkSeq++
+	slog.Info("placing bulk orders",
+		"bids", len(bids), "asks", len(asks),
+		"bulk_seq", d.bulkSeq,
+		"dry_run", d.dryRun,
+	)
+	if d.dryRun {
+		return nil
+	}
+
+	fn := d.cfg.PackageAddress + "::dex_accounts_entry::place_bulk_orders_to_subaccount"
+	slog.Info("submitting bulk orders", "bids", len(bids), "asks", len(asks), "bulk_seq", d.bulkSeq)
+	result, err := d.aptosNode.SubmitEntryFunction(ctx, d.aptosSigner, fn, nil, []any{
+		d.cfg.SubaccountAddress, //  1. subaccount
+		d.market.MarketID,      //  2. market
+		d.bulkSeq,              //  3. sequence_number (u64)
+		bidPrices,              //  4. bid_prices vector<u64>
+		bidSizes,               //  5. bid_sizes  vector<u64>
+		askPrices,              //  6. ask_prices vector<u64>
+		askSizes,               //  7. ask_sizes  vector<u64>
+		nil,                    //  8. builder_address Option<address>
+		nil,                    //  9. builder_fees    Option<u64>
+	})
+	if err != nil {
+		d.bulkSeq-- // revert on submission error so next retry uses same seq
+		slog.Error("bulk orders submission failed", "bids", len(bids), "asks", len(asks), "err", err)
+		return err
+	}
+	slog.Info("bulk orders submitted", "tx_hash", result.Hash)
+	if !result.Success {
+		d.bulkSeq--
+		slog.Error("bulk orders execution failed", "vm_status", result.VMStatus)
+		return fmt.Errorf("place bulk orders failed: vm_status=%s", result.VMStatus)
+	}
+	slog.Info("bulk orders placed", "bids", len(bids), "asks", len(asks), "tx_hash", result.Hash)
+	return nil
+}
+
+// CancelBulkOrders removes all bulk quotes for the target market in one transaction.
+func (d *DecibelExchange) CancelBulkOrders(ctx context.Context) error {
+	if d.market == nil {
+		return fmt.Errorf("market not set: call SetMarket first")
+	}
+	slog.Info("cancelling bulk orders", "dry_run", d.dryRun)
+	if d.dryRun {
+		return nil
+	}
+
+	fn := d.cfg.PackageAddress + "::dex_accounts_entry::cancel_bulk_order_to_subaccount"
+	slog.Info("submitting cancel bulk orders")
+	result, err := d.aptosNode.SubmitEntryFunction(ctx, d.aptosSigner, fn, nil, []any{
+		d.cfg.SubaccountAddress,
+		d.market.MarketID,
+	})
+	if err != nil {
+		slog.Error("cancel bulk orders submission failed", "err", err)
+		return err
+	}
+	slog.Info("cancel bulk orders submitted", "tx_hash", result.Hash)
+	if !result.Success {
+		slog.Error("cancel bulk orders execution failed", "vm_status", result.VMStatus)
+		return fmt.Errorf("cancel bulk orders failed: vm_status=%s", result.VMStatus)
+	}
+	slog.Info("bulk orders cancelled", "tx_hash", result.Hash)
 	return nil
 }
 

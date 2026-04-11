@@ -20,6 +20,14 @@ type Exchange interface {
 	// PlaceOrder places an order on the exchange.
 	PlaceOrder(ctx context.Context, req PlaceOrderRequest) error
 
+	// PlaceBulkOrders atomically replaces all bulk quotes for the target market.
+	// bids and asks are price levels (POST_ONLY). An empty slice clears that side.
+	// Passing empty slices for both sides is equivalent to CancelBulkOrders.
+	PlaceBulkOrders(ctx context.Context, bids, asks []BulkOrderEntry) error
+
+	// CancelBulkOrders removes all bulk quotes for the target market in one transaction.
+	CancelBulkOrders(ctx context.Context) error
+
 	// CancelOrder cancels a single order by ID.
 	// Returns nil when the order was already gone (not-found is success).
 	CancelOrder(ctx context.Context, orderID string) error

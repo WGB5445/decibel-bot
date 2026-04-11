@@ -42,3 +42,9 @@ type PlaceOrderRequest struct {
 	TimeInForce int // 0=GTC, 1=POST_ONLY, 2=IOC
 	ReduceOnly  bool
 }
+
+// BulkOrderEntry is a single price level within a PlaceBulkOrders call.
+type BulkOrderEntry struct {
+	Price float64
+	Size  float64
+}
