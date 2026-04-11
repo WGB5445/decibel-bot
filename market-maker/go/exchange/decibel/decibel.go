@@ -170,6 +170,9 @@ func (d *DecibelExchange) PlaceOrder(ctx context.Context, req exchange.PlaceOrde
 		),
 	)
 	if err != nil {
+		if result != nil && result.Hash != "" {
+			slog.Warn("place order: tx submitted but confirmation incomplete", "tx_hash", result.Hash, "err", err)
+		}
 		return exchange.PlaceOrderOutcome{}, err
 	}
 	if !result.Success {
@@ -233,7 +236,13 @@ func (d *DecibelExchange) PlaceBulkOrders(ctx context.Context, bids, asks []exch
 		nil,                     //  9. builder_fees    Option<u64>
 	})
 	if err != nil {
-		d.bulkSeq-- // revert on submission error so next retry uses same seq
+		if result != nil && result.Hash != "" {
+			// Tx may still land on-chain; do not reuse the same bulk_seq.
+			slog.Error("bulk orders: tx submitted but confirmation incomplete",
+				"tx_hash", result.Hash, "bids", len(bids), "asks", len(asks), "err", err)
+			return err
+		}
+		d.bulkSeq-- // only when submit did not return a hash (build/sign/submit path failed)
 		slog.Error("bulk orders submission failed", "bids", len(bids), "asks", len(asks), "err", err)
 		return err
 	}
@@ -264,7 +273,11 @@ func (d *DecibelExchange) CancelBulkOrders(ctx context.Context) error {
 		d.market.MarketID,
 	})
 	if err != nil {
-		slog.Error("cancel bulk orders submission failed", "err", err)
+		if result != nil && result.Hash != "" {
+			slog.Warn("cancel bulk orders: tx submitted but confirmation incomplete", "tx_hash", result.Hash, "err", err)
+		} else {
+			slog.Error("cancel bulk orders submission failed", "err", err)
+		}
 		return err
 	}
 	slog.Info("cancel bulk orders submitted", "tx_hash", result.Hash)
@@ -294,6 +307,9 @@ func (d *DecibelExchange) CancelOrder(ctx context.Context, orderID string) error
 		d.market.MarketID,
 	})
 	if err != nil {
+		if result != nil && result.Hash != "" {
+			slog.Warn("cancel order: tx submitted but confirmation incomplete", "tx_hash", result.Hash, "order_id", orderID, "err", err)
+		}
 		return err
 	}
 	if !result.CancelSucceeded() {

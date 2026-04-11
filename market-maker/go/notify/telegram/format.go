@@ -53,8 +53,13 @@ func positionsForDisplay(snap botstate.Snapshot) []botstate.Position {
 		}
 		out = append(out, p)
 	}
-	sort.Slice(out, func(i, j int) bool {
-		return strings.ToLower(out[i].MarketID) < strings.ToLower(out[j].MarketID)
+	sort.SliceStable(out, func(i, j int) bool {
+		ni := api.NormalizeAddr(out[i].MarketID)
+		nj := api.NormalizeAddr(out[j].MarketID)
+		if ni != nj {
+			return ni < nj
+		}
+		return out[i].MarketID < out[j].MarketID
 	})
 	return out
 }

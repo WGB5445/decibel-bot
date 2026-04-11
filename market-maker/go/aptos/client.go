@@ -15,7 +15,10 @@ import (
 
 const maxGasAmount = 200_000 // match legacy REST client / main
 
-// TxResult holds the outcome of a committed on-chain transaction.
+// TxResult holds the outcome of an entry-function submission.
+// Normally the transaction is committed and Success/VMStatus/Events reflect the chain.
+// When SubmitTransaction succeeded but WaitForTransaction failed (timeout/network),
+// Hash is still set, Success is false, VMStatus is "wait_pending", and Events is nil.
 type TxResult struct {
 	Hash     string
 	Success  bool
@@ -24,6 +27,9 @@ type TxResult struct {
 	// (same order as the Aptos API). Callers may scan for order_id etc.
 	Events []*aptapi.Event
 }
+
+// VMStatusWaitPending is set on TxResult when the tx hash is known but confirmation polling failed.
+const VMStatusWaitPending = "wait_pending"
 
 // CancelSucceeded returns true when the transaction should be counted as a
 // successful cancel (either the tx succeeded, or the order was already gone).
@@ -176,9 +182,15 @@ func (n *NodeClient) SubmitEntryFunction(
 	}
 	waitOpts := []any{aptossdk.PollTimeout(waitTimeout)}
 
-	tx, err := n.sdk.WaitForTransaction(string(submitRes.Hash), waitOpts...)
+	hash := string(submitRes.Hash)
+	tx, err := n.sdk.WaitForTransaction(hash, waitOpts...)
 	if err != nil {
-		return nil, fmt.Errorf("wait for transaction: %w", err)
+		return &TxResult{
+			Hash:     hash,
+			Success:  false,
+			VMStatus: VMStatusWaitPending,
+			Events:   nil,
+		}, fmt.Errorf("wait for transaction: %w", err)
 	}
 
 	vm := tx.VmStatus
@@ -186,7 +198,7 @@ func (n *NodeClient) SubmitEntryFunction(
 		vm = "unknown"
 	}
 	return &TxResult{
-		Hash:     string(submitRes.Hash),
+		Hash:     hash,
 		Success:  tx.Success,
 		VMStatus: vm,
 		Events:   tx.Events,

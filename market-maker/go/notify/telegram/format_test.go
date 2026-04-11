@@ -27,6 +27,27 @@ func TestPositionsForDisplay_filtersAndSorts(t *testing.T) {
 	}
 }
 
+func TestPositionsForDisplay_normalizedAddrTieBreak(t *testing.T) {
+	// Same canonical address under api.NormalizeAddr; raw string order must be deterministic.
+	snap := botstate.Snapshot{
+		AllPositions: []botstate.Position{
+			{MarketID: "0x1", Size: 0.1},
+			{MarketID: "0x01", Size: 0.2},
+		},
+	}
+	got := positionsForDisplay(snap)
+	if len(got) != 2 {
+		t.Fatalf("len=%d want 2", len(got))
+	}
+	if got[0].MarketID != "0x01" || got[1].MarketID != "0x1" {
+		t.Fatalf("want lexicographic tie-break 0x01 before 0x1, got %#v", got)
+	}
+	got2 := positionsForDisplay(snap)
+	if got[0].MarketID != got2[0].MarketID || got[1].MarketID != got2[1].MarketID {
+		t.Fatalf("order non-deterministic between calls: %#v vs %#v", got, got2)
+	}
+}
+
 func TestPositionsTotalPages_andClamp(t *testing.T) {
 	snap := botstate.Snapshot{
 		AllPositions: []botstate.Position{
