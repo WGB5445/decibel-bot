@@ -3,6 +3,9 @@
 A perpetual-futures market-maker bot for the [Decibel DEX](https://decibel.trade) on Aptos.
 
 Requires **Go 1.24+**. Built with a **three-layer pluggable architecture**:
+
+**CI:** On every push / pull request that touches `market-maker/go/`, [GitHub Actions](../../.github/workflows/market-maker-go.yml) runs on **Linux** (`ubuntu-latest`): `gofmt` check, `go vet ./...`, `go test ./...`, and `go build` (from the `market-maker/go` directory).
+
 - **Exchange Layer** — abstraction for different DEX/chains (currently Decibel/Aptos)
 - **Strategy Layer** — market-making logic decoupled from exchange details
 - **Notification Layer** — monitoring/control via Telegram (extensible to Discord, Slack, etc.)
