@@ -56,6 +56,7 @@ func (t *TelegramNotifier) SetBotCommands(ctx context.Context) error {
 		tgbotapi.BotCommand{Command: "balance", Description: "查看账户余额"},
 		tgbotapi.BotCommand{Command: "gas", Description: "查看钱包 APT 余额"},
 		tgbotapi.BotCommand{Command: "positions", Description: "查看当前仓位"},
+		tgbotapi.BotCommand{Command: "trade_history", Description: "成交历史 trade_history（每页5条，可翻页）"},
 		tgbotapi.BotCommand{Command: "help", Description: "显示帮助"},
 	)
 

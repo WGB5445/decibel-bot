@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log/slog"
 	"math"
+	"sync"
 
 	aptossdk "github.com/aptos-labs/aptos-go-sdk"
 
@@ -25,6 +26,14 @@ type DecibelExchange struct {
 	market      *exchange.MarketConfig
 	walletAddr  string
 	dryRun      bool
+
+	// bulkSeq is the last sequence_number used in a live place_bulk_orders call (or max from
+	// GET /bulk_orders after sync). Each live PlaceBulkOrders does bulkSeq++ before submit.
+	// It is never decremented so retries never reuse a consumed or ambiguous seq.
+	bulkSeq uint64
+
+	bulkMu        sync.Mutex
+	bulkSeqSynced bool
 }
 
 // New creates a DecibelExchange, initialising the Decibel REST client, Aptos
@@ -84,9 +93,19 @@ func (d *DecibelExchange) FindMarket(ctx context.Context, name string) (*exchang
 	return apiMarketToExchange(m), nil
 }
 
+// MarketsCatalog implements exchange.Exchange: full venue market list from GET /markets
+// (cached on the underlying api.Client after the first successful fetch).
+func (d *DecibelExchange) MarketsCatalog(ctx context.Context) ([]api.MarketConfig, error) {
+	return d.apiClient.FetchMarkets(ctx)
+}
+
 // SetMarket configures the target market for subsequent FetchState / order calls.
 func (d *DecibelExchange) SetMarket(m *exchange.MarketConfig) {
+	d.bulkMu.Lock()
+	defer d.bulkMu.Unlock()
 	d.market = m
+	d.bulkSeqSynced = false
+	d.bulkSeq = 0
 }
 
 // FetchState fetches the full state snapshot for one cycle.
@@ -124,9 +143,9 @@ func (d *DecibelExchange) FetchOpenOrders(ctx context.Context) ([]exchange.OpenO
 }
 
 // PlaceOrder places a limit order on Decibel via Aptos entry function.
-func (d *DecibelExchange) PlaceOrder(ctx context.Context, req exchange.PlaceOrderRequest) error {
+func (d *DecibelExchange) PlaceOrder(ctx context.Context, req exchange.PlaceOrderRequest) (exchange.PlaceOrderOutcome, error) {
 	if d.market == nil {
-		return fmt.Errorf("market not set: call SetMarket first")
+		return exchange.PlaceOrderOutcome{}, fmt.Errorf("market not set: call SetMarket first")
 	}
 	side := "ASK"
 	if req.IsBuy {
@@ -145,7 +164,7 @@ func (d *DecibelExchange) PlaceOrder(ctx context.Context, req exchange.PlaceOrde
 		"dry_run", d.dryRun,
 	)
 	if d.dryRun {
-		return nil
+		return exchange.PlaceOrderOutcome{}, nil
 	}
 
 	fn := d.cfg.PackageAddress + "::dex_accounts_entry::place_order_to_subaccount"
@@ -160,12 +179,173 @@ func (d *DecibelExchange) PlaceOrder(ctx context.Context, req exchange.PlaceOrde
 		),
 	)
 	if err != nil {
-		return err
+		if result != nil && result.Hash != "" {
+			slog.Warn("place order: tx submitted but confirmation incomplete", "tx_hash", result.Hash, "err", err)
+		}
+		return exchange.PlaceOrderOutcome{}, err
 	}
 	if !result.Success {
-		return fmt.Errorf("place order failed: side=%s vm_status=%s", side, result.VMStatus)
+		return exchange.PlaceOrderOutcome{}, fmt.Errorf("place order failed: side=%s vm_status=%s", side, result.VMStatus)
 	}
-	slog.Info("order placed", "side", side, "price", req.Price, "size", req.Size, "tx_hash", result.Hash)
+	oid := aptos.OrderIDFromEvents(result.Events)
+	if oid != "" {
+		slog.Info("order placed", "side", side, "price", req.Price, "size", req.Size, "tx_hash", result.Hash, "order_id", oid)
+	} else {
+		slog.Info("order placed", "side", side, "price", req.Price, "size", req.Size, "tx_hash", result.Hash)
+	}
+	return exchange.PlaceOrderOutcome{TxHash: result.Hash, OrderID: oid}, nil
+}
+
+// FetchTradeHistory implements exchange.Exchange.
+func (d *DecibelExchange) FetchTradeHistory(ctx context.Context, p api.TradeHistoryParams) ([]api.TradeHistoryItem, error) {
+	return d.apiClient.FetchTradeHistory(ctx, p)
+}
+
+// syncBulkSeqFromREST sets d.bulkSeq to max(sequence_number) from GET /bulk_orders
+// so the next live PlaceBulkOrders uses max+1. Caller must hold d.bulkMu.
+func (d *DecibelExchange) syncBulkSeqFromREST(ctx context.Context) error {
+	rows, err := d.apiClient.FetchBulkOrders(ctx, d.cfg.SubaccountAddress, d.market.MarketID)
+	if err != nil {
+		return err
+	}
+	var max uint64
+	for _, r := range rows {
+		if r.SequenceNumber > max {
+			max = r.SequenceNumber
+		}
+	}
+	d.bulkSeq = max
+	d.bulkSeqSynced = true
+	slog.Info("bulk sequence synced from REST",
+		"max_sequence_number", max,
+		"next_bulk_seq", max+1,
+		"rows", len(rows),
+	)
+	return nil
+}
+
+// PlaceBulkOrders atomically replaces all bulk quotes for the target market.
+// Bulk orders are POST_ONLY. Empty bids/asks clears that side.
+func (d *DecibelExchange) PlaceBulkOrders(ctx context.Context, bids, asks []exchange.BulkOrderEntry) error {
+	if d.market == nil {
+		return fmt.Errorf("market not set: call SetMarket first")
+	}
+
+	d.bulkMu.Lock()
+	defer d.bulkMu.Unlock()
+
+	if !d.bulkSeqSynced {
+		if err := d.syncBulkSeqFromREST(ctx); err != nil {
+			return fmt.Errorf("sync bulk sequence from REST: %w", err)
+		}
+	}
+
+	bidPrices := make([]string, len(bids))
+	bidSizes := make([]string, len(bids))
+	for i, b := range bids {
+		bidPrices[i] = fmt.Sprintf("%d", scalePrice(b.Price, d.market.PxDecimals))
+		bidSizes[i] = fmt.Sprintf("%d", scaleSize(b.Size, d.market.SzDecimals))
+	}
+	askPrices := make([]string, len(asks))
+	askSizes := make([]string, len(asks))
+	for i, a := range asks {
+		askPrices[i] = fmt.Sprintf("%d", scalePrice(a.Price, d.market.PxDecimals))
+		askSizes[i] = fmt.Sprintf("%d", scaleSize(a.Size, d.market.SzDecimals))
+	}
+
+	if d.dryRun {
+		slog.Info("placing bulk orders (dry run)",
+			"bids", len(bids), "asks", len(asks),
+			"next_bulk_seq", d.bulkSeq+1,
+		)
+		return nil
+	}
+
+	d.bulkSeq++
+	slog.Info("placing bulk orders",
+		"bids", len(bids), "asks", len(asks),
+		"bulk_seq", d.bulkSeq,
+		"dry_run", d.dryRun,
+	)
+
+	fn := d.cfg.PackageAddress + "::dex_accounts_entry::place_bulk_orders_to_subaccount"
+	slog.Info("submitting bulk orders", "bids", len(bids), "asks", len(asks), "bulk_seq", d.bulkSeq)
+	result, err := d.aptosNode.SubmitEntryFunction(ctx, d.aptosSigner, fn, nil, []any{
+		d.cfg.SubaccountAddress, //  1. subaccount
+		d.market.MarketID,       //  2. market
+		d.bulkSeq,               //  3. sequence_number (u64)
+		bidPrices,               //  4. bid_prices vector<u64>
+		bidSizes,                //  5. bid_sizes  vector<u64>
+		askPrices,               //  6. ask_prices vector<u64>
+		askSizes,                //  7. ask_sizes  vector<u64>
+		nil,                     //  8. builder_address Option<address>
+		nil,                     //  9. builder_fees    Option<u64>
+	})
+	if err != nil {
+		if result != nil && result.Hash != "" {
+			slog.Error("bulk orders: tx submitted but confirmation incomplete",
+				"tx_hash", result.Hash, "bids", len(bids), "asks", len(asks), "err", err)
+			return err
+		}
+		slog.Error("bulk orders submission failed", "bids", len(bids), "asks", len(asks), "err", err)
+		return err
+	}
+	slog.Info("bulk orders submitted", "tx_hash", result.Hash)
+	if !result.Success {
+		slog.Error("bulk orders execution failed", "vm_status", result.VMStatus)
+		return fmt.Errorf("place bulk orders failed: vm_status=%s", result.VMStatus)
+	}
+	slog.Info("bulk orders placed", "bids", len(bids), "asks", len(asks), "tx_hash", result.Hash)
+	return nil
+}
+
+// CancelBulkOrders removes all bulk quotes for the target market in one transaction.
+func (d *DecibelExchange) CancelBulkOrders(ctx context.Context) error {
+	if d.market == nil {
+		return fmt.Errorf("market not set: call SetMarket first")
+	}
+
+	rows, err := d.apiClient.FetchBulkOrders(ctx, d.cfg.SubaccountAddress, d.market.MarketID)
+	if err != nil {
+		return fmt.Errorf("fetch bulk orders before cancel: %w", err)
+	}
+	active := false
+	for i := range rows {
+		if rows[i].HasRestingQuotes() {
+			active = true
+			break
+		}
+	}
+	if !active {
+		slog.Info("skipping cancel bulk orders: no active bulk quotes on REST", "rows", len(rows))
+		return nil
+	}
+
+	slog.Info("cancelling bulk orders", "dry_run", d.dryRun)
+	if d.dryRun {
+		return nil
+	}
+
+	fn := d.cfg.PackageAddress + "::dex_accounts_entry::cancel_bulk_order_to_subaccount"
+	slog.Info("submitting cancel bulk orders")
+	result, err := d.aptosNode.SubmitEntryFunction(ctx, d.aptosSigner, fn, nil, []any{
+		d.cfg.SubaccountAddress,
+		d.market.MarketID,
+	})
+	if err != nil {
+		if result != nil && result.Hash != "" {
+			slog.Warn("cancel bulk orders: tx submitted but confirmation incomplete", "tx_hash", result.Hash, "err", err)
+		} else {
+			slog.Error("cancel bulk orders submission failed", "err", err)
+		}
+		return err
+	}
+	slog.Info("cancel bulk orders submitted", "tx_hash", result.Hash)
+	if !result.Success {
+		slog.Error("cancel bulk orders execution failed", "vm_status", result.VMStatus)
+		return fmt.Errorf("cancel bulk orders failed: vm_status=%s", result.VMStatus)
+	}
+	slog.Info("bulk orders cancelled", "tx_hash", result.Hash)
 	return nil
 }
 
@@ -187,6 +367,9 @@ func (d *DecibelExchange) CancelOrder(ctx context.Context, orderID string) error
 		d.market.MarketID,
 	})
 	if err != nil {
+		if result != nil && result.Hash != "" {
+			slog.Warn("cancel order: tx submitted but confirmation incomplete", "tx_hash", result.Hash, "order_id", orderID, "err", err)
+		}
 		return err
 	}
 	if !result.CancelSucceeded() {
@@ -248,13 +431,17 @@ func scaleSize(size float64, szDecimals int) uint64 {
 // apiMarketToExchange converts an api.MarketConfig to exchange.MarketConfig.
 func apiMarketToExchange(m *api.MarketConfig) *exchange.MarketConfig {
 	return &exchange.MarketConfig{
-		MarketID:   m.MarketAddr,
-		MarketName: m.MarketName,
-		TickSize:   m.TickSize,
-		LotSize:    m.LotSize,
-		MinSize:    m.MinSize,
-		PxDecimals: m.PxDecimals,
-		SzDecimals: m.SzDecimals,
+		MarketID:                m.MarketAddr,
+		MarketName:              m.MarketName,
+		TickSize:                m.TickSize,
+		LotSize:                 m.LotSize,
+		MinSize:                 m.MinSize,
+		PxDecimals:              m.PxDecimals,
+		SzDecimals:              m.SzDecimals,
+		MaxLeverage:             m.MaxLeverage,
+		Mode:                    m.Mode,
+		MaxOpenInterest:         m.MaxOpenInterest,
+		UnrealizedPnlHaircutBps: m.UnrealizedPnlHaircutBps,
 	}
 }
 
@@ -263,8 +450,15 @@ func apiStateToExchange(s *api.StateSnapshot) *exchange.StateSnapshot {
 	positions := make([]exchange.Position, len(s.AllPositions))
 	for i, p := range s.AllPositions {
 		positions[i] = exchange.Position{
-			MarketID: p.MarketAddr,
-			Size:     p.Size,
+			MarketID:                  p.Market,
+			Size:                      p.Size,
+			EntryPrice:                p.EntryPrice,
+			UserLeverage:              p.UserLeverage,
+			UnrealizedFunding:         p.UnrealizedFunding,
+			EstimatedLiquidationPrice: p.EstimatedLiquidationPrice,
+			IsIsolated:                p.IsIsolated,
+			TransactionVersion:        p.TransactionVersion,
+			IsDeleted:                 p.IsDeleted,
 		}
 	}
 	orders := make([]exchange.OpenOrder, len(s.OpenOrders))
@@ -282,4 +476,13 @@ func apiStateToExchange(s *api.StateSnapshot) *exchange.StateSnapshot {
 		OpenOrders:   orders,
 		AllPositions: positions,
 	}
+}
+
+// APIClient returns the shared REST client used by ex when it is a *DecibelExchange; otherwise nil.
+func APIClient(ex exchange.Exchange) *api.Client {
+	d, ok := ex.(*DecibelExchange)
+	if !ok || d == nil {
+		return nil
+	}
+	return d.apiClient
 }

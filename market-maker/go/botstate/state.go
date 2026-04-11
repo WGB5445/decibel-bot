@@ -13,8 +13,15 @@ import (
 // Position is a lightweight position type used within botstate.
 // Strategy layer is responsible for converting exchange.Position to this type.
 type Position struct {
-	MarketID string
-	Size     float64 // positive = long, negative = short
+	MarketID                  string
+	Size                      float64 // positive = long, negative = short
+	EntryPrice                float64
+	UserLeverage              float64
+	UnrealizedFunding         float64
+	EstimatedLiquidationPrice float64
+	IsIsolated                bool
+	TransactionVersion        int64
+	IsDeleted                 bool
 }
 
 // BotState is written by the market-maker strategy and read by notification
@@ -41,6 +48,7 @@ type Snapshot struct {
 	MarginUsage      float64
 	Inventory        float64
 	Mid              *float64
+	MidByMarket      map[string]float64
 	AllPositions     []Position
 	EntryPrice       float64 // VWAP estimate for the target market; 0 = unknown
 	TargetMarketName string
@@ -103,6 +111,7 @@ func (s *BotState) Get() Snapshot {
 		MarginUsage:      s.marginUsage,
 		Inventory:        s.inventory,
 		Mid:              midCopy,
+		MidByMarket:      nil,
 		AllPositions:     append([]Position(nil), s.allPositions...),
 		EntryPrice:       s.entryPrices[key],
 		TargetMarketName: s.targetMarketName,

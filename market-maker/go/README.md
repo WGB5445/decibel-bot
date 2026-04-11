@@ -54,7 +54,8 @@ export TG_ALERT_INVENTORY_INTERVAL_MIN=30  # optional: minutes between alerts
 Commands (sent by `/...` to the bot in Telegram):
 - `/balance` — Account equity, available balance, margin usage
 - `/gas` — Wallet APT balance
-- `/positions` — All open positions with P&L (for target market)
+- `/positions` — Non-zero positions across markets (paged in one message; refresh resets to page 1); chain actions still use market addresses
+- `/trade_history` — Recent fills for the configured market from REST `trade_history` (5 per page, paginated)
 - `/help` — Command list
 
 Alerts: When `abs(inventory) ≥ MAX_INVENTORY`, the bot sends an alert with buttons to refresh or close the position. Auto-refresh period is configurable.
@@ -132,6 +133,7 @@ The **GlobalPerpEngine** object address is **not configurable**: it is always de
 | `SKEW_PER_UNIT` | `-skew-per-unit` | `0.0001` | Extra half-spread added per 1.0 unit of net inventory (inventory skew coefficient). Positive inventory shifts quotes down; negative shifts them up. |
 | `MAX_MARGIN_USAGE` | `-max-margin-usage` | `0.5` | Pause quoting when `cross_margin_ratio > this` (0–1). `0.5` = pause above 50% margin usage. |
 | `REFRESH_INTERVAL` | `-refresh-interval` | `20.0` | Seconds to sleep between full quote cycles. |
+| `REFRESH_INTERVAL_JITTER_S` | `-refresh-interval-jitter` | `0` | Half-width in seconds for **uniform** random jitter: each cycle sleeps in `[REFRESH_INTERVAL − jitter, REFRESH_INTERVAL + jitter]`. The lower bound is floored at `0.01` s if `interval − jitter` would be non-positive. `0` disables jitter (fixed interval). |
 | `COOLDOWN_S` | `-cooldown-s` | `1.5` | Seconds to wait between placing the bid and the ask within a single cycle. |
 | `CANCEL_RESYNC_S` | `-cancel-resync-s` | `8.0` | Seconds to wait before re-fetching open orders after a cancel fails. |
 | `AUTO_FLATTEN` | `-auto-flatten` | `false` | When `true`, automatically place a reduce-only GTC order to cut inventory when `MAX_INVENTORY` is hit. |

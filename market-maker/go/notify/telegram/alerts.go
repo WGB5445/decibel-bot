@@ -108,8 +108,9 @@ func (t *TelegramNotifier) handleInventoryCallback(ctx context.Context, cb *tgbo
 
 	switch action {
 	case "close":
-		t.edit(chatID, msgID, "⏳ 正在平仓...", inventoryAlertKeyboard(false))
-		if err := t.info.FlattenPosition(ctx); err != nil {
+		t.edit(chatID, msgID, "正在平仓", inventoryAlertKeyboard(false))
+		out, err := t.info.FlattenPosition(ctx)
+		if err != nil {
 			kb := inventoryAlertKeyboard(false)
 			if snap, fe := t.info.FetchLiveSnapshot(ctx); fe == nil {
 				kb = inventoryAlertKeyboard(math.Abs(snap.Inventory) >= 1e-9)
@@ -121,22 +122,20 @@ func (t *TelegramNotifier) handleInventoryCallback(ctx context.Context, cb *tgbo
 			t.editPlain(chatID, msgID, fmt.Sprintf("❌ 平仓失败: %v", err), kb)
 			return
 		}
-		snap, err := t.info.FetchLiveSnapshot(ctx)
-		midStr := "市价"
-		if err == nil && snap.Mid != nil {
-			midStr = fmt.Sprintf("$%.2f", *snap.Mid)
-		} else if err != nil {
-			slog.Warn("tgbot: fetch live snapshot after inv flatten failed", "err", err)
+		snap, err2 := t.info.FetchLiveSnapshot(ctx)
+		if err2 != nil {
+			slog.Warn("tgbot: fetch live snapshot after inv flatten failed", "err", err2)
+			t.editPlain(chatID, msgID, fmt.Sprintf("平仓已提交但刷新失败: %v", err2), inventoryAlertKeyboard(true))
+			return
 		}
-		showClose := false
-		if err == nil {
-			showClose = math.Abs(snap.Inventory) >= 1e-9
+		// 平仓结果定格：刷新走新消息仓位；返回走新消息帮助，不 edit 本条。
+		kb := positionsPostCloseKeyboard()
+		md, plain := t.flattenFollowUpMessage(ctx, out.TxHash, out.OrderID, snap)
+		if plain != "" {
+			t.editPlain(chatID, msgID, plain, kb)
+		} else {
+			t.edit(chatID, msgID, md, kb)
 		}
-		kb := inventoryAlertKeyboard(showClose)
-		t.edit(chatID, msgID,
-			fmt.Sprintf("✅ 平仓单已提交 (~%s)\n仓位正在关闭中。", midStr),
-			kb,
-		)
 
 	case "refresh":
 		snap, err := t.info.FetchLiveSnapshot(ctx)
