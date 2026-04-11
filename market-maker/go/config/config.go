@@ -30,7 +30,7 @@ var networkProfiles = map[string]NetworkProfile{
 	"mainnet": {
 		RestAPIBase:      "https://api.mainnet.aptoslabs.com/decibel/api/v1",
 		AptosFullnodeURL: "https://api.mainnet.aptoslabs.com/v1",
-		PackageAddress:   "0x2a4e9bee4b09f5b8e9c996a489c6993abe1e9e45e61e81bb493e38e53a3e7e3d",
+		PackageAddress:   "0x50ead22afd6ffd9769e3b3d6e0e64a2a350d68e8b102c4e72e33d0b8cfdfdb06",
 	},
 }
 
@@ -71,6 +71,18 @@ type Config struct {
 	AptosFullnodeURL   string
 	MarketAddrOverride string // skips API discovery
 	RestAPIBase        string
+
+	// ── Telegram ─────────────────────────────────────────────────────────────
+	TGBotToken               string // TG_BOT_TOKEN or -tg-token
+	TGAdminID                int64  // TG_ADMIN_ID or -tg-admin-id
+	TGAlertInventory         bool   // TG_ALERT_INVENTORY or -tg-alert-inventory
+	TGAlertInventoryInterval int    // TG_ALERT_INVENTORY_INTERVAL_MIN or -tg-alert-interval
+	TGStrictStart            bool   // TG_STRICT_START or -tg-strict-start
+}
+
+// TelegramEnabled reports whether the Telegram bot should be started.
+func (c *Config) TelegramEnabled() bool {
+	return c.TGBotToken != "" && c.TGAdminID != 0
 }
 
 // Load reads env vars, applies network defaults, parses CLI flags (overrides), then validates.
@@ -117,6 +129,12 @@ func Load() (*Config, error) {
 		RestAPIBase:      envStr("REST_API_BASE", profile.RestAPIBase),
 		AptosFullnodeURL: envStr("APTOS_FULLNODE_URL", profile.AptosFullnodeURL),
 		PackageAddress:   envStr("PACKAGE_ADDRESS", profile.PackageAddress),
+
+		TGBotToken:               os.Getenv("TG_BOT_TOKEN"),
+		TGAdminID:                envInt64("TG_ADMIN_ID", 0),
+		TGAlertInventory:         envBool("TG_ALERT_INVENTORY", false),
+		TGAlertInventoryInterval: int(envFloat("TG_ALERT_INVENTORY_INTERVAL_MIN", 30)),
+		TGStrictStart:            envBool("TG_STRICT_START", false),
 	}
 
 	flag.StringVar(&cfg.Network, "network", cfg.Network,
@@ -147,6 +165,24 @@ func Load() (*Config, error) {
 	flag.StringVar(&cfg.PrivateKey, "private-key", cfg.PrivateKey, "Ed25519 private key hex or AIP-80 (overrides PRIVATE_KEY); visible in process list")
 	flag.StringVar(&cfg.NodeAPIKey, "node-api-key", cfg.NodeAPIKey, "Fullnode API key (overrides NODE_API_KEY; falls back to bearer token)")
 
+	// Telegram
+	flag.StringVar(&cfg.TGBotToken, "tg-token", cfg.TGBotToken,
+		"Telegram bot token (overrides TG_BOT_TOKEN); visible in process list")
+	flag.Int64Var(&cfg.TGAdminID, "tg-admin-id", cfg.TGAdminID,
+		"Telegram admin user ID (overrides TG_ADMIN_ID); visible in process list")
+	flag.BoolVar(&cfg.TGAlertInventory, "tg-alert-inventory", cfg.TGAlertInventory,
+		"Enable Telegram alert when position exceeds max-inventory (overrides TG_ALERT_INVENTORY)")
+	flag.IntVar(&cfg.TGAlertInventoryInterval, "tg-alert-interval", cfg.TGAlertInventoryInterval,
+		"Minutes between repeated inventory-limit Telegram alerts (overrides TG_ALERT_INVENTORY_INTERVAL_MIN)")
+	flag.BoolVar(&cfg.TGStrictStart, "tg-strict-start", cfg.TGStrictStart,
+		"When Telegram is enabled, exit if bot init/ready/setCommands fails (overrides TG_STRICT_START)")
+
+	// Go's flag package does not treat "-boolflag false" as a single flag: the
+	// word "false" becomes the first non-flag token and parsing stops, so flags
+	// after it are silently ignored. Rewrite to "-boolflag=false" for known
+	// boolean flags (same for "true", "0", "1", etc.).
+	os.Args = normalizeBoolCLIArgs(os.Args)
+
 	flag.Parse()
 
 	flagsSet := make(map[string]struct{})
@@ -176,6 +212,11 @@ func Load() (*Config, error) {
 }
 
 func (c *Config) validate() error {
+	// Clamp TGAlertInventoryInterval to avoid time.NewTicker(0) panic.
+	if c.TGAlertInventoryInterval <= 0 {
+		c.TGAlertInventoryInterval = 30
+	}
+
 	var missing []string
 	if c.BearerToken == "" {
 		missing = append(missing, "BEARER_TOKEN (-bearer-token)")
@@ -242,6 +283,90 @@ func NormalizeMarket(name string) string {
 	return strings.ToUpper(strings.ReplaceAll(name, "/", "-"))
 }
 
+// boolCLIFlagNames are flags registered with flag.BoolVar in Load. Only these
+// get "-name value" merged into "-name=value" before Parse (see normalizeBoolCLIArgs).
+// When adding a new BoolVar in Load, add the name here and document it in README.md (Boolean flags).
+var boolCLIFlagNames = map[string]struct{}{
+	"auto-flatten":       {},
+	"dry-run":            {},
+	"auto-spread":        {},
+	"tg-alert-inventory": {},
+	"tg-strict-start":    {},
+}
+
+// normalizeBoolCLIArgs returns a copy of args with "-boolflag literal" rewritten
+// to "-boolflag=literal" when literal is a boolean token and boolflag is known.
+// After "--", args are left unchanged.
+func normalizeBoolCLIArgs(args []string) []string {
+	if len(args) <= 1 {
+		return args
+	}
+	out := make([]string, 0, len(args))
+	out = append(out, args[0])
+	pastTerminator := false
+	for i := 1; i < len(args); i++ {
+		a := args[i]
+		if pastTerminator {
+			out = append(out, a)
+			continue
+		}
+		if a == "--" {
+			pastTerminator = true
+			out = append(out, a)
+			continue
+		}
+		name, ok := leadingFlagName(a)
+		if !ok || strings.Contains(a, "=") {
+			out = append(out, a)
+			continue
+		}
+		if _, isBool := boolCLIFlagNames[name]; !isBool {
+			out = append(out, a)
+			continue
+		}
+		if i+1 < len(args) {
+			next := args[i+1]
+			if isBoolToken(next) && !strings.HasPrefix(next, "-") {
+				out = append(out, a+"="+next)
+				i++
+				continue
+			}
+		}
+		out = append(out, a)
+	}
+	return out
+}
+
+// leadingFlagName returns the flag name for "-name" or "--name" without "=value".
+func leadingFlagName(arg string) (name string, ok bool) {
+	if arg == "" || arg == "-" {
+		return "", false
+	}
+	if arg[0] != '-' {
+		return "", false
+	}
+	s := strings.TrimLeft(arg, "-")
+	if s == "" {
+		return "", false
+	}
+	if i := strings.IndexByte(s, '='); i >= 0 {
+		s = s[:i]
+	}
+	if s == "" {
+		return "", false
+	}
+	return s, true
+}
+
+func isBoolToken(s string) bool {
+	switch strings.ToLower(strings.TrimSpace(s)) {
+	case "true", "false", "t", "f", "0", "1", "yes", "no":
+		return true
+	default:
+		return false
+	}
+}
+
 // ── Env helpers ──────────────────────────────────────────────────────────────
 
 func isExplicitEnv(key string) bool {
@@ -268,6 +393,15 @@ func envBool(key string, def bool) bool {
 	if v := os.Getenv(key); v != "" {
 		if b, err := strconv.ParseBool(v); err == nil {
 			return b
+		}
+	}
+	return def
+}
+
+func envInt64(key string, def int64) int64 {
+	if v := os.Getenv(key); v != "" {
+		if i, err := strconv.ParseInt(v, 10, 64); err == nil {
+			return i
 		}
 	}
 	return def

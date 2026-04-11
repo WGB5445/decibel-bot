@@ -68,11 +68,12 @@ type MarketConfig struct {
 
 // StateSnapshot captures everything the bot needs for one cycle decision.
 type StateSnapshot struct {
-	MarginUsage float64
-	Equity      float64
-	Inventory   float64 // net position for the target market
-	OpenOrders  []OpenOrder
-	Mid         *float64 // nil = price unavailable
+	MarginUsage  float64
+	Equity       float64
+	Inventory    float64 // net position for the target market
+	OpenOrders   []OpenOrder
+	Mid          *float64   // nil = price unavailable
+	AllPositions []Position // all positions across all markets (unfiltered)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -240,11 +241,12 @@ func (c *Client) FetchState(ctx context.Context, subaccount, marketAddr string) 
 	}
 
 	return &StateSnapshot{
-		MarginUsage: overview.CrossMarginRatio,
-		Equity:      overview.PerpEquityBalance,
-		Inventory:   inventory,
-		OpenOrders:  myOrders,
-		Mid:         price.Mid(),
+		MarginUsage:  overview.CrossMarginRatio,
+		Equity:       overview.PerpEquityBalance,
+		Inventory:    inventory,
+		OpenOrders:   myOrders,
+		Mid:          price.Mid(),
+		AllPositions: positions,
 	}, nil
 }
 
@@ -255,10 +257,11 @@ func (c *Client) FetchState(ctx context.Context, subaccount, marketAddr string) 
 // AddrEqual compares two Aptos addresses case-insensitively,
 // ignoring leading zeros and the "0x" prefix.
 func AddrEqual(a, b string) bool {
-	return normalizeAddr(a) == normalizeAddr(b)
+	return NormalizeAddr(a) == NormalizeAddr(b)
 }
 
-func normalizeAddr(addr string) string {
+// NormalizeAddr strips the "0x" prefix, lowercases, and removes leading zeros.
+func NormalizeAddr(addr string) string {
 	s := strings.TrimPrefix(strings.ToLower(addr), "0x")
 	s = strings.TrimLeft(s, "0")
 	if s == "" {

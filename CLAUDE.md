@@ -46,7 +46,7 @@ go build -o decibel-mm .                        # build binary
 go test ./...                                   # run all tests
 ```
 
-**Flags:** Go `flag` package uses single dashes (`-dry-run`, `-spread`); `-flag=value` is also valid.
+**Flags:** Go `flag` package uses single dashes (`-dry-run`, `-spread`); `-flag=value` is also valid. For **boolean** flags, prefer `-name=true` / `-name=false` in scripts; `config.Load` also normalizes `-name false` for the known bool flags (see `market-maker/go/README.md`, section **Boolean flags**).
 
 ---
 
@@ -179,7 +179,7 @@ go run . -dry-run    # validate config before going live
 - Pricing logic is unit-tested in isolation — no network, no state (`go test ./...`)
 - Typical test parameters: `mid=100_000`, `spread=0.001`, `tick=1.0`, `lot=0.00001`
 - Aptos named-object derivation is tested in `aptos/address_test.go`
-- No integration tests — use `--dry-run` against a live network for end-to-end validation
+- No integration tests — use `-dry-run` against a live network for end-to-end validation
 
 ---
 
