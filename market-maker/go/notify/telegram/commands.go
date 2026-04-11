@@ -17,6 +17,8 @@ func (t *TelegramNotifier) handleCommand(ctx context.Context, msg *tgbotapi.Mess
 		t.sendGas(ctx, msg.Chat.ID)
 	case "positions":
 		t.sendPositions(ctx, msg.Chat.ID)
+	case "trades":
+		t.sendRecentTrades(ctx, msg.Chat.ID)
 	case "help":
 		t.sendHelp(msg.Chat.ID)
 	default:
@@ -56,9 +58,23 @@ func (t *TelegramNotifier) sendPositions(ctx context.Context, chatID int64) {
 		t.send(tgbotapi.NewMessage(chatID, fmt.Sprintf("查询失败，请稍后重试: %v", err)))
 		return
 	}
-	m := tgbotapi.NewMessage(chatID, formatPositions(snap))
+	m := tgbotapi.NewMessage(chatID, formatPositions(snap, 0, t.info.MarketDisplayName))
 	m.ParseMode = tgbotapi.ModeMarkdown
-	m.ReplyMarkup = positionsKeyboard(snap)
+	m.ReplyMarkup = t.positionsReplyMarkup(snap, 0)
+	t.send(m)
+}
+
+// sendRecentTrades sends paged trade_history for the target market (fetch cap in format.TradesHistoryFetchLimit).
+func (t *TelegramNotifier) sendRecentTrades(ctx context.Context, chatID int64) {
+	items, err := t.info.FetchRecentTrades(ctx, TradesHistoryFetchLimit)
+	if err != nil {
+		slog.Warn("tgbot: fetch recent trades failed", "err", err)
+		t.send(tgbotapi.NewMessage(chatID, fmt.Sprintf("查询失败，请稍后重试: %v", err)))
+		return
+	}
+	m := tgbotapi.NewMessage(chatID, formatRecentTrades(items, 0, t.info.MarketDisplayName))
+	m.ParseMode = tgbotapi.ModeMarkdown
+	m.ReplyMarkup = tradesReplyMarkup(0, len(items))
 	t.send(m)
 }
 

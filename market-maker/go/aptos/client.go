@@ -9,6 +9,7 @@ import (
 	"time"
 
 	aptossdk "github.com/aptos-labs/aptos-go-sdk"
+	aptapi "github.com/aptos-labs/aptos-go-sdk/api"
 	"github.com/aptos-labs/aptos-go-sdk/crypto"
 )
 
@@ -19,6 +20,9 @@ type TxResult struct {
 	Hash     string
 	Success  bool
 	VMStatus string
+	// Events is populated when the committed transaction is a user transaction
+	// (same order as the Aptos API). Callers may scan for order_id etc.
+	Events []*aptapi.Event
 }
 
 // CancelSucceeded returns true when the transaction should be counted as a
@@ -181,7 +185,12 @@ func (n *NodeClient) SubmitEntryFunction(
 	if vm == "" {
 		vm = "unknown"
 	}
-	return &TxResult{Hash: string(submitRes.Hash), Success: tx.Success, VMStatus: vm}, nil
+	return &TxResult{
+		Hash:     string(submitRes.Hash),
+		Success:  tx.Success,
+		VMStatus: vm,
+		Events:   tx.Events,
+	}, nil
 }
 
 func normalizeEntryArgs(args []any) []any {

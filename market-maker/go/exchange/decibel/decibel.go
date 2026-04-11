@@ -128,9 +128,9 @@ func (d *DecibelExchange) FetchOpenOrders(ctx context.Context) ([]exchange.OpenO
 }
 
 // PlaceOrder places a limit order on Decibel via Aptos entry function.
-func (d *DecibelExchange) PlaceOrder(ctx context.Context, req exchange.PlaceOrderRequest) error {
+func (d *DecibelExchange) PlaceOrder(ctx context.Context, req exchange.PlaceOrderRequest) (exchange.PlaceOrderOutcome, error) {
 	if d.market == nil {
-		return fmt.Errorf("market not set: call SetMarket first")
+		return exchange.PlaceOrderOutcome{}, fmt.Errorf("market not set: call SetMarket first")
 	}
 	side := "ASK"
 	if req.IsBuy {
@@ -149,7 +149,7 @@ func (d *DecibelExchange) PlaceOrder(ctx context.Context, req exchange.PlaceOrde
 		"dry_run", d.dryRun,
 	)
 	if d.dryRun {
-		return nil
+		return exchange.PlaceOrderOutcome{}, nil
 	}
 
 	fn := d.cfg.PackageAddress + "::dex_accounts_entry::place_order_to_subaccount"
@@ -164,13 +164,23 @@ func (d *DecibelExchange) PlaceOrder(ctx context.Context, req exchange.PlaceOrde
 		),
 	)
 	if err != nil {
-		return err
+		return exchange.PlaceOrderOutcome{}, err
 	}
 	if !result.Success {
-		return fmt.Errorf("place order failed: side=%s vm_status=%s", side, result.VMStatus)
+		return exchange.PlaceOrderOutcome{}, fmt.Errorf("place order failed: side=%s vm_status=%s", side, result.VMStatus)
 	}
-	slog.Info("order placed", "side", side, "price", req.Price, "size", req.Size, "tx_hash", result.Hash)
-	return nil
+	oid := aptos.OrderIDFromEvents(result.Events)
+	if oid != "" {
+		slog.Info("order placed", "side", side, "price", req.Price, "size", req.Size, "tx_hash", result.Hash, "order_id", oid)
+	} else {
+		slog.Info("order placed", "side", side, "price", req.Price, "size", req.Size, "tx_hash", result.Hash)
+	}
+	return exchange.PlaceOrderOutcome{TxHash: result.Hash, OrderID: oid}, nil
+}
+
+// FetchTradeHistory implements exchange.Exchange.
+func (d *DecibelExchange) FetchTradeHistory(ctx context.Context, p api.TradeHistoryParams) ([]api.TradeHistoryItem, error) {
+	return d.apiClient.FetchTradeHistory(ctx, p)
 }
 
 // PlaceBulkOrders atomically replaces all bulk quotes for the target market.
@@ -339,13 +349,17 @@ func scaleSize(size float64, szDecimals int) uint64 {
 // apiMarketToExchange converts an api.MarketConfig to exchange.MarketConfig.
 func apiMarketToExchange(m *api.MarketConfig) *exchange.MarketConfig {
 	return &exchange.MarketConfig{
-		MarketID:   m.MarketAddr,
-		MarketName: m.MarketName,
-		TickSize:   m.TickSize,
-		LotSize:    m.LotSize,
-		MinSize:    m.MinSize,
-		PxDecimals: m.PxDecimals,
-		SzDecimals: m.SzDecimals,
+		MarketID:                m.MarketAddr,
+		MarketName:              m.MarketName,
+		TickSize:                m.TickSize,
+		LotSize:                 m.LotSize,
+		MinSize:                 m.MinSize,
+		PxDecimals:              m.PxDecimals,
+		SzDecimals:              m.SzDecimals,
+		MaxLeverage:             m.MaxLeverage,
+		Mode:                    m.Mode,
+		MaxOpenInterest:         m.MaxOpenInterest,
+		UnrealizedPnlHaircutBps: m.UnrealizedPnlHaircutBps,
 	}
 }
 
@@ -354,8 +368,15 @@ func apiStateToExchange(s *api.StateSnapshot) *exchange.StateSnapshot {
 	positions := make([]exchange.Position, len(s.AllPositions))
 	for i, p := range s.AllPositions {
 		positions[i] = exchange.Position{
-			MarketID: p.MarketAddr,
-			Size:     p.Size,
+			MarketID:                  p.Market,
+			Size:                      p.Size,
+			EntryPrice:                p.EntryPrice,
+			UserLeverage:              p.UserLeverage,
+			UnrealizedFunding:         p.UnrealizedFunding,
+			EstimatedLiquidationPrice: p.EstimatedLiquidationPrice,
+			IsIsolated:                p.IsIsolated,
+			TransactionVersion:        p.TransactionVersion,
+			IsDeleted:                 p.IsDeleted,
 		}
 	}
 	orders := make([]exchange.OpenOrder, len(s.OpenOrders))

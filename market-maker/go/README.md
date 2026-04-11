@@ -54,7 +54,7 @@ export TG_ALERT_INVENTORY_INTERVAL_MIN=30  # optional: minutes between alerts
 Commands (sent by `/...` to the bot in Telegram):
 - `/balance` — Account equity, available balance, margin usage
 - `/gas` — Wallet APT balance
-- `/positions` — All open positions with P&L (for target market)
+- `/positions` — Non-zero positions across markets (paged in one message; refresh resets to page 1); chain actions still use market addresses
 - `/help` — Command list
 
 Alerts: When `abs(inventory) ≥ MAX_INVENTORY`, the bot sends an alert with buttons to refresh or close the position. Auto-refresh period is configurable.

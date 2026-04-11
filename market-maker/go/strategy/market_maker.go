@@ -55,23 +55,23 @@ func (m *MarketMaker) State() *botstate.BotState { return m.state }
 // FlattenPosition places a reduce-only order to close the current position.
 // Uses a live exchange snapshot (not BotState) so repeated calls are idempotent
 // once the chain reflects the closed position. Serialized with flattenMu.
-func (m *MarketMaker) FlattenPosition(ctx context.Context) error {
+func (m *MarketMaker) FlattenPosition(ctx context.Context) (exchange.PlaceOrderOutcome, error) {
 	m.flattenMu.Lock()
 	defer m.flattenMu.Unlock()
 
 	state, err := m.ex.FetchState(ctx)
 	if err != nil {
-		return fmt.Errorf("fetch state for flatten: %w", err)
+		return exchange.PlaceOrderOutcome{}, fmt.Errorf("fetch state for flatten: %w", err)
 	}
 	if state.Mid == nil {
-		return fmt.Errorf("cannot flatten position: mid price unavailable")
+		return exchange.PlaceOrderOutcome{}, fmt.Errorf("cannot flatten position: mid price unavailable")
 	}
 
 	inv := state.Inventory
 	absInv := math.Abs(inv)
 	size := math.Round(absInv/m.market.LotSize) * m.market.LotSize
 	if size <= 0 || size < m.market.MinSize {
-		return ErrNoPositionToFlatten
+		return exchange.PlaceOrderOutcome{}, ErrNoPositionToFlatten
 	}
 
 	return m.placeFlattenOrder(ctx, inv, *state.Mid)
@@ -212,7 +212,7 @@ func (m *MarketMaker) runCycle(ctx context.Context) error {
 			return fmt.Errorf("cancel bulk orders: %w", err)
 		}
 		if m.cfg.AutoFlatten {
-			if err := m.placeFlattenOrder(ctx, state.Inventory, mid); err != nil {
+			if _, err := m.placeFlattenOrder(ctx, state.Inventory, mid); err != nil {
 				return fmt.Errorf("flatten order: %w", err)
 			}
 		} else {
@@ -253,7 +253,7 @@ func (m *MarketMaker) cancelAllOrders(ctx context.Context, orders []exchange.Ope
 	return nOK, nFail, nil
 }
 
-func (m *MarketMaker) placeFlattenOrder(ctx context.Context, inventory, mid float64) error {
+func (m *MarketMaker) placeFlattenOrder(ctx context.Context, inventory, mid float64) (exchange.PlaceOrderOutcome, error) {
 	isBuy := inventory < 0
 	absInv := math.Abs(inventory)
 
@@ -270,7 +270,7 @@ func (m *MarketMaker) placeFlattenOrder(ctx context.Context, inventory, mid floa
 	if size <= 0 || size < m.market.MinSize {
 		slog.Warn("flatten size too small, skipping",
 			"size", size, "min_size", m.market.MinSize)
-		return ErrNoPositionToFlatten
+		return exchange.PlaceOrderOutcome{}, ErrNoPositionToFlatten
 	}
 
 	return m.ex.PlaceOrder(ctx, exchange.PlaceOrderRequest{
@@ -289,8 +289,15 @@ func exchangePositionsToBotstate(positions []exchange.Position) []botstate.Posit
 	result := make([]botstate.Position, len(positions))
 	for i, p := range positions {
 		result[i] = botstate.Position{
-			MarketID: p.MarketID,
-			Size:     p.Size,
+			MarketID:                  p.MarketID,
+			Size:                      p.Size,
+			EntryPrice:                p.EntryPrice,
+			UserLeverage:              p.UserLeverage,
+			UnrealizedFunding:         p.UnrealizedFunding,
+			EstimatedLiquidationPrice: p.EstimatedLiquidationPrice,
+			IsIsolated:                p.IsIsolated,
+			TransactionVersion:        p.TransactionVersion,
+			IsDeleted:                 p.IsDeleted,
 		}
 	}
 	return result

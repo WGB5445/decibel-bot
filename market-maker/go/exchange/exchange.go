@@ -2,7 +2,11 @@
 // market-making strategy from any specific exchange implementation.
 package exchange
 
-import "context"
+import (
+	"context"
+
+	"decibel-mm-bot/api"
+)
 
 // Exchange abstracts all exchange interactions needed by the market-maker strategy.
 // Each exchange (Decibel, Binance, dYdX, ...) provides its own implementation.
@@ -18,7 +22,11 @@ type Exchange interface {
 	FetchOpenOrders(ctx context.Context) ([]OpenOrder, error)
 
 	// PlaceOrder places an order on the exchange.
-	PlaceOrder(ctx context.Context, req PlaceOrderRequest) error
+	// On VM success returns PlaceOrderOutcome (TxHash; OrderID when parsed from events).
+	PlaceOrder(ctx context.Context, req PlaceOrderRequest) (PlaceOrderOutcome, error)
+
+	// FetchTradeHistory queries Decibel REST GET /trade_history.
+	FetchTradeHistory(ctx context.Context, p api.TradeHistoryParams) ([]api.TradeHistoryItem, error)
 
 	// PlaceBulkOrders atomically replaces all bulk quotes for the target market.
 	// bids and asks are price levels (POST_ONLY). An empty slice clears that side.

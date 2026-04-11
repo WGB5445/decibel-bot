@@ -2,14 +2,20 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
+	"math"
 	"os"
 	"os/signal"
+	"strings"
+	"sync"
 	"syscall"
 	"time"
 
 	"github.com/joho/godotenv"
+	"golang.org/x/sync/errgroup"
 
+	"decibel-mm-bot/api"
 	"decibel-mm-bot/aptos"
 	"decibel-mm-bot/botstate"
 	"decibel-mm-bot/config"
@@ -78,6 +84,15 @@ func main() {
 	)
 	slog.Info("using subaccount", "address", cfg.SubaccountAddress)
 
+	// Market catalog for Telegram display names (addr -> market_name from /markets).
+	nameLookup := map[string]string(nil)
+	apiCatalog := api.NewClient(cfg.RestAPIBase, cfg.BearerToken)
+	if mkts, err := apiCatalog.FetchMarkets(ctx); err != nil {
+		slog.Warn("fetch markets for display name catalog failed", "err", err)
+	} else {
+		nameLookup = buildMarketNameLookup(mkts)
+	}
+
 	// ── 2. Strategy layer ────────────────────────────────────────────────────
 	mm := strategy.New(cfg, ex, market)
 
@@ -89,7 +104,7 @@ func main() {
 			AlertInventory:         cfg.TGAlertInventory,
 			AlertInventoryInterval: cfg.TGAlertInventoryInterval,
 		}
-		info := &infoAdapter{mm: mm, ex: ex, cfg: cfg}
+		info := &infoAdapter{mm: mm, ex: ex, cfg: cfg, apiClient: apiCatalog, marketNames: nameLookup}
 		tg, err := telegram.New(tgCfg, info)
 		if err != nil {
 			if cfg.TGStrictStart {
@@ -129,12 +144,26 @@ func main() {
 	}
 }
 
+func buildMarketNameLookup(markets []api.MarketConfig) map[string]string {
+	m := make(map[string]string, len(markets))
+	for _, mk := range markets {
+		k := api.NormalizeAddr(mk.MarketAddr)
+		if k == "" || mk.MarketName == "" {
+			continue
+		}
+		m[k] = mk.MarketName
+	}
+	return m
+}
+
 // infoAdapter bridges the strategy and exchange layers to implement
 // notify.InfoProvider for the notification layer.
 type infoAdapter struct {
-	mm  *strategy.MarketMaker
-	ex  exchange.Exchange
-	cfg *config.Config
+	mm          *strategy.MarketMaker
+	ex          exchange.Exchange
+	cfg         *config.Config
+	apiClient   *api.Client
+	marketNames map[string]string // api.NormalizeAddr -> market_name
 }
 
 var _ notify.InfoProvider = (*infoAdapter)(nil)
@@ -152,7 +181,17 @@ func (a *infoAdapter) FetchLiveSnapshot(ctx context.Context) (botstate.Snapshot,
 
 	positions := make([]botstate.Position, len(state.AllPositions))
 	for i, p := range state.AllPositions {
-		positions[i] = botstate.Position{MarketID: p.MarketID, Size: p.Size}
+		positions[i] = botstate.Position{
+			MarketID:                  p.MarketID,
+			Size:                      p.Size,
+			EntryPrice:                p.EntryPrice,
+			UserLeverage:              p.UserLeverage,
+			UnrealizedFunding:         p.UnrealizedFunding,
+			EstimatedLiquidationPrice: p.EstimatedLiquidationPrice,
+			IsIsolated:                p.IsIsolated,
+			TransactionVersion:        p.TransactionVersion,
+			IsDeleted:                 p.IsDeleted,
+		}
 	}
 
 	var midCopy *float64
@@ -160,12 +199,14 @@ func (a *infoAdapter) FetchLiveSnapshot(ctx context.Context) (botstate.Snapshot,
 		v := *state.Mid
 		midCopy = &v
 	}
+	midByMarket := a.fetchPositionMids(ctx, positions, base.TargetMarketID, midCopy)
 
 	return botstate.Snapshot{
 		Equity:           state.Equity,
 		MarginUsage:      state.MarginUsage,
 		Inventory:        state.Inventory,
 		Mid:              midCopy,
+		MidByMarket:      midByMarket,
 		AllPositions:     positions,
 		EntryPrice:       base.EntryPrice,
 		TargetMarketName: base.TargetMarketName,
@@ -174,8 +215,114 @@ func (a *infoAdapter) FetchLiveSnapshot(ctx context.Context) (botstate.Snapshot,
 	}, nil
 }
 
-func (a *infoAdapter) FlattenPosition(ctx context.Context) error {
+const maxLiveSnapshotPriceFetches = 8
+
+func (a *infoAdapter) fetchPositionMids(
+	ctx context.Context,
+	positions []botstate.Position,
+	targetMarketID string,
+	targetMid *float64,
+) map[string]float64 {
+	mids := make(map[string]float64)
+	targetKey := api.NormalizeAddr(targetMarketID)
+	if targetKey != "" && targetMid != nil {
+		mids[targetKey] = *targetMid
+	}
+	if a.apiClient == nil {
+		return mids
+	}
+
+	var markets []string
+	seen := make(map[string]struct{})
+	if targetKey != "" {
+		seen[targetKey] = struct{}{}
+	}
+	for _, p := range positions {
+		if p.IsDeleted || math.Abs(p.Size) < 1e-9 {
+			continue
+		}
+		key := api.NormalizeAddr(p.MarketID)
+		if key == "" {
+			continue
+		}
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		markets = append(markets, p.MarketID)
+	}
+	if len(markets) == 0 {
+		return mids
+	}
+
+	var mu sync.Mutex
+	g, gctx := errgroup.WithContext(ctx)
+	g.SetLimit(maxLiveSnapshotPriceFetches)
+	for _, marketID := range markets {
+		marketID := marketID
+		g.Go(func() error {
+			price, err := a.apiClient.FetchPrice(gctx, marketID)
+			if err != nil {
+				if gctx.Err() == nil {
+					slog.Warn("fetch live mid for display failed", "market", marketID, "err", err)
+				}
+				return nil
+			}
+			mid := price.Mid()
+			if mid == nil {
+				return nil
+			}
+			mu.Lock()
+			mids[api.NormalizeAddr(marketID)] = *mid
+			mu.Unlock()
+			return nil
+		})
+	}
+	_ = g.Wait()
+	return mids
+}
+
+func (a *infoAdapter) FlattenPosition(ctx context.Context) (exchange.PlaceOrderOutcome, error) {
 	return a.mm.FlattenPosition(ctx)
+}
+
+func (a *infoAdapter) DryRun() bool {
+	return a.ex.DryRun()
+}
+
+func (a *infoAdapter) FetchTradeHistoryByOrder(ctx context.Context, marketAddr, orderID string) ([]api.TradeHistoryItem, error) {
+	return a.ex.FetchTradeHistory(ctx, api.TradeHistoryParams{
+		Account: a.cfg.SubaccountAddress,
+		Market:  marketAddr,
+		OrderID: orderID,
+		Limit:   100,
+	})
+}
+
+func (a *infoAdapter) FetchRecentTrades(ctx context.Context, limit int) ([]api.TradeHistoryItem, error) {
+	market := a.mm.State().Get().TargetMarketID
+	if market == "" {
+		return nil, fmt.Errorf("target market not set")
+	}
+	if limit <= 0 {
+		limit = 10
+	}
+	if limit > 200 {
+		limit = 200
+	}
+	p := api.TradeHistoryParams{
+		Account: a.cfg.SubaccountAddress,
+		Market:  market,
+		Limit:   limit,
+		SortKey: "timestamp",
+		SortDir: "DESC",
+	}
+	items, err := a.ex.FetchTradeHistory(ctx, p)
+	if err != nil {
+		p.SortKey, p.SortDir = "", ""
+		items, err = a.ex.FetchTradeHistory(ctx, p)
+	}
+	return items, err
 }
 
 func (a *infoAdapter) GasBalance(ctx context.Context) (float64, string, error) {
@@ -188,4 +335,17 @@ func (a *infoAdapter) WalletAddress() string {
 
 func (a *infoAdapter) MaxInventory() float64 {
 	return a.cfg.MaxInventory
+}
+
+func (a *infoAdapter) MarketDisplayName(addr string) string {
+	if strings.TrimSpace(addr) == "" {
+		return ""
+	}
+	key := api.NormalizeAddr(addr)
+	if a.marketNames != nil {
+		if n, ok := a.marketNames[key]; ok && n != "" {
+			return n
+		}
+	}
+	return notify.ShortAddrForDisplay(addr)
 }

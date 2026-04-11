@@ -4,8 +4,11 @@ package notify
 
 import (
 	"context"
+	"strings"
 
+	"decibel-mm-bot/api"
 	"decibel-mm-bot/botstate"
+	"decibel-mm-bot/exchange"
 )
 
 // Notifier is a notification service that runs alongside the strategy.
@@ -27,7 +30,18 @@ type InfoProvider interface {
 	FetchLiveSnapshot(ctx context.Context) (botstate.Snapshot, error)
 
 	// FlattenPosition places a reduce-only order to close the current position.
-	FlattenPosition(ctx context.Context) error
+	// On VM success, PlaceOrderOutcome includes TxHash and OrderID when parsed from events.
+	FlattenPosition(ctx context.Context) (exchange.PlaceOrderOutcome, error)
+
+	// DryRun mirrors exchange dry-run mode (no chain transactions).
+	DryRun() bool
+
+	// FetchTradeHistoryByOrder queries GET /trade_history with account + market + order_id.
+	FetchTradeHistoryByOrder(ctx context.Context, marketAddr, orderID string) ([]api.TradeHistoryItem, error)
+
+	// FetchRecentTrades returns the latest fills for the configured target market (newest first).
+	// The Telegram bot may request a larger limit (e.g. 100) to paginate fills client-side.
+	FetchRecentTrades(ctx context.Context, limit int) ([]api.TradeHistoryItem, error)
 
 	// GasBalance returns the gas token balance: amount, unit symbol, error.
 	GasBalance(ctx context.Context) (float64, string, error)
@@ -37,4 +51,21 @@ type InfoProvider interface {
 
 	// MaxInventory returns the configured inventory limit.
 	MaxInventory() float64
+
+	// MarketDisplayName resolves a market address to a human-readable name from
+	// the cached /markets catalog; falls back to a shortened address when unknown.
+	MarketDisplayName(marketAddr string) string
+}
+
+// ShortAddrForDisplay is a fallback label when MarketDisplayName has no mapping.
+func ShortAddrForDisplay(addr string) string {
+	s := strings.TrimSpace(addr)
+	if s == "" {
+		return ""
+	}
+	lower := strings.ToLower(strings.TrimPrefix(s, "0x"))
+	if len(lower) <= 12 {
+		return "0x" + lower
+	}
+	return "0x" + lower[:6] + "…" + lower[len(lower)-4:]
 }
