@@ -11,8 +11,6 @@ skew_per_unit: 0.0001
 max_margin_usage: 0.5
 refresh_interval: 20
 refresh_interval_jitter: 0 # seconds; uniform in [refresh_interval−jitter, refresh_interval+jitter]; 0 = off
-cooldown_s: 1.5
-cancel_resync_s: 8
 auto_flatten: false
 flatten_aggression: 0.001
 dry_run: true
