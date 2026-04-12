@@ -21,6 +21,10 @@ import (
 // large enough to place a reduce-only flatten order (idempotent no-op).
 var ErrNoPositionToFlatten = errors.New("no position to flatten")
 
+// marginStuckThreshold is the number of consecutive cycles spent above
+// MaxMarginUsage before a CRITICAL alert is logged.
+const marginStuckThreshold = 100
+
 // MarketMaker runs the inventory-skew market-making strategy.
 type MarketMaker struct {
 	cfg    *config.Config
@@ -40,6 +44,15 @@ type MarketMaker struct {
 	// CancelBulkOrders we skip further on-chain cancels until inventory recovers,
 	// so we do not burn gas re-submitting noop cancels every cycle.
 	invLimitBulkCancelDone bool
+
+	// Circuit breaker for PlaceBulkOrders: track consecutive failures and apply
+	// exponential backoff (extra sleep within runCycle) to prevent thrashing.
+	bulkOrderFailures     int
+	bulkOrderBackoffUntil time.Time
+
+	// Margin recovery tracking: count cycles spent above MaxMarginUsage.
+	// After marginStuckThreshold cycles we log a CRITICAL alert.
+	marginHighCycles int
 }
 
 // New creates a MarketMaker with the given exchange and market config.
@@ -188,12 +201,23 @@ func (m *MarketMaker) runCycle(ctx context.Context) error {
 
 	// ── 3. Risk guard: margin ─────────────────────────────────────────────────
 	if state.MarginUsage > m.cfg.MaxMarginUsage {
-		slog.Warn("PAUSED: margin usage too high",
-			"margin_usage", state.MarginUsage,
-			"threshold", m.cfg.MaxMarginUsage,
-		)
+		m.marginHighCycles++
+		if m.marginHighCycles >= marginStuckThreshold {
+			slog.Error("CRITICAL: margin has been too high for many cycles — manual intervention may be required",
+				"margin_usage", state.MarginUsage,
+				"threshold", m.cfg.MaxMarginUsage,
+				"cycles_paused", m.marginHighCycles,
+			)
+		} else {
+			slog.Warn("PAUSED: margin usage too high",
+				"margin_usage", state.MarginUsage,
+				"threshold", m.cfg.MaxMarginUsage,
+				"cycles_paused", m.marginHighCycles,
+			)
+		}
 		return nil
 	}
+	m.marginHighCycles = 0
 
 	// ── 3b. Risk guard: no price ──────────────────────────────────────────────
 	if state.Mid == nil {
@@ -233,7 +257,7 @@ func (m *MarketMaker) runCycle(ctx context.Context) error {
 					"inventory", state.Inventory, "max", m.cfg.MaxInventory)
 			}
 			if m.cfg.AutoFlatten {
-				if _, err := m.placeFlattenOrder(ctx, state.Inventory, mid); err != nil {
+				if _, err := m.placeFlattenOrder(ctx, state.Inventory, mid); err != nil && !errors.Is(err, ErrNoPositionToFlatten) {
 					return fmt.Errorf("flatten order: %w", err)
 				}
 			} else {
@@ -248,7 +272,7 @@ func (m *MarketMaker) runCycle(ctx context.Context) error {
 			return fmt.Errorf("cancel bulk orders: %w", err)
 		}
 		if m.cfg.AutoFlatten {
-			if _, err := m.placeFlattenOrder(ctx, state.Inventory, mid); err != nil {
+			if _, err := m.placeFlattenOrder(ctx, state.Inventory, mid); err != nil && !errors.Is(err, ErrNoPositionToFlatten) {
 				return fmt.Errorf("flatten order: %w", err)
 			}
 		}
@@ -258,13 +282,37 @@ func (m *MarketMaker) runCycle(ctx context.Context) error {
 	slog.Info("computed quotes", "bid", quotes.Bid, "ask", quotes.Ask, "size", quotes.Size)
 
 	// ── 5. Atomically replace bulk quotes (bid + ask in one transaction) ──────
+
+	// Circuit breaker: if we're in a backoff window, skip placing and warn.
+	if time.Now().Before(m.bulkOrderBackoffUntil) {
+		slog.Warn("circuit breaker active, skipping PlaceBulkOrders",
+			"failures", m.bulkOrderFailures,
+			"backoff_remaining_s", math.Round(time.Until(m.bulkOrderBackoffUntil).Seconds()),
+		)
+		return nil
+	}
+
 	if err := m.ex.PlaceBulkOrders(ctx,
 		[]exchange.BulkOrderEntry{{Price: quotes.Bid, Size: quotes.Size}},
 		[]exchange.BulkOrderEntry{{Price: quotes.Ask, Size: quotes.Size}},
 	); err != nil {
+		m.bulkOrderFailures++
+		// Exponential backoff: 2^failures × RefreshInterval, capped at 5 minutes.
+		backoff := time.Duration(math.Min(
+			math.Pow(2, float64(m.bulkOrderFailures))*m.cfg.RefreshInterval,
+			300,
+		)) * time.Second
+		m.bulkOrderBackoffUntil = time.Now().Add(backoff)
+		slog.Error("PlaceBulkOrders failed, circuit breaker engaged",
+			"failures", m.bulkOrderFailures,
+			"backoff_s", backoff.Seconds(),
+		)
 		return fmt.Errorf("place bulk orders: %w", err)
 	}
 
+	// Success — reset circuit breaker.
+	m.bulkOrderFailures = 0
+	m.bulkOrderBackoffUntil = time.Time{}
 	slog.Info("cycle complete")
 	return nil
 }
@@ -294,9 +342,27 @@ func (m *MarketMaker) placeFlattenOrder(ctx context.Context, inventory, mid floa
 	var rawPrice float64
 	if isBuy {
 		p := mid * (1.0 + m.cfg.FlattenAggression)
+		// Cap at FlattenMaxDeviation above mid (when non-zero).
+		if m.cfg.FlattenMaxDeviation > 0 {
+			cap := mid * (1.0 + m.cfg.FlattenMaxDeviation)
+			if p > cap {
+				slog.Warn("flatten buy price capped by FlattenMaxDeviation",
+					"uncapped", p, "capped", cap)
+				p = cap
+			}
+		}
 		rawPrice = math.Ceil(p/m.market.TickSize) * m.market.TickSize
 	} else {
 		p := mid * (1.0 - m.cfg.FlattenAggression)
+		// Floor at FlattenMaxDeviation below mid (when non-zero).
+		if m.cfg.FlattenMaxDeviation > 0 {
+			floor := mid * (1.0 - m.cfg.FlattenMaxDeviation)
+			if p < floor {
+				slog.Warn("flatten sell price floored by FlattenMaxDeviation",
+					"uncapped", p, "floored", floor)
+				p = floor
+			}
+		}
 		rawPrice = math.Floor(p/m.market.TickSize) * m.market.TickSize
 	}
 

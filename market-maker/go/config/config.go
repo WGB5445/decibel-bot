@@ -51,9 +51,13 @@ type Config struct {
 	// RefreshIntervalJitterS is half-width in seconds for uniform jitter around RefreshInterval
 	// (sleep Uniform[interval−jitter, interval+jitter]; 0 disables). See README.
 	RefreshIntervalJitterS float64
-	AutoFlatten            bool
-	FlattenAggression      float64
-	DryRun                 bool
+	AutoFlatten           bool
+	FlattenAggression     float64
+	// FlattenMaxDeviation is the maximum price deviation from mid allowed for a
+	// flatten order (e.g. 0.05 = 5%). Prevents over-aggressive pricing in fast
+	// markets. 0 disables the cap.
+	FlattenMaxDeviation float64
+	DryRun              bool
 
 	// ── Adaptive spread ───────────────────────────────────────────────────────
 	AutoSpread         bool

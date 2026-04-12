@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"math"
 	"sync"
+	"time"
 
 	aptossdk "github.com/aptos-labs/aptos-go-sdk"
 
@@ -203,25 +204,44 @@ func (d *DecibelExchange) FetchTradeHistory(ctx context.Context, p api.TradeHist
 
 // syncBulkSeqFromREST sets d.bulkSeq to max(sequence_number) from GET /bulk_orders
 // so the next live PlaceBulkOrders uses max+1. Caller must hold d.bulkMu.
+// Retries up to 3 times with quadratic backoff (1s, 4s, 9s) on transient failures.
 func (d *DecibelExchange) syncBulkSeqFromREST(ctx context.Context) error {
-	rows, err := d.apiClient.FetchBulkOrders(ctx, d.cfg.SubaccountAddress, d.market.MarketID)
-	if err != nil {
-		return err
-	}
-	var max uint64
-	for _, r := range rows {
-		if r.SequenceNumber > max {
-			max = r.SequenceNumber
+	const maxAttempts = 3
+	var lastErr error
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		rows, err := d.apiClient.FetchBulkOrders(ctx, d.cfg.SubaccountAddress, d.market.MarketID)
+		if err != nil {
+			lastErr = err
+			backoff := time.Duration(attempt*attempt) * time.Second
+			slog.Warn("bulk sequence sync failed, retrying",
+				"attempt", attempt,
+				"max_attempts", maxAttempts,
+				"backoff_s", backoff.Seconds(),
+				"err", err,
+			)
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(backoff):
+			}
+			continue
 		}
+		var maxSeq uint64
+		for _, r := range rows {
+			if r.SequenceNumber > maxSeq {
+				maxSeq = r.SequenceNumber
+			}
+		}
+		d.bulkSeq = maxSeq
+		d.bulkSeqSynced = true
+		slog.Info("bulk sequence synced from REST",
+			"max_sequence_number", maxSeq,
+			"next_bulk_seq", maxSeq+1,
+			"rows", len(rows),
+		)
+		return nil
 	}
-	d.bulkSeq = max
-	d.bulkSeqSynced = true
-	slog.Info("bulk sequence synced from REST",
-		"max_sequence_number", max,
-		"next_bulk_seq", max+1,
-		"rows", len(rows),
-	)
-	return nil
+	return fmt.Errorf("sync bulk sequence failed after %d attempts: %w", maxAttempts, lastErr)
 }
 
 // PlaceBulkOrders atomically replaces all bulk quotes for the target market.

@@ -143,9 +143,10 @@ func newConfigFromEnvProfile(profile NetworkProfile, networkEnv string) *Config 
 		MaxMarginUsage:         envFloat("MAX_MARGIN_USAGE", 0.5),
 		RefreshInterval:        envFloat("REFRESH_INTERVAL", 20.0),
 		RefreshIntervalJitterS: envFloat("REFRESH_INTERVAL_JITTER_S", 0),
-		AutoFlatten:            envBool("AUTO_FLATTEN", false),
-		FlattenAggression:      envFloat("FLATTEN_AGGRESSION", 0.001),
-		DryRun:                 envBool("DRY_RUN", false),
+		AutoFlatten:         envBool("AUTO_FLATTEN", false),
+		FlattenAggression:   envFloat("FLATTEN_AGGRESSION", 0.001),
+		FlattenMaxDeviation: envFloat("FLATTEN_MAX_DEVIATION", 0.05),
+		DryRun:              envBool("DRY_RUN", false),
 
 		AutoSpread:         envBool("AUTO_SPREAD", false),
 		SpreadMin:          envFloat("SPREAD_MIN", 0.0004),
@@ -378,6 +379,7 @@ func registerAllFlags(fs *flag.FlagSet, cfg *Config) {
 		"Seconds; sleep duration is uniform in [refresh-interval−jitter, refresh-interval+jitter] (lower bound floored at 0.01s); 0 disables")
 	fs.BoolVar(&cfg.AutoFlatten, "auto-flatten", cfg.AutoFlatten, "Auto reduce-only order when inventory hits limit")
 	fs.Float64Var(&cfg.FlattenAggression, "flatten-aggression", cfg.FlattenAggression, "Flatten order price offset from mid")
+	fs.Float64Var(&cfg.FlattenMaxDeviation, "flatten-max-deviation", cfg.FlattenMaxDeviation, "Max price deviation from mid for flatten orders (0 = no cap)")
 	fs.BoolVar(&cfg.DryRun, "dry-run", cfg.DryRun, "Log without sending transactions")
 	fs.BoolVar(&cfg.AutoSpread, "auto-spread", cfg.AutoSpread, "Automatically narrow spread after spread-no-fill-cycles cycles with no fill")
 	fs.Float64Var(&cfg.SpreadMin, "spread-min", cfg.SpreadMin, "Minimum spread the auto-adjuster will narrow to")

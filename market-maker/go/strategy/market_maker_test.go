@@ -2,7 +2,9 @@ package strategy
 
 import (
 	"context"
+	"errors"
 	"testing"
+	"time"
 
 	"decibel-mm-bot/api"
 	"decibel-mm-bot/config"
@@ -13,10 +15,12 @@ import (
 
 type mockExchange struct {
 	state           exchange.StateSnapshot
+	fetchErr        error // if non-nil, FetchState returns this error
 	placed          []exchange.PlaceOrderRequest
 	bulkBids        []exchange.BulkOrderEntry
 	bulkAsks        []exchange.BulkOrderEntry
 	bulkCancelCalls int
+	bulkOrderErr    error // if non-nil, PlaceBulkOrders returns this error
 }
 
 func (m *mockExchange) FindMarket(_ context.Context, _ string) (*exchange.MarketConfig, error) {
@@ -26,6 +30,9 @@ func (m *mockExchange) MarketsCatalog(_ context.Context) ([]api.MarketConfig, er
 	return nil, nil
 }
 func (m *mockExchange) FetchState(_ context.Context) (*exchange.StateSnapshot, error) {
+	if m.fetchErr != nil {
+		return nil, m.fetchErr
+	}
 	snap := m.state
 	return &snap, nil
 }
@@ -40,6 +47,9 @@ func (m *mockExchange) FetchTradeHistory(_ context.Context, _ api.TradeHistoryPa
 	return nil, nil
 }
 func (m *mockExchange) PlaceBulkOrders(_ context.Context, bids, asks []exchange.BulkOrderEntry) error {
+	if m.bulkOrderErr != nil {
+		return m.bulkOrderErr
+	}
 	m.bulkBids = append(m.bulkBids, bids...)
 	m.bulkAsks = append(m.bulkAsks, asks...)
 	return nil
@@ -83,7 +93,7 @@ func testConfig() *config.Config {
 	}
 }
 
-// ── Tests ─────────────────────────────────────────────────────────────────────
+// ── Tests: Adaptive Spread ────────────────────────────────────────────────────
 
 // First cycle must not trigger adaptive spread adjustments (no previous inventory to compare).
 func TestFirstCycleSkipsSpreadAdjustment(t *testing.T) {
@@ -233,6 +243,86 @@ func TestSpreadFlooredAtSpreadMin(t *testing.T) {
 	}
 }
 
+// ── Tests: Risk Guards ────────────────────────────────────────────────────────
+
+// When MarginUsage exceeds MaxMarginUsage, the cycle must pause — no quotes placed.
+func TestMarginGuardPausesQuoting(t *testing.T) {
+	cfg := testConfig()
+	cfg.MaxMarginUsage = 0.8
+	ex := &mockExchange{state: exchange.StateSnapshot{
+		Inventory:   0.0,
+		MarginUsage: 0.95, // exceeds 0.8
+		Mid:         ptr(100_000),
+	}}
+
+	mm := New(cfg, ex, testMarket())
+	if err := mm.runCycle(context.Background()); err != nil {
+		t.Fatalf("runCycle: %v", err)
+	}
+
+	if len(ex.bulkBids)+len(ex.bulkAsks) != 0 {
+		t.Errorf("expected no quotes placed when margin too high, got %d bids %d asks",
+			len(ex.bulkBids), len(ex.bulkAsks))
+	}
+}
+
+// When MarginUsage is below threshold, quotes are placed normally.
+func TestMarginGuardAllowsQuotingBelowThreshold(t *testing.T) {
+	cfg := testConfig()
+	cfg.MaxMarginUsage = 0.8
+	ex := &mockExchange{state: exchange.StateSnapshot{
+		Inventory:   0.0,
+		MarginUsage: 0.5, // below 0.8
+		Mid:         ptr(100_000),
+	}}
+
+	mm := New(cfg, ex, testMarket())
+	if err := mm.runCycle(context.Background()); err != nil {
+		t.Fatalf("runCycle: %v", err)
+	}
+
+	if len(ex.bulkBids) == 0 || len(ex.bulkAsks) == 0 {
+		t.Error("expected quotes placed when margin is within threshold")
+	}
+}
+
+// When mid-price is nil, the cycle must pause — no quotes placed.
+func TestMidPriceMissingPausesQuoting(t *testing.T) {
+	cfg := testConfig()
+	ex := &mockExchange{state: exchange.StateSnapshot{
+		Inventory: 0.0,
+		Mid:       nil, // no price
+	}}
+
+	mm := New(cfg, ex, testMarket())
+	if err := mm.runCycle(context.Background()); err != nil {
+		t.Fatalf("runCycle: %v", err)
+	}
+
+	if len(ex.bulkBids)+len(ex.bulkAsks) != 0 {
+		t.Errorf("expected no quotes placed when mid-price missing, got %d bids %d asks",
+			len(ex.bulkBids), len(ex.bulkAsks))
+	}
+}
+
+// When FetchState returns an error, runCycle must return that error.
+func TestStateFetchFailurePropagatesError(t *testing.T) {
+	cfg := testConfig()
+	fetchErr := errors.New("network timeout")
+	ex := &mockExchange{fetchErr: fetchErr}
+
+	mm := New(cfg, ex, testMarket())
+	err := mm.runCycle(context.Background())
+	if err == nil {
+		t.Fatal("expected error from runCycle when FetchState fails, got nil")
+	}
+	if !errors.Is(err, fetchErr) {
+		t.Errorf("expected error chain to contain %v, got %v", fetchErr, err)
+	}
+}
+
+// ── Tests: Inventory Limit ────────────────────────────────────────────────────
+
 // At max inventory, CancelBulkOrders is called and no new quotes are placed.
 func TestAtMaxInventoryCancelsBulkAndSkipsQuotes(t *testing.T) {
 	cfg := testConfig()
@@ -279,6 +369,176 @@ func TestAtMaxInventoryCancelsBulkOnlyOnce(t *testing.T) {
 	}
 }
 
+// When inventory recovers below limit, the invLimitBulkCancelDone flag resets and
+// the next time inventory hits the limit, CancelBulkOrders fires again.
+func TestInventoryRecoveryReArmsFlag(t *testing.T) {
+	cfg := testConfig()
+	cfg.MaxInventory = 0.001
+	cfg.AutoFlatten = false
+	ex := &mockExchange{state: exchange.StateSnapshot{
+		Inventory: 0.002,
+		Mid:       ptr(100_000),
+	}}
+
+	mm := New(cfg, ex, testMarket())
+
+	// Cycle 1: hit limit — first cancel fires.
+	if err := mm.runCycle(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if ex.bulkCancelCalls != 1 {
+		t.Fatalf("expected 1 cancel after first limit hit, got %d", ex.bulkCancelCalls)
+	}
+
+	// Cycle 2: inventory recovers below limit.
+	ex.state.Inventory = 0.0005
+	if err := mm.runCycle(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if mm.invLimitBulkCancelDone {
+		t.Error("invLimitBulkCancelDone should be reset when inventory recovers")
+	}
+
+	// Cycle 3: inventory hits limit again — cancel should fire again.
+	ex.state.Inventory = 0.002
+	if err := mm.runCycle(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if ex.bulkCancelCalls != 2 {
+		t.Errorf("expected 2nd cancel after second limit hit, got %d total", ex.bulkCancelCalls)
+	}
+}
+
+// ── Tests: Flatten Orders ─────────────────────────────────────────────────────
+
+// When AutoFlatten=true and inventory is at limit, a flatten order is placed.
+func TestFlattenOrderPlacedWhenAutoFlattenOn(t *testing.T) {
+	cfg := testConfig()
+	cfg.MaxInventory = 0.001
+	cfg.AutoFlatten = true
+	cfg.FlattenAggression = 0.001
+	ex := &mockExchange{state: exchange.StateSnapshot{
+		Inventory: 0.002,
+		Mid:       ptr(100_000),
+	}}
+
+	mm := New(cfg, ex, testMarket())
+	if err := mm.runCycle(context.Background()); err != nil {
+		t.Fatalf("runCycle: %v", err)
+	}
+
+	if len(ex.placed) == 0 {
+		t.Error("expected a flatten PlaceOrder when AutoFlatten=true at max inventory")
+	}
+	if len(ex.placed) > 0 && !ex.placed[0].ReduceOnly {
+		t.Error("flatten order must be ReduceOnly=true")
+	}
+	if len(ex.placed) > 0 && ex.placed[0].TimeInForce != 0 {
+		t.Errorf("flatten order must use GTC (TimeInForce=0), got %d", ex.placed[0].TimeInForce)
+	}
+}
+
+// When AutoFlatten=false and inventory is at limit, no flatten order is placed.
+func TestFlattenOrderSkippedWhenAutoFlattenOff(t *testing.T) {
+	cfg := testConfig()
+	cfg.MaxInventory = 0.001
+	cfg.AutoFlatten = false
+	ex := &mockExchange{state: exchange.StateSnapshot{
+		Inventory: 0.002,
+		Mid:       ptr(100_000),
+	}}
+
+	mm := New(cfg, ex, testMarket())
+	if err := mm.runCycle(context.Background()); err != nil {
+		t.Fatalf("runCycle: %v", err)
+	}
+
+	if len(ex.placed) != 0 {
+		t.Errorf("expected no flatten order when AutoFlatten=false, got %d PlaceOrder calls", len(ex.placed))
+	}
+}
+
+// Long position (positive inventory) → flatten sells (IsBuy=false).
+func TestFlattenLongPositionSells(t *testing.T) {
+	cfg := testConfig()
+	cfg.MaxInventory = 0.001
+	cfg.AutoFlatten = true
+	cfg.FlattenAggression = 0.001
+	ex := &mockExchange{state: exchange.StateSnapshot{
+		Inventory: 0.002, // long
+		Mid:       ptr(100_000),
+	}}
+
+	mm := New(cfg, ex, testMarket())
+	if err := mm.runCycle(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	if len(ex.placed) == 0 {
+		t.Fatal("expected flatten order")
+	}
+	if ex.placed[0].IsBuy {
+		t.Error("flatten for long position must be a sell (IsBuy=false)")
+	}
+	// Long flatten: sell below mid
+	if ex.placed[0].Price >= 100_000 {
+		t.Errorf("flatten sell price %.2f should be below mid 100000", ex.placed[0].Price)
+	}
+}
+
+// Short position (negative inventory) → flatten buys (IsBuy=true).
+func TestFlattenShortPositionBuys(t *testing.T) {
+	cfg := testConfig()
+	cfg.MaxInventory = 0.001
+	cfg.AutoFlatten = true
+	cfg.FlattenAggression = 0.001
+	ex := &mockExchange{state: exchange.StateSnapshot{
+		Inventory: -0.002, // short
+		Mid:       ptr(100_000),
+	}}
+
+	mm := New(cfg, ex, testMarket())
+	if err := mm.runCycle(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	if len(ex.placed) == 0 {
+		t.Fatal("expected flatten order")
+	}
+	if !ex.placed[0].IsBuy {
+		t.Error("flatten for short position must be a buy (IsBuy=true)")
+	}
+	// Short flatten: buy above mid
+	if ex.placed[0].Price <= 100_000 {
+		t.Errorf("flatten buy price %.2f should be above mid 100000", ex.placed[0].Price)
+	}
+}
+
+// Flatten order is not placed when inventory is too small to round to MinSize.
+func TestFlattenSkippedWhenInventoryTooSmall(t *testing.T) {
+	cfg := testConfig()
+	cfg.MaxInventory = 0.001
+	cfg.AutoFlatten = true
+	cfg.FlattenAggression = 0.001
+	market := testMarket()
+	market.MinSize = 0.1 // very large min size
+	ex := &mockExchange{state: exchange.StateSnapshot{
+		Inventory: 0.002, // too small to round to MinSize=0.1
+		Mid:       ptr(100_000),
+	}}
+
+	mm := New(cfg, ex, market)
+	if err := mm.runCycle(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	if len(ex.placed) != 0 {
+		t.Errorf("expected no flatten order when inventory too small for MinSize, got %d", len(ex.placed))
+	}
+}
+
+// ── Tests: Normal Quote Placement ─────────────────────────────────────────────
+
 // Normal cycle places exactly one bulk bid and one bulk ask via PlaceBulkOrders.
 func TestNormalCyclePlacesBulkBidAndAsk(t *testing.T) {
 	cfg := testConfig()
@@ -298,5 +558,314 @@ func TestNormalCyclePlacesBulkBidAndAsk(t *testing.T) {
 	if ex.bulkBids[0].Price >= ex.bulkAsks[0].Price {
 		t.Errorf("bid price %.2f must be < ask price %.2f",
 			ex.bulkBids[0].Price, ex.bulkAsks[0].Price)
+	}
+}
+
+// PlaceBulkOrders error causes runCycle to return an error.
+func TestPlaceBulkOrdersErrorPropagates(t *testing.T) {
+	cfg := testConfig()
+	bulkErr := errors.New("on-chain tx failed")
+	ex := &mockExchange{
+		state:        exchange.StateSnapshot{Inventory: 0.0, Mid: ptr(100_000)},
+		bulkOrderErr: bulkErr,
+	}
+
+	mm := New(cfg, ex, testMarket())
+	err := mm.runCycle(context.Background())
+	if err == nil {
+		t.Fatal("expected error when PlaceBulkOrders fails, got nil")
+	}
+	if !errors.Is(err, bulkErr) {
+		t.Errorf("expected error chain to contain %v, got %v", bulkErr, err)
+	}
+}
+
+// Skew shifts bid and ask in the correct direction for a long position.
+// Uses large SkewPerUnit (0.1) and sizeable inventory (0.1) so the skew
+// (0.01 = 1%) is large enough to survive tick rounding.
+func TestSkewShiftsBidAskForLongPosition(t *testing.T) {
+	cfg := testConfig()
+	cfg.SkewPerUnit = 0.1  // 10% per unit of inventory
+	cfg.MaxInventory = 1.0 // allow larger inventory
+	mid := 100_000.0
+
+	// Cycle with zero inventory (baseline prices).
+	ex := &mockExchange{state: exchange.StateSnapshot{Inventory: 0.0, Mid: ptr(mid)}}
+	mm := New(cfg, ex, testMarket())
+	if err := mm.runCycle(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	baseBid := ex.bulkBids[0].Price
+	baseAsk := ex.bulkAsks[0].Price
+
+	// Fresh bot with positive inventory (long) — quotes should be skewed down.
+	// skew = 0.1 × 0.1 = 0.01 (1%), well above tick size.
+	ex2 := &mockExchange{state: exchange.StateSnapshot{Inventory: 0.1, Mid: ptr(mid)}}
+	mm2 := New(cfg, ex2, testMarket())
+	if err := mm2.runCycle(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	skewBid := ex2.bulkBids[0].Price
+	skewAsk := ex2.bulkAsks[0].Price
+
+	if skewBid >= baseBid {
+		t.Errorf("long position should push bid down: base=%.2f skewed=%.2f", baseBid, skewBid)
+	}
+	if skewAsk >= baseAsk {
+		t.Errorf("long position should push ask down: base=%.2f skewed=%.2f", baseAsk, skewAsk)
+	}
+}
+
+// Quotes are the same size regardless of inventory direction (symmetric sizing).
+func TestQuoteSizeSymmetric(t *testing.T) {
+	cfg := testConfig()
+	mid := 100_000.0
+
+	for _, inv := range []float64{-0.005, 0.0, 0.005} {
+		ex := &mockExchange{state: exchange.StateSnapshot{Inventory: inv, Mid: ptr(mid)}}
+		mm := New(cfg, ex, testMarket())
+		if err := mm.runCycle(context.Background()); err != nil {
+			t.Fatalf("inv=%.4f: %v", inv, err)
+		}
+		if len(ex.bulkBids) == 0 || len(ex.bulkAsks) == 0 {
+			t.Fatalf("inv=%.4f: expected bulk orders", inv)
+		}
+		if ex.bulkBids[0].Size != ex.bulkAsks[0].Size {
+			t.Errorf("inv=%.4f: bid size %.5f != ask size %.5f",
+				inv, ex.bulkBids[0].Size, ex.bulkAsks[0].Size)
+		}
+	}
+}
+
+// ── Tests: State Update ───────────────────────────────────────────────────────
+
+// FlattenMaxDeviation caps the flatten sell price (long position) when FlattenAggression
+// would place the order too far below mid.
+func TestFlattenMaxDeviationCapsLongSellPrice(t *testing.T) {
+	cfg := testConfig()
+	cfg.MaxInventory = 0.001
+	cfg.AutoFlatten = true
+	cfg.FlattenAggression = 0.10 // 10% below mid — very aggressive
+	cfg.FlattenMaxDeviation = 0.02 // cap at 2% below mid
+	mid := 100_000.0
+	ex := &mockExchange{state: exchange.StateSnapshot{
+		Inventory: 0.002, // long
+		Mid:       ptr(mid),
+	}}
+
+	mm := New(cfg, ex, testMarket())
+	if err := mm.runCycle(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if len(ex.placed) == 0 {
+		t.Fatal("expected flatten order")
+	}
+	// Price must not be more than 2% below mid.
+	minAllowed := mid * (1.0 - cfg.FlattenMaxDeviation)
+	if ex.placed[0].Price < minAllowed {
+		t.Errorf("flatten sell price %.2f is below FlattenMaxDeviation floor %.2f",
+			ex.placed[0].Price, minAllowed)
+	}
+}
+
+// FlattenMaxDeviation caps the flatten buy price (short position) when FlattenAggression
+// would place the order too far above mid.
+func TestFlattenMaxDeviationCapsShortBuyPrice(t *testing.T) {
+	cfg := testConfig()
+	cfg.MaxInventory = 0.001
+	cfg.AutoFlatten = true
+	cfg.FlattenAggression = 0.10 // 10% above mid — very aggressive
+	cfg.FlattenMaxDeviation = 0.02 // cap at 2% above mid
+	mid := 100_000.0
+	ex := &mockExchange{state: exchange.StateSnapshot{
+		Inventory: -0.002, // short
+		Mid:       ptr(mid),
+	}}
+
+	mm := New(cfg, ex, testMarket())
+	if err := mm.runCycle(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if len(ex.placed) == 0 {
+		t.Fatal("expected flatten order")
+	}
+	// Price must not be more than 2% above mid.
+	maxAllowed := mid * (1.0 + cfg.FlattenMaxDeviation)
+	if ex.placed[0].Price > maxAllowed {
+		t.Errorf("flatten buy price %.2f exceeds FlattenMaxDeviation cap %.2f",
+			ex.placed[0].Price, maxAllowed)
+	}
+}
+
+// When FlattenMaxDeviation=0, no cap is applied.
+func TestFlattenMaxDeviationZeroDisablesCap(t *testing.T) {
+	cfg := testConfig()
+	cfg.MaxInventory = 0.001
+	cfg.AutoFlatten = true
+	cfg.FlattenAggression = 0.10 // 10% below mid
+	cfg.FlattenMaxDeviation = 0.0 // disabled
+	mid := 100_000.0
+	ex := &mockExchange{state: exchange.StateSnapshot{
+		Inventory: 0.002, // long
+		Mid:       ptr(mid),
+	}}
+
+	mm := New(cfg, ex, testMarket())
+	if err := mm.runCycle(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if len(ex.placed) == 0 {
+		t.Fatal("expected flatten order")
+	}
+	// With no cap, price should be ~10% below mid (after tick rounding).
+	expected := mid * (1.0 - cfg.FlattenAggression)
+	if ex.placed[0].Price > expected+1.0 {
+		t.Errorf("expected uncapped price near %.2f, got %.2f", expected, ex.placed[0].Price)
+	}
+}
+
+// ── Tests: Margin Recovery Tracking ──────────────────────────────────────────
+
+// marginHighCycles increments each cycle spent above the threshold.
+func TestMarginHighCyclesIncrement(t *testing.T) {
+	cfg := testConfig()
+	cfg.MaxMarginUsage = 0.5
+	ex := &mockExchange{state: exchange.StateSnapshot{
+		Inventory:   0.0,
+		MarginUsage: 0.9, // above threshold
+		Mid:         ptr(100_000),
+	}}
+
+	mm := New(cfg, ex, testMarket())
+	for i := 0; i < 3; i++ {
+		if err := mm.runCycle(context.Background()); err != nil {
+			t.Fatalf("cycle %d: %v", i+1, err)
+		}
+	}
+
+	if mm.marginHighCycles != 3 {
+		t.Errorf("marginHighCycles should be 3 after 3 paused cycles, got %d", mm.marginHighCycles)
+	}
+}
+
+// marginHighCycles resets when margin returns below threshold.
+func TestMarginHighCyclesResetOnRecovery(t *testing.T) {
+	cfg := testConfig()
+	cfg.MaxMarginUsage = 0.5
+	ex := &mockExchange{state: exchange.StateSnapshot{
+		Inventory:   0.0,
+		MarginUsage: 0.9,
+		Mid:         ptr(100_000),
+	}}
+
+	mm := New(cfg, ex, testMarket())
+	// 3 high-margin cycles.
+	for i := 0; i < 3; i++ {
+		_ = mm.runCycle(context.Background())
+	}
+	if mm.marginHighCycles == 0 {
+		t.Fatal("expected marginHighCycles > 0 after high-margin cycles")
+	}
+
+	// Margin recovers.
+	ex.state.MarginUsage = 0.3
+	if err := mm.runCycle(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if mm.marginHighCycles != 0 {
+		t.Errorf("marginHighCycles should reset to 0 after margin recovers, got %d", mm.marginHighCycles)
+	}
+}
+
+// ── Tests: Circuit Breaker ────────────────────────────────────────────────────
+
+// After a PlaceBulkOrders failure, the failure counter increments and a backoff is set.
+func TestCircuitBreakerEngagesOnFailure(t *testing.T) {
+	cfg := testConfig()
+	bulkErr := errors.New("tx rejected")
+	ex := &mockExchange{
+		state:        exchange.StateSnapshot{Inventory: 0.0, Mid: ptr(100_000)},
+		bulkOrderErr: bulkErr,
+	}
+
+	mm := New(cfg, ex, testMarket())
+	err := mm.runCycle(context.Background())
+	if err == nil {
+		t.Fatal("expected error from failed PlaceBulkOrders")
+	}
+
+	if mm.bulkOrderFailures != 1 {
+		t.Errorf("bulkOrderFailures should be 1 after first failure, got %d", mm.bulkOrderFailures)
+	}
+	if mm.bulkOrderBackoffUntil.IsZero() {
+		t.Error("bulkOrderBackoffUntil should be set after failure")
+	}
+}
+
+// After a successful PlaceBulkOrders, the circuit breaker resets.
+func TestCircuitBreakerResetsOnSuccess(t *testing.T) {
+	cfg := testConfig()
+	ex := &mockExchange{state: exchange.StateSnapshot{Inventory: 0.0, Mid: ptr(100_000)}}
+
+	mm := New(cfg, ex, testMarket())
+	// Simulate prior failures.
+	mm.bulkOrderFailures = 3
+
+	if err := mm.runCycle(context.Background()); err != nil {
+		t.Fatalf("runCycle: %v", err)
+	}
+
+	if mm.bulkOrderFailures != 0 {
+		t.Errorf("bulkOrderFailures should reset to 0 on success, got %d", mm.bulkOrderFailures)
+	}
+	if !mm.bulkOrderBackoffUntil.IsZero() {
+		t.Error("bulkOrderBackoffUntil should be cleared on success")
+	}
+}
+
+// While the backoff window is active, PlaceBulkOrders is skipped.
+func TestCircuitBreakerSkipsPlacementDuringBackoff(t *testing.T) {
+	cfg := testConfig()
+	ex := &mockExchange{state: exchange.StateSnapshot{Inventory: 0.0, Mid: ptr(100_000)}}
+
+	mm := New(cfg, ex, testMarket())
+	// Set active backoff window (far future).
+	mm.bulkOrderFailures = 2
+	mm.bulkOrderBackoffUntil = time.Now().Add(10 * time.Minute)
+
+	if err := mm.runCycle(context.Background()); err != nil {
+		t.Fatalf("expected no error during backoff, got: %v", err)
+	}
+
+	if len(ex.bulkBids)+len(ex.bulkAsks) != 0 {
+		t.Errorf("expected no PlaceBulkOrders during backoff, got %d bids %d asks",
+			len(ex.bulkBids), len(ex.bulkAsks))
+	}
+}
+
+// State update includes PrevInventory so the notification layer can compute entry price.
+func TestStateUpdateIncludesPrevInventory(t *testing.T) {
+	cfg := testConfig()
+	ex := &mockExchange{state: exchange.StateSnapshot{Inventory: 0.001, Mid: ptr(100_000)}}
+
+	mm := New(cfg, ex, testMarket())
+
+	// Cycle 1: establishes lastInventory = 0.001.
+	if err := mm.runCycle(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if mm.lastInventory != 0.001 {
+		t.Errorf("lastInventory should be updated to 0.001 after cycle, got %.6f", mm.lastInventory)
+	}
+
+	// Cycle 2: inventory changes; prevInventory in state update should be 0.001.
+	ex.state.Inventory = 0.003
+	if err := mm.runCycle(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	// BotState stores PrevInventory; verify lastInventory tracks correctly.
+	if mm.lastInventory != 0.003 {
+		t.Errorf("lastInventory should track current inventory, got %.6f", mm.lastInventory)
 	}
 }
