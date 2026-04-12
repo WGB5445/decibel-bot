@@ -15,14 +15,14 @@ import (
 // ── Mock exchange ─────────────────────────────────────────────────────────────
 
 type mockExchange struct {
-	state           exchange.StateSnapshot
-	fetchErr        error // if non-nil, FetchState returns this error
-	placed          []exchange.PlaceOrderRequest
-	placedIDs       []string // order IDs returned by PlaceOrder, in order
-	orderSeq        int      // incremented each PlaceOrder call; used to generate unique IDs
-	bulkBids        []exchange.BulkOrderEntry
-	bulkAsks        []exchange.BulkOrderEntry
-	bulkCancelCalls int
+	state            exchange.StateSnapshot
+	fetchErr         error // if non-nil, FetchState returns this error
+	placed           []exchange.PlaceOrderRequest
+	placedIDs        []string // order IDs returned by PlaceOrder, in order
+	orderSeq         int      // incremented each PlaceOrder call; used to generate unique IDs
+	bulkBids         []exchange.BulkOrderEntry
+	bulkAsks         []exchange.BulkOrderEntry
+	bulkCancelCalls  int
 	cancelOrderCalls int
 	bulkCancelErr    error // if non-nil, CancelBulkOrders returns this error
 	bulkOrderErr     error // if non-nil, PlaceBulkOrders returns this error
@@ -73,8 +73,8 @@ func (m *mockExchange) CancelOrder(_ context.Context, _ string) error {
 	m.cancelOrderCalls++
 	return nil
 }
-func (m *mockExchange) WalletAddress() string                         { return "0xtest" }
-func (m *mockExchange) DryRun() bool                                  { return false }
+func (m *mockExchange) WalletAddress() string { return "0xtest" }
+func (m *mockExchange) DryRun() bool          { return false }
 func (m *mockExchange) GasBalance(_ context.Context) (float64, string, error) {
 	return 1.0, "APT", nil
 }
