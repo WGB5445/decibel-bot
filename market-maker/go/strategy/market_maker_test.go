@@ -80,8 +80,6 @@ func testConfig() *config.Config {
 		MaxInventory:       0.01,
 		SkewPerUnit:        0.0001,
 		MaxMarginUsage:     0.9,
-		CooldownS:          0.0,
-		CancelResyncS:      0.0,
 	}
 }
 

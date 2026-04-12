@@ -51,8 +51,6 @@ type Config struct {
 	// RefreshIntervalJitterS is half-width in seconds for uniform jitter around RefreshInterval
 	// (sleep Uniform[interval−jitter, interval+jitter]; 0 disables). See README.
 	RefreshIntervalJitterS float64
-	CooldownS              float64
-	CancelResyncS          float64
 	AutoFlatten            bool
 	FlattenAggression      float64
 	DryRun                 bool

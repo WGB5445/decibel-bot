@@ -143,8 +143,6 @@ func newConfigFromEnvProfile(profile NetworkProfile, networkEnv string) *Config 
 		MaxMarginUsage:         envFloat("MAX_MARGIN_USAGE", 0.5),
 		RefreshInterval:        envFloat("REFRESH_INTERVAL", 20.0),
 		RefreshIntervalJitterS: envFloat("REFRESH_INTERVAL_JITTER_S", 0),
-		CooldownS:              envFloat("COOLDOWN_S", 1.5),
-		CancelResyncS:          envFloat("CANCEL_RESYNC_S", 8.0),
 		AutoFlatten:            envBool("AUTO_FLATTEN", false),
 		FlattenAggression:      envFloat("FLATTEN_AGGRESSION", 0.001),
 		DryRun:                 envBool("DRY_RUN", false),
@@ -378,8 +376,6 @@ func registerAllFlags(fs *flag.FlagSet, cfg *Config) {
 	fs.Float64Var(&cfg.RefreshInterval, "refresh-interval", cfg.RefreshInterval, "Seconds between cycles")
 	fs.Float64Var(&cfg.RefreshIntervalJitterS, "refresh-interval-jitter", cfg.RefreshIntervalJitterS,
 		"Seconds; sleep duration is uniform in [refresh-interval−jitter, refresh-interval+jitter] (lower bound floored at 0.01s); 0 disables")
-	fs.Float64Var(&cfg.CooldownS, "cooldown-s", cfg.CooldownS, "Seconds between placing bid and ask")
-	fs.Float64Var(&cfg.CancelResyncS, "cancel-resync-s", cfg.CancelResyncS, "Seconds to wait before re-checking failed cancels")
 	fs.BoolVar(&cfg.AutoFlatten, "auto-flatten", cfg.AutoFlatten, "Auto reduce-only order when inventory hits limit")
 	fs.Float64Var(&cfg.FlattenAggression, "flatten-aggression", cfg.FlattenAggression, "Flatten order price offset from mid")
 	fs.BoolVar(&cfg.DryRun, "dry-run", cfg.DryRun, "Log without sending transactions")
