@@ -25,6 +25,9 @@ var ErrNoPositionToFlatten = errors.New("no position to flatten")
 // MaxMarginUsage before a CRITICAL alert is logged.
 const marginStuckThreshold = 100
 
+// shutdownBulkCancelMaxAttempts limits REST/Aptos retries for CancelBulkOrders during shutdown.
+const shutdownBulkCancelMaxAttempts = 3
+
 // MarketMaker runs the inventory-skew market-making strategy.
 type MarketMaker struct {
 	cfg    *config.Config
@@ -118,11 +121,63 @@ func (m *MarketMaker) Run(ctx context.Context) error {
 		)
 		select {
 		case <-ctx.Done():
-			slog.Info("shutting down")
+			slog.Info("shutting down", "reason", ctx.Err())
+			if err := m.shutdownCancelQuotes(); err != nil {
+				return fmt.Errorf("shutdown cancel: %w", err)
+			}
 			return nil
 		case <-time.After(sleep):
 		}
 	}
+}
+
+// shutdownCancelQuotes revokes bulk market-making quotes for the configured market only.
+// It uses a fresh timeout context because the main ctx is already cancelled on SIGINT/SIGTERM.
+// Single resting orders (e.g. GTC auto-flatten) are not cancelled here by design.
+func (m *MarketMaker) shutdownCancelQuotes() error {
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), m.cfg.ShutdownCancelTimeout())
+	defer cancel()
+
+	slog.Info("shutdown: cancelling bulk quotes for this market only (single resting orders, e.g. GTC auto-flatten, are not cancelled)",
+		"market", m.market.MarketName,
+		"timeout", m.cfg.ShutdownCancelTimeout(),
+	)
+	slog.Warn("do not kill -9 the process; forced kill may leave resting orders on the book")
+
+	if m.ex.DryRun() {
+		slog.Warn("dry-run: no on-chain bulk cancel transactions will be sent; orders will not be cancelled")
+	}
+
+	var lastErr error
+	for attempt := 1; attempt <= shutdownBulkCancelMaxAttempts; attempt++ {
+		if err := shutdownCtx.Err(); err != nil {
+			if lastErr != nil {
+				return fmt.Errorf("shutdown cancel deadline: %w (last_err=%v)", err, lastErr)
+			}
+			return fmt.Errorf("shutdown cancel deadline: %w", err)
+		}
+		err := m.ex.CancelBulkOrders(shutdownCtx)
+		if err == nil {
+			slog.Info("shutdown cleanup complete: bulk cancel succeeded or no bulk quotes to cancel")
+			return nil
+		}
+		lastErr = err
+		slog.Warn("bulk cancel failed, retrying",
+			"attempt", attempt,
+			"max_attempts", shutdownBulkCancelMaxAttempts,
+			"err", err,
+		)
+		if attempt == shutdownBulkCancelMaxAttempts {
+			break
+		}
+		backoff := time.Duration(attempt*attempt) * time.Second
+		select {
+		case <-shutdownCtx.Done():
+			return fmt.Errorf("shutdown cancel deadline: %w (last_err=%v)", shutdownCtx.Err(), lastErr)
+		case <-time.After(backoff):
+		}
+	}
+	return fmt.Errorf("CancelBulkOrders retries exhausted: %w", lastErr)
 }
 
 func (m *MarketMaker) runCycle(ctx context.Context) error {

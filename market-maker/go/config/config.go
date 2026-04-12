@@ -8,6 +8,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"time"
 )
 
 // ── Network profiles ──────────────────────────────────────────────────────────
@@ -51,6 +52,9 @@ type Config struct {
 	// RefreshIntervalJitterS is half-width in seconds for uniform jitter around RefreshInterval
 	// (sleep Uniform[interval−jitter, interval+jitter]; 0 disables). See README.
 	RefreshIntervalJitterS float64
+	// ShutdownCancelTimeoutS is the time budget (seconds) for graceful shutdown bulk cancel
+	// (CancelBulkOrders only). Clamped in validate to at least 5s; 0 or negative becomes default 60s.
+	ShutdownCancelTimeoutS float64
 	AutoFlatten            bool
 	FlattenAggression      float64
 	// FlattenMaxDeviation is the maximum price deviation from mid allowed for a
@@ -99,6 +103,13 @@ func (c *Config) validate() error {
 		return fmt.Errorf("REFRESH_INTERVAL_JITTER_S (-refresh-interval-jitter) must be >= 0, got %v", c.RefreshIntervalJitterS)
 	}
 
+	if c.ShutdownCancelTimeoutS <= 0 {
+		c.ShutdownCancelTimeoutS = 60
+	}
+	if c.ShutdownCancelTimeoutS < 5 {
+		c.ShutdownCancelTimeoutS = 5
+	}
+
 	var missing []string
 	if c.BearerToken == "" {
 		missing = append(missing, "BEARER_TOKEN (-bearer-token)")
@@ -116,6 +127,19 @@ func (c *Config) validate() error {
 		return fmt.Errorf("missing required configuration: %s", strings.Join(missing, ", "))
 	}
 	return nil
+}
+
+// ShutdownCancelTimeout returns the time budget for graceful shutdown bulk cancel (CancelBulkOrders).
+// Values are normalized like validate: default 60s, minimum 5s.
+func (c *Config) ShutdownCancelTimeout() time.Duration {
+	s := c.ShutdownCancelTimeoutS
+	if s <= 0 {
+		s = 60
+	}
+	if s < 5 {
+		s = 5
+	}
+	return time.Duration(s * float64(time.Second))
 }
 
 // ParsePrivateKey decodes the 32-byte Ed25519 seed from the configured private key string.
