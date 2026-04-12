@@ -645,7 +645,7 @@ func TestFlattenMaxDeviationCapsLongSellPrice(t *testing.T) {
 	cfg := testConfig()
 	cfg.MaxInventory = 0.001
 	cfg.AutoFlatten = true
-	cfg.FlattenAggression = 0.10 // 10% below mid — very aggressive
+	cfg.FlattenAggression = 0.10   // 10% below mid — very aggressive
 	cfg.FlattenMaxDeviation = 0.02 // cap at 2% below mid
 	mid := 100_000.0
 	ex := &mockExchange{state: exchange.StateSnapshot{
@@ -674,7 +674,7 @@ func TestFlattenMaxDeviationCapsShortBuyPrice(t *testing.T) {
 	cfg := testConfig()
 	cfg.MaxInventory = 0.001
 	cfg.AutoFlatten = true
-	cfg.FlattenAggression = 0.10 // 10% above mid — very aggressive
+	cfg.FlattenAggression = 0.10   // 10% above mid — very aggressive
 	cfg.FlattenMaxDeviation = 0.02 // cap at 2% above mid
 	mid := 100_000.0
 	ex := &mockExchange{state: exchange.StateSnapshot{
@@ -702,7 +702,7 @@ func TestFlattenMaxDeviationZeroDisablesCap(t *testing.T) {
 	cfg := testConfig()
 	cfg.MaxInventory = 0.001
 	cfg.AutoFlatten = true
-	cfg.FlattenAggression = 0.10 // 10% below mid
+	cfg.FlattenAggression = 0.10  // 10% below mid
 	cfg.FlattenMaxDeviation = 0.0 // disabled
 	mid := 100_000.0
 	ex := &mockExchange{state: exchange.StateSnapshot{

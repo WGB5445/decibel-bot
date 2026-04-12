@@ -24,9 +24,9 @@ type FileConfig struct {
 	RefreshInterval       *float64 `json:"refresh_interval,omitempty"       yaml:"refresh_interval,omitempty"       toml:"refresh_interval,omitempty"`
 	RefreshIntervalJitter *float64 `json:"refresh_interval_jitter,omitempty" yaml:"refresh_interval_jitter,omitempty" toml:"refresh_interval_jitter,omitempty"`
 	AutoFlatten           *bool    `json:"auto_flatten,omitempty"           yaml:"auto_flatten,omitempty"           toml:"auto_flatten,omitempty"`
-	FlattenAggression    *float64 `json:"flatten_aggression,omitempty"      yaml:"flatten_aggression,omitempty"      toml:"flatten_aggression,omitempty"`
-	FlattenMaxDeviation  *float64 `json:"flatten_max_deviation,omitempty"   yaml:"flatten_max_deviation,omitempty"   toml:"flatten_max_deviation,omitempty"`
-	DryRun               *bool    `json:"dry_run,omitempty"                 yaml:"dry_run,omitempty"                 toml:"dry_run,omitempty"`
+	FlattenAggression     *float64 `json:"flatten_aggression,omitempty"      yaml:"flatten_aggression,omitempty"      toml:"flatten_aggression,omitempty"`
+	FlattenMaxDeviation   *float64 `json:"flatten_max_deviation,omitempty"   yaml:"flatten_max_deviation,omitempty"   toml:"flatten_max_deviation,omitempty"`
+	DryRun                *bool    `json:"dry_run,omitempty"                 yaml:"dry_run,omitempty"                 toml:"dry_run,omitempty"`
 	AutoSpread            *bool    `json:"auto_spread,omitempty"            yaml:"auto_spread,omitempty"            toml:"auto_spread,omitempty"`
 	SpreadMin             *float64 `json:"spread_min,omitempty"             yaml:"spread_min,omitempty"             toml:"spread_min,omitempty"`
 	SpreadMax             *float64 `json:"spread_max,omitempty"             yaml:"spread_max,omitempty"             toml:"spread_max,omitempty"`
