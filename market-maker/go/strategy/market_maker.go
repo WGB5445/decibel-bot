@@ -138,14 +138,14 @@ func (m *MarketMaker) shutdownCancelQuotes() error {
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), m.cfg.ShutdownCancelTimeout())
 	defer cancel()
 
-	slog.Info("收到退出信号：开始撤销当前市场的 bulk 做市挂单（不撤销单笔挂单，例如 auto-flatten 的 GTC）",
+	slog.Info("shutdown: cancelling bulk quotes for this market only (single resting orders, e.g. GTC auto-flatten, are not cancelled)",
 		"market", m.market.MarketName,
 		"timeout", m.cfg.ShutdownCancelTimeout(),
 	)
-	slog.Warn("请勿对进程执行 kill -9；强杀可能导致挂单残留")
+	slog.Warn("do not kill -9 the process; forced kill may leave resting orders on the book")
 
 	if m.ex.DryRun() {
-		slog.Warn("dry-run：不会发送链上 bulk 撤单交易，挂单不会被撤销")
+		slog.Warn("dry-run: no on-chain bulk cancel transactions will be sent; orders will not be cancelled")
 	}
 
 	var lastErr error
@@ -158,11 +158,11 @@ func (m *MarketMaker) shutdownCancelQuotes() error {
 		}
 		err := m.ex.CancelBulkOrders(shutdownCtx)
 		if err == nil {
-			slog.Info("退出清理完成：bulk 撤单已成功或当前无 bulk 挂单")
+			slog.Info("shutdown cleanup complete: bulk cancel succeeded or no bulk quotes to cancel")
 			return nil
 		}
 		lastErr = err
-		slog.Warn("bulk 撤单失败，将重试",
+		slog.Warn("bulk cancel failed, retrying",
 			"attempt", attempt,
 			"max_attempts", shutdownBulkCancelMaxAttempts,
 			"err", err,
@@ -177,7 +177,7 @@ func (m *MarketMaker) shutdownCancelQuotes() error {
 		case <-time.After(backoff):
 		}
 	}
-	return fmt.Errorf("CancelBulkOrders 重试耗尽: %w", lastErr)
+	return fmt.Errorf("CancelBulkOrders retries exhausted: %w", lastErr)
 }
 
 func (m *MarketMaker) runCycle(ctx context.Context) error {
