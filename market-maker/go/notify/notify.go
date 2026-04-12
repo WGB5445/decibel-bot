@@ -63,7 +63,8 @@ func ShortAddrForDisplay(addr string) string {
 	if s == "" {
 		return ""
 	}
-	lower := strings.ToLower(strings.TrimPrefix(s, "0x"))
+	lower := strings.ToLower(s)
+	lower = strings.TrimPrefix(lower, "0x")
 	if len(lower) <= 12 {
 		return "0x" + lower
 	}
