@@ -23,6 +23,7 @@ type FileConfig struct {
 	MaxMarginUsage        *float64 `json:"max_margin_usage,omitempty"       yaml:"max_margin_usage,omitempty"       toml:"max_margin_usage,omitempty"`
 	RefreshInterval       *float64 `json:"refresh_interval,omitempty"       yaml:"refresh_interval,omitempty"       toml:"refresh_interval,omitempty"`
 	RefreshIntervalJitter *float64 `json:"refresh_interval_jitter,omitempty" yaml:"refresh_interval_jitter,omitempty" toml:"refresh_interval_jitter,omitempty"`
+	ShutdownCancelTimeout *float64 `json:"shutdown_cancel_timeout,omitempty" yaml:"shutdown_cancel_timeout,omitempty" toml:"shutdown_cancel_timeout,omitempty"`
 	AutoFlatten           *bool    `json:"auto_flatten,omitempty"           yaml:"auto_flatten,omitempty"           toml:"auto_flatten,omitempty"`
 	FlattenAggression     *float64 `json:"flatten_aggression,omitempty"      yaml:"flatten_aggression,omitempty"      toml:"flatten_aggression,omitempty"`
 	FlattenMaxDeviation   *float64 `json:"flatten_max_deviation,omitempty"   yaml:"flatten_max_deviation,omitempty"   toml:"flatten_max_deviation,omitempty"`
@@ -115,6 +116,10 @@ func applyFileConfig(dst *Config, src *FileConfig, explicitFile map[string]bool)
 	if src.RefreshIntervalJitter != nil {
 		dst.RefreshIntervalJitterS = *src.RefreshIntervalJitter
 		set("REFRESH_INTERVAL_JITTER_S")
+	}
+	if src.ShutdownCancelTimeout != nil {
+		dst.ShutdownCancelTimeoutS = *src.ShutdownCancelTimeout
+		set("SHUTDOWN_CANCEL_TIMEOUT")
 	}
 	if src.AutoFlatten != nil {
 		dst.AutoFlatten = *src.AutoFlatten

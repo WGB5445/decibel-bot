@@ -23,7 +23,9 @@ type mockExchange struct {
 	bulkBids        []exchange.BulkOrderEntry
 	bulkAsks        []exchange.BulkOrderEntry
 	bulkCancelCalls int
-	bulkOrderErr    error // if non-nil, PlaceBulkOrders returns this error
+	cancelOrderCalls int
+	bulkCancelErr    error // if non-nil, CancelBulkOrders returns this error
+	bulkOrderErr     error // if non-nil, PlaceBulkOrders returns this error
 }
 
 func (m *mockExchange) FindMarket(_ context.Context, _ string) (*exchange.MarketConfig, error) {
@@ -62,9 +64,15 @@ func (m *mockExchange) PlaceBulkOrders(_ context.Context, bids, asks []exchange.
 }
 func (m *mockExchange) CancelBulkOrders(_ context.Context) error {
 	m.bulkCancelCalls++
+	if m.bulkCancelErr != nil {
+		return m.bulkCancelErr
+	}
 	return nil
 }
-func (m *mockExchange) CancelOrder(_ context.Context, _ string) error { return nil }
+func (m *mockExchange) CancelOrder(_ context.Context, _ string) error {
+	m.cancelOrderCalls++
+	return nil
+}
 func (m *mockExchange) WalletAddress() string                         { return "0xtest" }
 func (m *mockExchange) DryRun() bool                                  { return false }
 func (m *mockExchange) GasBalance(_ context.Context) (float64, string, error) {
@@ -87,15 +95,16 @@ func testMarket() *exchange.MarketConfig {
 
 func testConfig() *config.Config {
 	return &config.Config{
-		Spread:             0.002,
-		SpreadStep:         0.0002,
-		SpreadMin:          0.0005,
-		SpreadNoFillCycles: 3,
-		AutoSpread:         true,
-		OrderSize:          0.001,
-		MaxInventory:       0.01,
-		SkewPerUnit:        0.0001,
-		MaxMarginUsage:     0.9,
+		Spread:                 0.002,
+		SpreadStep:             0.0002,
+		SpreadMin:              0.0005,
+		SpreadNoFillCycles:     3,
+		AutoSpread:             true,
+		OrderSize:              0.001,
+		MaxInventory:           0.01,
+		SkewPerUnit:            0.0001,
+		MaxMarginUsage:         0.9,
+		ShutdownCancelTimeoutS: 60,
 	}
 }
 
@@ -1033,5 +1042,71 @@ func TestStateUpdateIncludesPrevInventory(t *testing.T) {
 	// BotState stores PrevInventory; verify lastInventory tracks correctly.
 	if mm.lastInventory != 0.003 {
 		t.Errorf("lastInventory should track current inventory, got %.6f", mm.lastInventory)
+	}
+}
+
+// Graceful shutdown only calls CancelBulkOrders, never CancelOrder.
+func TestShutdownCancelQuotes_BulkOnlyNoCancelOrder(t *testing.T) {
+	cfg := testConfig()
+	ex := &mockExchange{state: exchange.StateSnapshot{Inventory: 0.0, Mid: ptr(100_000)}}
+	mm := New(cfg, ex, testMarket())
+
+	if err := mm.shutdownCancelQuotes(); err != nil {
+		t.Fatalf("shutdownCancelQuotes: %v", err)
+	}
+	if ex.bulkCancelCalls != 1 {
+		t.Errorf("expected 1 CancelBulkOrders, got %d", ex.bulkCancelCalls)
+	}
+	if ex.cancelOrderCalls != 0 {
+		t.Errorf("expected 0 CancelOrder calls, got %d", ex.cancelOrderCalls)
+	}
+}
+
+func TestShutdownCancelQuotes_AllRetriesFail(t *testing.T) {
+	cfg := testConfig()
+	wantErr := errors.New("bulk cancel failed")
+	ex := &mockExchange{bulkCancelErr: wantErr}
+	mm := New(cfg, ex, testMarket())
+
+	err := mm.shutdownCancelQuotes()
+	if err == nil {
+		t.Fatal("expected error when CancelBulkOrders always fails")
+	}
+	if ex.bulkCancelCalls != shutdownBulkCancelMaxAttempts {
+		t.Errorf("expected %d CancelBulkOrders attempts, got %d", shutdownBulkCancelMaxAttempts, ex.bulkCancelCalls)
+	}
+	if !errors.Is(err, wantErr) {
+		t.Errorf("expected error chain to contain %v, got %v", wantErr, err)
+	}
+}
+
+func TestRun_OnContextCancelRunsCleanup(t *testing.T) {
+	cfg := testConfig()
+	cfg.RefreshInterval = 0.01
+	cfg.RefreshIntervalJitterS = 0
+	ex := &mockExchange{state: exchange.StateSnapshot{Inventory: 0.0, Mid: ptr(100_000)}}
+	mm := New(cfg, ex, testMarket())
+	ctx, cancel := context.WithCancel(context.Background())
+
+	runErr := make(chan error, 1)
+	go func() { runErr <- mm.Run(ctx) }()
+
+	time.Sleep(50 * time.Millisecond)
+	cancel()
+
+	select {
+	case err := <-runErr:
+		if err != nil {
+			t.Fatalf("Run: %v", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("Run did not exit after context cancel")
+	}
+
+	if ex.bulkCancelCalls != 1 {
+		t.Errorf("expected exactly 1 CancelBulkOrders on shutdown, got %d", ex.bulkCancelCalls)
+	}
+	if ex.cancelOrderCalls != 0 {
+		t.Errorf("shutdown must not call CancelOrder, got %d calls", ex.cancelOrderCalls)
 	}
 }

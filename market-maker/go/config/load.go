@@ -143,6 +143,7 @@ func newConfigFromEnvProfile(profile NetworkProfile, networkEnv string) *Config 
 		MaxMarginUsage:         envFloat("MAX_MARGIN_USAGE", 0.5),
 		RefreshInterval:        envFloat("REFRESH_INTERVAL", 20.0),
 		RefreshIntervalJitterS: envFloat("REFRESH_INTERVAL_JITTER_S", 0),
+		ShutdownCancelTimeoutS: envFloat("SHUTDOWN_CANCEL_TIMEOUT", 60.0),
 		AutoFlatten:            envBool("AUTO_FLATTEN", false),
 		FlattenAggression:      envFloat("FLATTEN_AGGRESSION", 0.001),
 		FlattenMaxDeviation:    envFloat("FLATTEN_MAX_DEVIATION", 0.05),
@@ -216,6 +217,11 @@ func explicitEnvKeys() map[string]bool {
 	if v := os.Getenv("REFRESH_INTERVAL_JITTER_S"); v != "" {
 		if _, err := strconv.ParseFloat(v, 64); err == nil {
 			m["REFRESH_INTERVAL_JITTER_S"] = true
+		}
+	}
+	if v := os.Getenv("SHUTDOWN_CANCEL_TIMEOUT"); v != "" {
+		if _, err := strconv.ParseFloat(v, 64); err == nil {
+			m["SHUTDOWN_CANCEL_TIMEOUT"] = true
 		}
 	}
 	if v := os.Getenv("AUTO_FLATTEN"); v != "" {
@@ -367,6 +373,8 @@ func registerAllFlags(fs *flag.FlagSet, cfg *Config) {
 	fs.Float64Var(&cfg.RefreshInterval, "refresh-interval", cfg.RefreshInterval, "Seconds between cycles")
 	fs.Float64Var(&cfg.RefreshIntervalJitterS, "refresh-interval-jitter", cfg.RefreshIntervalJitterS,
 		"Seconds; sleep duration is uniform in [refresh-interval−jitter, refresh-interval+jitter] (lower bound floored at 0.01s); 0 disables")
+	fs.Float64Var(&cfg.ShutdownCancelTimeoutS, "shutdown-cancel-timeout", cfg.ShutdownCancelTimeoutS,
+		"Seconds; time budget for graceful shutdown bulk cancel (CancelBulkOrders); min 5 after validation")
 	fs.BoolVar(&cfg.AutoFlatten, "auto-flatten", cfg.AutoFlatten, "Auto reduce-only order when inventory hits limit")
 	fs.Float64Var(&cfg.FlattenAggression, "flatten-aggression", cfg.FlattenAggression, "Flatten order price offset from mid")
 	fs.Float64Var(&cfg.FlattenMaxDeviation, "flatten-max-deviation", cfg.FlattenMaxDeviation, "Max price deviation from mid for flatten orders (0 = no cap)")
