@@ -1,10 +1,9 @@
-// Package config loads bot parameters from environment variables and CLI flags.
-// CLI flags override environment variables when explicitly set.
+// Package config loads bot parameters from environment variables, optional
+// JSON/YAML/TOML config files, and CLI flags. See Load / LoadWith for precedence.
 package config
 
 import (
 	"encoding/hex"
-	"flag"
 	"fmt"
 	"os"
 	"strconv"
@@ -42,18 +41,23 @@ type Config struct {
 	Network string // "testnet" | "mainnet"
 
 	// ── Trading parameters ────────────────────────────────────────────────────
-	MarketName        string
-	Spread            float64
-	OrderSize         float64
-	MaxInventory      float64
-	SkewPerUnit       float64
-	MaxMarginUsage    float64
-	RefreshInterval   float64
-	CooldownS         float64
-	CancelResyncS     float64
-	AutoFlatten       bool
-	FlattenAggression float64
-	DryRun            bool
+	MarketName      string
+	Spread          float64
+	OrderSize       float64
+	MaxInventory    float64
+	SkewPerUnit     float64
+	MaxMarginUsage  float64
+	RefreshInterval float64
+	// RefreshIntervalJitterS is half-width in seconds for uniform jitter around RefreshInterval
+	// (sleep Uniform[interval−jitter, interval+jitter]; 0 disables). See README.
+	RefreshIntervalJitterS float64
+	AutoFlatten            bool
+	FlattenAggression      float64
+	// FlattenMaxDeviation is the maximum price deviation from mid allowed for a
+	// flatten order (e.g. 0.05 = 5%). Prevents over-aggressive pricing in fast
+	// markets. 0 disables the cap.
+	FlattenMaxDeviation float64
+	DryRun              bool
 
 	// ── Adaptive spread ───────────────────────────────────────────────────────
 	AutoSpread         bool
@@ -85,136 +89,14 @@ func (c *Config) TelegramEnabled() bool {
 	return c.TGBotToken != "" && c.TGAdminID != 0
 }
 
-// Load reads env vars, applies network defaults, parses CLI flags (overrides), then validates.
-//
-// Effective priority (highest → lowest):
-//
-//	CLI flag (if set on command line)  >  explicit env var  >  network profile  >  built-in default
-func Load() (*Config, error) {
-	// Step 1: network from env only (baseline before flags).
-	networkFromEnv := envStr("NETWORK", "testnet")
-	profile, ok := networkProfiles[networkFromEnv]
-	if !ok {
-		return nil, fmt.Errorf("unknown network %q; valid values: testnet, mainnet", networkFromEnv)
-	}
-
-	cfg := &Config{
-		Network: networkFromEnv,
-
-		MarketName:        envStr("MARKET_NAME", "BTC/USD"),
-		Spread:            envFloat("SPREAD", 0.001),
-		OrderSize:         envFloat("ORDER_SIZE", 0.001),
-		MaxInventory:      envFloat("MAX_INVENTORY", 0.005),
-		SkewPerUnit:       envFloat("SKEW_PER_UNIT", 0.0001),
-		MaxMarginUsage:    envFloat("MAX_MARGIN_USAGE", 0.5),
-		RefreshInterval:   envFloat("REFRESH_INTERVAL", 20.0),
-		CooldownS:         envFloat("COOLDOWN_S", 1.5),
-		CancelResyncS:     envFloat("CANCEL_RESYNC_S", 8.0),
-		AutoFlatten:       envBool("AUTO_FLATTEN", false),
-		FlattenAggression: envFloat("FLATTEN_AGGRESSION", 0.001),
-		DryRun:            envBool("DRY_RUN", false),
-
-		AutoSpread:         envBool("AUTO_SPREAD", false),
-		SpreadMin:          envFloat("SPREAD_MIN", 0.0004),
-		SpreadMax:          envFloat("SPREAD_MAX", 0.02),
-		SpreadNoFillCycles: int(envFloat("SPREAD_NO_FILL_CYCLES", 3)),
-		SpreadStep:         envFloat("SPREAD_STEP", 0.0002),
-
-		BearerToken:        os.Getenv("BEARER_TOKEN"),
-		SubaccountAddress:  os.Getenv("SUBACCOUNT_ADDRESS"),
-		PrivateKey:         os.Getenv("PRIVATE_KEY"),
-		NodeAPIKey:         os.Getenv("NODE_API_KEY"),
-		MarketAddrOverride: os.Getenv("MARKET_ADDR"),
-
-		RestAPIBase:      envStr("REST_API_BASE", profile.RestAPIBase),
-		AptosFullnodeURL: envStr("APTOS_FULLNODE_URL", profile.AptosFullnodeURL),
-		PackageAddress:   envStr("PACKAGE_ADDRESS", profile.PackageAddress),
-
-		TGBotToken:               os.Getenv("TG_BOT_TOKEN"),
-		TGAdminID:                envInt64("TG_ADMIN_ID", 0),
-		TGAlertInventory:         envBool("TG_ALERT_INVENTORY", false),
-		TGAlertInventoryInterval: int(envFloat("TG_ALERT_INVENTORY_INTERVAL_MIN", 30)),
-		TGStrictStart:            envBool("TG_STRICT_START", false),
-	}
-
-	flag.StringVar(&cfg.Network, "network", cfg.Network,
-		"Network preset: testnet | mainnet  (sets default URLs and package address)")
-	flag.StringVar(&cfg.MarketName, "market-name", cfg.MarketName, "Market symbol (e.g. BTC/USD)")
-	flag.Float64Var(&cfg.Spread, "spread", cfg.Spread, "Total spread fraction (0.001 = 0.1%)")
-	flag.Float64Var(&cfg.OrderSize, "order-size", cfg.OrderSize, "Base units per side per quote")
-	flag.Float64Var(&cfg.MaxInventory, "max-inventory", cfg.MaxInventory, "Stop quoting when abs(position) >= this")
-	flag.Float64Var(&cfg.SkewPerUnit, "skew-per-unit", cfg.SkewPerUnit, "Extra half-spread per unit of inventory")
-	flag.Float64Var(&cfg.MaxMarginUsage, "max-margin-usage", cfg.MaxMarginUsage, "Pause when cross_margin_ratio > this")
-	flag.Float64Var(&cfg.RefreshInterval, "refresh-interval", cfg.RefreshInterval, "Seconds between cycles")
-	flag.Float64Var(&cfg.CooldownS, "cooldown-s", cfg.CooldownS, "Seconds between placing bid and ask")
-	flag.Float64Var(&cfg.CancelResyncS, "cancel-resync-s", cfg.CancelResyncS, "Seconds to wait before re-checking failed cancels")
-	flag.BoolVar(&cfg.AutoFlatten, "auto-flatten", cfg.AutoFlatten, "Auto reduce-only order when inventory hits limit")
-	flag.Float64Var(&cfg.FlattenAggression, "flatten-aggression", cfg.FlattenAggression, "Flatten order price offset from mid")
-	flag.BoolVar(&cfg.DryRun, "dry-run", cfg.DryRun, "Log without sending transactions")
-	flag.BoolVar(&cfg.AutoSpread, "auto-spread", cfg.AutoSpread, "Automatically narrow spread after spread-no-fill-cycles cycles with no fill")
-	flag.Float64Var(&cfg.SpreadMin, "spread-min", cfg.SpreadMin, "Minimum spread the auto-adjuster will narrow to")
-	flag.Float64Var(&cfg.SpreadMax, "spread-max", cfg.SpreadMax, "Maximum spread ceiling")
-	flag.IntVar(&cfg.SpreadNoFillCycles, "spread-no-fill-cycles", cfg.SpreadNoFillCycles, "Cycles without fill before adjusting spread")
-	flag.Float64Var(&cfg.SpreadStep, "spread-step", cfg.SpreadStep, "Amount to narrow spread per adjustment step")
-	flag.StringVar(&cfg.PackageAddress, "package-address", cfg.PackageAddress, "Move package address (overrides network profile)")
-	flag.StringVar(&cfg.AptosFullnodeURL, "fullnode-url", cfg.AptosFullnodeURL, "Aptos fullnode URL (overrides network profile)")
-	flag.StringVar(&cfg.RestAPIBase, "api-base", cfg.RestAPIBase, "Decibel REST API base URL (overrides network profile)")
-
-	flag.StringVar(&cfg.BearerToken, "bearer-token", cfg.BearerToken, "Decibel REST bearer token (overrides BEARER_TOKEN)")
-	flag.StringVar(&cfg.SubaccountAddress, "subaccount", cfg.SubaccountAddress, "Subaccount object address (overrides SUBACCOUNT_ADDRESS)")
-	flag.StringVar(&cfg.PrivateKey, "private-key", cfg.PrivateKey, "Ed25519 private key hex or AIP-80 (overrides PRIVATE_KEY); visible in process list")
-	flag.StringVar(&cfg.NodeAPIKey, "node-api-key", cfg.NodeAPIKey, "Fullnode API key (overrides NODE_API_KEY; falls back to bearer token)")
-
-	// Telegram
-	flag.StringVar(&cfg.TGBotToken, "tg-token", cfg.TGBotToken,
-		"Telegram bot token (overrides TG_BOT_TOKEN); visible in process list")
-	flag.Int64Var(&cfg.TGAdminID, "tg-admin-id", cfg.TGAdminID,
-		"Telegram admin user ID (overrides TG_ADMIN_ID); visible in process list")
-	flag.BoolVar(&cfg.TGAlertInventory, "tg-alert-inventory", cfg.TGAlertInventory,
-		"Enable Telegram alert when position exceeds max-inventory (overrides TG_ALERT_INVENTORY)")
-	flag.IntVar(&cfg.TGAlertInventoryInterval, "tg-alert-interval", cfg.TGAlertInventoryInterval,
-		"Minutes between repeated inventory-limit Telegram alerts (overrides TG_ALERT_INVENTORY_INTERVAL_MIN)")
-	flag.BoolVar(&cfg.TGStrictStart, "tg-strict-start", cfg.TGStrictStart,
-		"When Telegram is enabled, exit if bot init/ready/setCommands fails (overrides TG_STRICT_START)")
-
-	// Go's flag package does not treat "-boolflag false" as a single flag: the
-	// word "false" becomes the first non-flag token and parsing stops, so flags
-	// after it are silently ignored. Rewrite to "-boolflag=false" for known
-	// boolean flags (same for "true", "0", "1", etc.).
-	os.Args = normalizeBoolCLIArgs(os.Args)
-
-	flag.Parse()
-
-	flagsSet := make(map[string]struct{})
-	flag.Visit(func(f *flag.Flag) {
-		flagsSet[f.Name] = struct{}{}
-	})
-
-	// Step 3: if --network changed the preset, refresh URL/package from the new profile
-	// unless the operator set them via CLI or env.
-	if cfg.Network != networkFromEnv {
-		p2, ok := networkProfiles[cfg.Network]
-		if !ok {
-			return nil, fmt.Errorf("unknown network %q; valid values: testnet, mainnet", cfg.Network)
-		}
-		if _, cli := flagsSet["api-base"]; !cli && !isExplicitEnv("REST_API_BASE") {
-			cfg.RestAPIBase = p2.RestAPIBase
-		}
-		if _, cli := flagsSet["fullnode-url"]; !cli && !isExplicitEnv("APTOS_FULLNODE_URL") {
-			cfg.AptosFullnodeURL = p2.AptosFullnodeURL
-		}
-		if _, cli := flagsSet["package-address"]; !cli && !isExplicitEnv("PACKAGE_ADDRESS") {
-			cfg.PackageAddress = p2.PackageAddress
-		}
-	}
-
-	return cfg, cfg.validate()
-}
-
 func (c *Config) validate() error {
 	// Clamp TGAlertInventoryInterval to avoid time.NewTicker(0) panic.
 	if c.TGAlertInventoryInterval <= 0 {
 		c.TGAlertInventoryInterval = 30
+	}
+
+	if c.RefreshIntervalJitterS < 0 {
+		return fmt.Errorf("REFRESH_INTERVAL_JITTER_S (-refresh-interval-jitter) must be >= 0, got %v", c.RefreshIntervalJitterS)
 	}
 
 	var missing []string
@@ -368,10 +250,6 @@ func isBoolToken(s string) bool {
 }
 
 // ── Env helpers ──────────────────────────────────────────────────────────────
-
-func isExplicitEnv(key string) bool {
-	return os.Getenv(key) != ""
-}
 
 func envStr(key, def string) string {
 	if v := os.Getenv(key); v != "" {
