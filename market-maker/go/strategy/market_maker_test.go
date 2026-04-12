@@ -3,6 +3,7 @@ package strategy
 import (
 	"context"
 	"errors"
+	"fmt"
 	"testing"
 	"time"
 
@@ -17,6 +18,8 @@ type mockExchange struct {
 	state           exchange.StateSnapshot
 	fetchErr        error // if non-nil, FetchState returns this error
 	placed          []exchange.PlaceOrderRequest
+	placedIDs       []string // order IDs returned by PlaceOrder, in order
+	orderSeq        int      // incremented each PlaceOrder call; used to generate unique IDs
 	bulkBids        []exchange.BulkOrderEntry
 	bulkAsks        []exchange.BulkOrderEntry
 	bulkCancelCalls int
@@ -40,8 +43,11 @@ func (m *mockExchange) FetchOpenOrders(_ context.Context) ([]exchange.OpenOrder,
 	return nil, nil
 }
 func (m *mockExchange) PlaceOrder(_ context.Context, req exchange.PlaceOrderRequest) (exchange.PlaceOrderOutcome, error) {
+	m.orderSeq++
+	id := fmt.Sprintf("order-%d", m.orderSeq)
 	m.placed = append(m.placed, req)
-	return exchange.PlaceOrderOutcome{TxHash: "0xmock"}, nil
+	m.placedIDs = append(m.placedIDs, id)
+	return exchange.PlaceOrderOutcome{TxHash: "0xmock", OrderID: id}, nil
 }
 func (m *mockExchange) FetchTradeHistory(_ context.Context, _ api.TradeHistoryParams) ([]api.TradeHistoryItem, error) {
 	return nil, nil
@@ -840,6 +846,166 @@ func TestCircuitBreakerSkipsPlacementDuringBackoff(t *testing.T) {
 	if len(ex.bulkBids)+len(ex.bulkAsks) != 0 {
 		t.Errorf("expected no PlaceBulkOrders during backoff, got %d bids %d asks",
 			len(ex.bulkBids), len(ex.bulkAsks))
+	}
+}
+
+// ── Tests: Flatten Order Deduplication ───────────────────────────────────────
+
+// While a flatten order is still resting (present in OpenOrders), no new flatten
+// order should be placed — even across many cycles.
+func TestFlattenNotDuplicatedWhileResting(t *testing.T) {
+	cfg := testConfig()
+	cfg.MaxInventory = 0.001
+	cfg.AutoFlatten = true
+	cfg.FlattenAggression = 0.001
+
+	ex := &mockExchange{state: exchange.StateSnapshot{
+		Inventory: 0.002,
+		Mid:       ptr(100_000),
+		// OpenOrders starts empty; filled in after first cycle below.
+	}}
+
+	mm := New(cfg, ex, testMarket())
+
+	// Cycle 1: no resting order yet → flatten placed, returns "order-1".
+	if err := mm.runCycle(context.Background()); err != nil {
+		t.Fatalf("cycle 1: %v", err)
+	}
+	if len(ex.placed) != 1 {
+		t.Fatalf("cycle 1: expected 1 PlaceOrder call, got %d", len(ex.placed))
+	}
+	flattenID := ex.placedIDs[0] // "order-1"
+	if mm.lastFlattenOrderID != flattenID {
+		t.Errorf("lastFlattenOrderID should be %q, got %q", flattenID, mm.lastFlattenOrderID)
+	}
+
+	// Simulate the order sitting on the book for cycles 2 and 3.
+	ex.state.OpenOrders = []exchange.OpenOrder{{OrderID: flattenID, MarketID: "0xmarket"}}
+
+	for cycle := 2; cycle <= 3; cycle++ {
+		if err := mm.runCycle(context.Background()); err != nil {
+			t.Fatalf("cycle %d: %v", cycle, err)
+		}
+	}
+
+	if len(ex.placed) != 1 {
+		t.Errorf("expected exactly 1 total PlaceOrder across 3 cycles, got %d", len(ex.placed))
+	}
+}
+
+// When the flatten order is filled (disappears from OpenOrders), the next cycle
+// should place a fresh flatten order.
+func TestFlattenReplacedAfterFill(t *testing.T) {
+	cfg := testConfig()
+	cfg.MaxInventory = 0.001
+	cfg.AutoFlatten = true
+	cfg.FlattenAggression = 0.001
+
+	ex := &mockExchange{state: exchange.StateSnapshot{
+		Inventory: 0.002,
+		Mid:       ptr(100_000),
+	}}
+
+	mm := New(cfg, ex, testMarket())
+
+	// Cycle 1: places flatten order "order-1".
+	if err := mm.runCycle(context.Background()); err != nil {
+		t.Fatalf("cycle 1: %v", err)
+	}
+	if len(ex.placed) != 1 {
+		t.Fatalf("cycle 1: expected 1 PlaceOrder, got %d", len(ex.placed))
+	}
+
+	// Cycle 2: order is gone from OpenOrders (filled) → new flatten placed.
+	ex.state.OpenOrders = nil // empty — order was filled
+	if err := mm.runCycle(context.Background()); err != nil {
+		t.Fatalf("cycle 2: %v", err)
+	}
+	if len(ex.placed) != 2 {
+		t.Errorf("expected 2 total PlaceOrder calls (fill + re-place), got %d", len(ex.placed))
+	}
+	if mm.lastFlattenOrderID != ex.placedIDs[1] {
+		t.Errorf("lastFlattenOrderID should be updated to %q, got %q",
+			ex.placedIDs[1], mm.lastFlattenOrderID)
+	}
+}
+
+// When inventory recovers below MaxInventory, lastFlattenOrderID must be cleared
+// so a fresh flatten is placed the next time inventory hits the limit.
+func TestFlattenIDClearedOnInventoryRecovery(t *testing.T) {
+	cfg := testConfig()
+	cfg.MaxInventory = 0.001
+	cfg.AutoFlatten = true
+	cfg.FlattenAggression = 0.001
+
+	ex := &mockExchange{state: exchange.StateSnapshot{
+		Inventory: 0.002, // at limit
+		Mid:       ptr(100_000),
+	}}
+
+	mm := New(cfg, ex, testMarket())
+
+	// Cycle 1: place flatten, get an order ID.
+	if err := mm.runCycle(context.Background()); err != nil {
+		t.Fatalf("cycle 1: %v", err)
+	}
+	if mm.lastFlattenOrderID == "" {
+		t.Fatal("lastFlattenOrderID should be set after placing flatten order")
+	}
+
+	// Inventory recovers.
+	ex.state.Inventory = 0.0005 // below MaxInventory
+	ex.state.OpenOrders = nil
+	if err := mm.runCycle(context.Background()); err != nil {
+		t.Fatalf("cycle 2 (recovery): %v", err)
+	}
+
+	if mm.lastFlattenOrderID != "" {
+		t.Errorf("lastFlattenOrderID should be cleared on inventory recovery, got %q",
+			mm.lastFlattenOrderID)
+	}
+}
+
+// The size-rounds-to-zero path (second call site) also deduplicates flatten orders.
+func TestFlattenDeduplicatesSizeZeroPath(t *testing.T) {
+	cfg := testConfig()
+	cfg.MaxInventory = 1.0   // high limit so invExceeded = false
+	cfg.OrderSize = 0.000001 // tiny order size rounds to zero lots
+	cfg.AutoFlatten = true
+	cfg.FlattenAggression = 0.001
+
+	market := testMarket()
+	market.LotSize = 0.001 // large lot makes size round to zero
+	market.MinSize = 0.001
+
+	ex := &mockExchange{state: exchange.StateSnapshot{
+		Inventory: 0.5, // has position but below the (high) MaxInventory
+		Mid:       ptr(100_000),
+	}}
+
+	mm := New(cfg, ex, market)
+
+	// Cycle 1: quotes == nil (size rounds to 0), flatten placed.
+	if err := mm.runCycle(context.Background()); err != nil {
+		t.Fatalf("cycle 1: %v", err)
+	}
+	if len(ex.placed) != 1 {
+		t.Fatalf("cycle 1: expected 1 PlaceOrder, got %d", len(ex.placed))
+	}
+	flattenID := ex.placedIDs[0]
+
+	// Simulate order still resting for cycles 2–3.
+	ex.state.OpenOrders = []exchange.OpenOrder{{OrderID: flattenID, MarketID: market.MarketID}}
+
+	for cycle := 2; cycle <= 3; cycle++ {
+		if err := mm.runCycle(context.Background()); err != nil {
+			t.Fatalf("cycle %d: %v", cycle, err)
+		}
+	}
+
+	if len(ex.placed) != 1 {
+		t.Errorf("expected exactly 1 PlaceOrder across 3 cycles (size-zero path), got %d",
+			len(ex.placed))
 	}
 }
 

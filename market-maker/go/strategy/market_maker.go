@@ -53,6 +53,12 @@ type MarketMaker struct {
 	// Margin recovery tracking: count cycles spent above MaxMarginUsage.
 	// After marginStuckThreshold cycles we log a CRITICAL alert.
 	marginHighCycles int
+
+	// lastFlattenOrderID records the most recently placed reduce-only flatten order.
+	// If this order is still present in state.OpenOrders we skip placing a new one,
+	// preventing unbounded accumulation of GTC flatten orders while inventory stays
+	// at the limit. Reset to "" when inventory recovers below MaxInventory.
+	lastFlattenOrderID string
 }
 
 // New creates a MarketMaker with the given exchange and market config.
@@ -149,6 +155,11 @@ func (m *MarketMaker) runCycle(ctx context.Context) error {
 	})
 
 	if math.Abs(state.Inventory) < m.cfg.MaxInventory {
+		if m.invLimitBulkCancelDone {
+			// Inventory has just recovered from the limit — reset both flags so we
+			// re-arm for the next limit event and allow a fresh flatten if needed.
+			m.lastFlattenOrderID = ""
+		}
 		m.invLimitBulkCancelDone = false
 	}
 
@@ -257,8 +268,16 @@ func (m *MarketMaker) runCycle(ctx context.Context) error {
 					"inventory", state.Inventory, "max", m.cfg.MaxInventory)
 			}
 			if m.cfg.AutoFlatten {
-				if _, err := m.placeFlattenOrder(ctx, state.Inventory, mid); err != nil && !errors.Is(err, ErrNoPositionToFlatten) {
-					return fmt.Errorf("flatten order: %w", err)
+				if m.shouldSkipFlatten(state.OpenOrders) {
+					slog.Info("flatten order already resting, skipping", "order_id", m.lastFlattenOrderID)
+				} else {
+					outcome, err := m.placeFlattenOrder(ctx, state.Inventory, mid)
+					if err != nil && !errors.Is(err, ErrNoPositionToFlatten) {
+						return fmt.Errorf("flatten order: %w", err)
+					}
+					if err == nil {
+						m.lastFlattenOrderID = outcome.OrderID
+					}
 				}
 			} else {
 				slog.Warn("at max inventory; manually flatten or enable --auto-flatten")
@@ -272,8 +291,16 @@ func (m *MarketMaker) runCycle(ctx context.Context) error {
 			return fmt.Errorf("cancel bulk orders: %w", err)
 		}
 		if m.cfg.AutoFlatten {
-			if _, err := m.placeFlattenOrder(ctx, state.Inventory, mid); err != nil && !errors.Is(err, ErrNoPositionToFlatten) {
-				return fmt.Errorf("flatten order: %w", err)
+			if m.shouldSkipFlatten(state.OpenOrders) {
+				slog.Info("flatten order already resting, skipping", "order_id", m.lastFlattenOrderID)
+			} else {
+				outcome, err := m.placeFlattenOrder(ctx, state.Inventory, mid)
+				if err != nil && !errors.Is(err, ErrNoPositionToFlatten) {
+					return fmt.Errorf("flatten order: %w", err)
+				}
+				if err == nil {
+					m.lastFlattenOrderID = outcome.OrderID
+				}
 			}
 		}
 		return nil
@@ -333,6 +360,23 @@ func (m *MarketMaker) cancelAllOrders(ctx context.Context, orders []exchange.Ope
 		}
 	}
 	return nOK, nFail, nil
+}
+
+// shouldSkipFlatten returns true if the last flatten order is still resting,
+// meaning we should not place another one this cycle. If the order is gone
+// (filled or externally cancelled) it clears lastFlattenOrderID and returns false.
+func (m *MarketMaker) shouldSkipFlatten(openOrders []exchange.OpenOrder) bool {
+	if m.lastFlattenOrderID == "" {
+		return false
+	}
+	for _, o := range openOrders {
+		if o.OrderID == m.lastFlattenOrderID {
+			return true // still resting
+		}
+	}
+	// Order is gone — allow re-placement.
+	m.lastFlattenOrderID = ""
+	return false
 }
 
 func (m *MarketMaker) placeFlattenOrder(ctx context.Context, inventory, mid float64) (exchange.PlaceOrderOutcome, error) {
