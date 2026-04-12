@@ -12,11 +12,11 @@ import (
 // ── Mock exchange ─────────────────────────────────────────────────────────────
 
 type mockExchange struct {
-	state             exchange.StateSnapshot
-	placed            []exchange.PlaceOrderRequest
-	bulkBids          []exchange.BulkOrderEntry
-	bulkAsks          []exchange.BulkOrderEntry
-	bulkCancelCalls   int
+	state           exchange.StateSnapshot
+	placed          []exchange.PlaceOrderRequest
+	bulkBids        []exchange.BulkOrderEntry
+	bulkAsks        []exchange.BulkOrderEntry
+	bulkCancelCalls int
 }
 
 func (m *mockExchange) FindMarket(_ context.Context, _ string) (*exchange.MarketConfig, error) {
@@ -49,8 +49,8 @@ func (m *mockExchange) CancelBulkOrders(_ context.Context) error {
 	return nil
 }
 func (m *mockExchange) CancelOrder(_ context.Context, _ string) error { return nil }
-func (m *mockExchange) WalletAddress() string                          { return "0xtest" }
-func (m *mockExchange) DryRun() bool                                   { return false }
+func (m *mockExchange) WalletAddress() string                         { return "0xtest" }
+func (m *mockExchange) DryRun() bool                                  { return false }
 func (m *mockExchange) GasBalance(_ context.Context) (float64, string, error) {
 	return 1.0, "APT", nil
 }
