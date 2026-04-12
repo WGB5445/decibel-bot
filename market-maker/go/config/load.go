@@ -218,16 +218,6 @@ func explicitEnvKeys() map[string]bool {
 			m["REFRESH_INTERVAL_JITTER_S"] = true
 		}
 	}
-	if v := os.Getenv("COOLDOWN_S"); v != "" {
-		if _, err := strconv.ParseFloat(v, 64); err == nil {
-			m["COOLDOWN_S"] = true
-		}
-	}
-	if v := os.Getenv("CANCEL_RESYNC_S"); v != "" {
-		if _, err := strconv.ParseFloat(v, 64); err == nil {
-			m["CANCEL_RESYNC_S"] = true
-		}
-	}
 	if v := os.Getenv("AUTO_FLATTEN"); v != "" {
 		if _, err := strconv.ParseBool(v); err == nil {
 			m["AUTO_FLATTEN"] = true
