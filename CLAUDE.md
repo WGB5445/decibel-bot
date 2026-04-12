@@ -14,20 +14,26 @@ repository ships a **Go 1.24+** implementation under `market-maker/go/` (Aptos I
 ```
 decibel-bot/
 └── market-maker/
-    ├── go/                          Go 1.24+ implementation
-    │   ├── main.go                  Entry: load .env → config.Load() → bot.Run()
-    │   ├── go.mod                   Module: decibel-mm-bot, go 1.24+
-    │   ├── .env.example             Credential + trading param template
-    │   ├── README.md                Usage and parameter reference
-    │   ├── config/config.go         Params; CLI flag > env > .env > default layering
-    │   ├── bot/bot.go               Main loop, runCycle(), adaptive spread state machine
-    │   ├── api/client.go            Decibel REST API; FetchState() parallel fetch
-    │   ├── aptos/client.go          aptos-go-sdk v1; SubmitEntryFunction()
-    │   ├── aptos/address.go         Named-object derivation (e.g. GlobalPerpEngine for logs)
+    ├── go/                              Go 1.24+ implementation
+    │   ├── main.go                      Entry: load .env → config.Load() → 3-layer wiring
+    │   ├── go.mod                       Module: decibel-mm-bot, go 1.24+
+    │   ├── .env.example                 Credential + trading param template
+    │   ├── README.md                    Usage and parameter reference
+    │   ├── config/config.go             Params; CLI flag > env > .env > default layering
+    │   ├── exchange/exchange.go         Exchange interface (abstract — strategy is exchange-agnostic)
+    │   ├── exchange/types.go            Shared types: MarketConfig, StateSnapshot, OpenOrder, etc.
+    │   ├── exchange/decibel/decibel.go  Decibel DEX implementation of Exchange; PlaceOrder/CancelOrder
+    │   ├── strategy/market_maker.go     Main loop, runCycle(), adaptive spread state machine
+    │   ├── botstate/state.go            Thread-safe shared state (inventory, mid, positions)
+    │   ├── api/client.go                Decibel REST API; FetchState() parallel fetch
+    │   ├── aptos/client.go              aptos-go-sdk v1; SubmitEntryFunction()
+    │   ├── aptos/address.go             Named-object derivation (e.g. GlobalPerpEngine for logs)
+    │   ├── notify/notify.go             Notifier interface
+    │   ├── notify/telegram/telegram.go  Telegram bot: command handler + alert dispatcher
     │   └── pricing/
-    │       ├── pricing.go           Pure ComputeQuotes() — no I/O, no side effects
-    │       └── pricing_test.go      Table-driven unit tests
-    └── 做市参数调优指南.md           Chinese parameter tuning guide
+    │       ├── pricing.go               Pure ComputeQuotes() — no I/O, no side effects
+    │       └── pricing_test.go          Table-driven unit tests
+    └── 做市参数调优指南.md               Chinese parameter tuning guide
 ```
 
 ---
@@ -186,6 +192,8 @@ go run . -dry-run    # validate config before going live
 ## Notes for AI Assistants
 
 - The pricing module is the most common change target — unit tests live in `pricing_test.go`
+- The main loop and adaptive spread logic live in `strategy/market_maker.go` (`runCycle`)
+- The Decibel-specific exchange wiring lives in `exchange/decibel/decibel.go`
 - `做市参数调优指南.md` is operational guidance for human traders; it does not require code changes
 - Go module name: `decibel-mm-bot`
 - Do not add error handling for impossible states (e.g. mid-price always positive inside `runCycle` — it's already guarded before the call)
