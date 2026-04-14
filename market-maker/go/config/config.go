@@ -92,6 +92,11 @@ type Config struct {
 	// LogVerbose enables extra REST DEBUG lines when LogLevel is debug. LOG_VERBOSE / -log-verbose.
 	LogVerbose bool
 
+	// LogTeeFile mirrors logs to a file: empty = off; "auto" = LOG_TEE_FILE_DIR + subaccount_market.log; else path. LOG_TEE_FILE / -log-tee-file.
+	LogTeeFile string
+	// LogTeeFileDir is the directory used when LogTeeFile is "auto" (default "."). LOG_TEE_FILE_DIR / -log-tee-file-dir.
+	LogTeeFileDir string
+
 	// ── Telegram ─────────────────────────────────────────────────────────────
 	TGBotToken               string // TG_BOT_TOKEN or -tg-token
 	TGAdminID                int64  // TG_ADMIN_ID or -tg-admin-id
@@ -123,6 +128,10 @@ func (c *Config) validate() error {
 	}
 	if c.LogFormat != "text" && c.LogFormat != "json" {
 		c.LogFormat = "text"
+	}
+
+	if strings.TrimSpace(c.LogTeeFileDir) == "" {
+		c.LogTeeFileDir = "."
 	}
 
 	// Clamp TGAlertInventoryInterval to avoid time.NewTicker(0) panic.

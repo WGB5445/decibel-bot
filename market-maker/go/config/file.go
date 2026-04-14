@@ -51,6 +51,8 @@ type FileConfig struct {
 	LogFormat             *string  `json:"log_format,omitempty"             yaml:"log_format,omitempty"             toml:"log_format,omitempty"`
 	LogCycleJSON          *bool    `json:"log_cycle_json,omitempty"       yaml:"log_cycle_json,omitempty"       toml:"log_cycle_json,omitempty"`
 	LogVerbose            *bool    `json:"log_verbose,omitempty"            yaml:"log_verbose,omitempty"            toml:"log_verbose,omitempty"`
+	LogTeeFile            *string  `json:"log_tee_file,omitempty"             yaml:"log_tee_file,omitempty"             toml:"log_tee_file,omitempty"`
+	LogTeeFileDir         *string  `json:"log_tee_file_dir,omitempty"       yaml:"log_tee_file_dir,omitempty"       toml:"log_tee_file_dir,omitempty"`
 }
 
 func decodeFileConfig(data []byte, ext string) (*FileConfig, error) {
@@ -233,6 +235,14 @@ func applyFileConfig(dst *Config, src *FileConfig, explicitFile map[string]bool)
 	if src.LogVerbose != nil {
 		dst.LogVerbose = *src.LogVerbose
 		set("LOG_VERBOSE")
+	}
+	if src.LogTeeFile != nil {
+		dst.LogTeeFile = strings.TrimSpace(*src.LogTeeFile)
+		set("LOG_TEE_FILE")
+	}
+	if src.LogTeeFileDir != nil {
+		dst.LogTeeFileDir = strings.TrimSpace(*src.LogTeeFileDir)
+		set("LOG_TEE_FILE_DIR")
 	}
 }
 

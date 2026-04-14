@@ -150,6 +150,9 @@ func newConfigFromEnvProfile(profile NetworkProfile, networkEnv string) *Config 
 		LogCycleJSON: envBool("LOG_CYCLE_JSON", false) || envBool("LOG_TRACE", false),
 		LogVerbose:   envBool("LOG_VERBOSE", false),
 
+		LogTeeFile:    strings.TrimSpace(os.Getenv("LOG_TEE_FILE")),
+		LogTeeFileDir: envStr("LOG_TEE_FILE_DIR", "."),
+
 		MarketName:             envStr("MARKET_NAME", "BTC/USD"),
 		Spread:                 envFloat("SPREAD", 0.001),
 		OrderSize:              envFloat("ORDER_SIZE", 0.001),
@@ -353,6 +356,12 @@ func explicitEnvKeys() map[string]bool {
 			m["LOG_VERBOSE"] = true
 		}
 	}
+	if strings.TrimSpace(os.Getenv("LOG_TEE_FILE")) != "" {
+		m["LOG_TEE_FILE"] = true
+	}
+	if strings.TrimSpace(os.Getenv("LOG_TEE_FILE_DIR")) != "" {
+		m["LOG_TEE_FILE_DIR"] = true
+	}
 	return m
 }
 
@@ -435,6 +444,8 @@ func registerAllFlags(fs *flag.FlagSet, cfg *Config) {
 	fs.StringVar(&cfg.LogFormat, "log-format", cfg.LogFormat, "Logger format: text | json (overrides LOG_FORMAT)")
 	fs.BoolVar(&cfg.LogCycleJSON, "log-cycle-json", cfg.LogCycleJSON, "Emit one JSON line per successful bulk quote cycle (overrides LOG_CYCLE_JSON / LOG_TRACE)")
 	fs.BoolVar(&cfg.LogVerbose, "log-verbose", cfg.LogVerbose, "Verbose REST GET logs when log-level is debug (overrides LOG_VERBOSE)")
+	fs.StringVar(&cfg.LogTeeFile, "log-tee-file", cfg.LogTeeFile, "Mirror logs to file: empty=off, auto=dir/subaccount_market.log, else path (overrides LOG_TEE_FILE)")
+	fs.StringVar(&cfg.LogTeeFileDir, "log-tee-file-dir", cfg.LogTeeFileDir, "Directory for log-tee-file=auto (overrides LOG_TEE_FILE_DIR)")
 
 	fs.StringVar(&cfg.BearerToken, "bearer-token", cfg.BearerToken, "Decibel REST bearer token (overrides BEARER_TOKEN)")
 	fs.StringVar(&cfg.SubaccountAddress, "subaccount", cfg.SubaccountAddress, "Subaccount object address (overrides SUBACCOUNT_ADDRESS)")
