@@ -448,8 +448,8 @@ func TestFlattenOrderPlacedWhenAutoFlattenOn(t *testing.T) {
 	if len(ex.placed) > 0 && !ex.placed[0].ReduceOnly {
 		t.Error("flatten order must be ReduceOnly=true")
 	}
-	if len(ex.placed) > 0 && ex.placed[0].TimeInForce != 1 {
-		t.Errorf("flatten order must use POST_ONLY (TimeInForce=1), got %d", ex.placed[0].TimeInForce)
+	if len(ex.placed) > 0 && ex.placed[0].TimeInForce != exchange.TimeInForcePostOnly {
+		t.Errorf("flatten order must use POST_ONLY (TimeInForce=%d), got %d", exchange.TimeInForcePostOnly, ex.placed[0].TimeInForce)
 	}
 }
 
@@ -709,6 +709,56 @@ func TestFlattenMaxDeviationCapsShortBuyPrice(t *testing.T) {
 	if ex.placed[0].Price < minAllowed {
 		t.Errorf("flatten buy price %.2f is below FlattenMaxDeviation floor %.2f",
 			ex.placed[0].Price, minAllowed)
+	}
+}
+
+// After tick rounding, price must still respect FlattenMaxDeviation (tick grid can
+// otherwise push buys below the floor or sells above the cap).
+func TestFlattenDeviationPostTickClampBuy(t *testing.T) {
+	cfg := testConfig()
+	cfg.FlattenAggression = 0.0025 // 100*(1-0.0025)=99.75 → Floor to tick 1 gives 99
+	cfg.FlattenMaxDeviation = 0.003
+	mid := 100.0
+	mkt := &exchange.MarketConfig{
+		MarketID: "0xmarket", MarketName: "TEST/USD",
+		TickSize: 1.0, LotSize: 0.00001, MinSize: 0.00001,
+	}
+	ex := &mockExchange{}
+	mm := New(cfg, ex, mkt)
+	ctx := context.Background()
+	if _, err := mm.placeFlattenOrder(ctx, -0.002, mid); err != nil {
+		t.Fatalf("placeFlattenOrder: %v", err)
+	}
+	if len(ex.placed) != 1 {
+		t.Fatalf("expected 1 placed order, got %d", len(ex.placed))
+	}
+	minAllowed := mid * (1.0 - cfg.FlattenMaxDeviation)
+	if ex.placed[0].Price < minAllowed {
+		t.Errorf("buy price %.2f below deviation floor %.2f after tick clamp", ex.placed[0].Price, minAllowed)
+	}
+}
+
+func TestFlattenDeviationPostTickClampSell(t *testing.T) {
+	cfg := testConfig()
+	cfg.FlattenAggression = 0.0025 // 100*(1+0.0025)=100.25 → Ceil to tick 1 gives 101
+	cfg.FlattenMaxDeviation = 0.003
+	mid := 100.0
+	mkt := &exchange.MarketConfig{
+		MarketID: "0xmarket", MarketName: "TEST/USD",
+		TickSize: 1.0, LotSize: 0.00001, MinSize: 0.00001,
+	}
+	ex := &mockExchange{}
+	mm := New(cfg, ex, mkt)
+	ctx := context.Background()
+	if _, err := mm.placeFlattenOrder(ctx, 0.002, mid); err != nil {
+		t.Fatalf("placeFlattenOrder: %v", err)
+	}
+	if len(ex.placed) != 1 {
+		t.Fatalf("expected 1 placed order, got %d", len(ex.placed))
+	}
+	maxAllowed := mid * (1.0 + cfg.FlattenMaxDeviation)
+	if ex.placed[0].Price > maxAllowed {
+		t.Errorf("sell price %.2f above deviation cap %.2f after tick clamp", ex.placed[0].Price, maxAllowed)
 	}
 }
 

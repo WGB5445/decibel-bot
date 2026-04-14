@@ -161,9 +161,9 @@ func (d *DecibelExchange) PlaceOrder(ctx context.Context, req exchange.PlaceOrde
 	label := "POST_ONLY"
 	if req.ReduceOnly {
 		switch req.TimeInForce {
-		case 1:
+		case exchange.TimeInForcePostOnly:
 			label = "reduce-only POST_ONLY"
-		case 2:
+		case exchange.TimeInForceIOC:
 			label = "reduce-only IOC"
 		default:
 			label = "reduce-only GTC"
@@ -207,9 +207,9 @@ func (d *DecibelExchange) PlaceOrder(ctx context.Context, req exchange.PlaceOrde
 	}
 	oid := aptos.OrderIDFromEvents(result.Events)
 	if oid != "" {
-		logging.Success("order placed", "side", side, "price", req.Price, "size", req.Size, "tx_hash", result.Hash, "order_id", oid)
+		logging.SuccessCtx(ctx, "order placed", "side", side, "price", req.Price, "size", req.Size, "tx_hash", result.Hash, "order_id", oid)
 	} else {
-		logging.Success("order placed", "side", side, "price", req.Price, "size", req.Size, "tx_hash", result.Hash)
+		logging.SuccessCtx(ctx, "order placed", "side", side, "price", req.Price, "size", req.Size, "tx_hash", result.Hash)
 	}
 	return exchange.PlaceOrderOutcome{TxHash: result.Hash, OrderID: oid}, nil
 }
@@ -364,7 +364,7 @@ func (d *DecibelExchange) PlaceBulkOrders(ctx context.Context, bids, asks []exch
 		)
 		return fmt.Errorf("place bulk orders failed: vm_status=%s", result.VMStatus)
 	}
-	logging.Success("bulk orders placed", "bids", len(bids), "asks", len(asks), "tx_hash", result.Hash)
+	logging.SuccessCtx(ctx, "bulk orders placed", "bids", len(bids), "asks", len(asks), "tx_hash", result.Hash)
 	slog.Info("bulk_orders_ok",
 		logctx.AppendAttrs(ctx,
 			"bids", len(bids), "asks", len(asks), "tx_hash", result.Hash,
@@ -435,7 +435,7 @@ func (d *DecibelExchange) CancelBulkOrders(ctx context.Context) error {
 		slog.Error("cancel bulk orders execution failed", logctx.AppendAttrs(ctx, "vm_status", result.VMStatus)...)
 		return fmt.Errorf("cancel bulk orders failed: vm_status=%s", result.VMStatus)
 	}
-	logging.Success("bulk orders cancelled", "tx_hash", result.Hash)
+	logging.SuccessCtx(ctx, "bulk orders cancelled", "tx_hash", result.Hash)
 	slog.Info("cancel_bulk_ok",
 		logctx.AppendAttrs(ctx,
 			"tx_hash", result.Hash,

@@ -37,9 +37,11 @@ func Setup(w io.Writer, cfg *config.Config) {
 		return
 	}
 
-	useColor := os.Getenv("NO_COLOR") == ""
-	if f, ok := w.(*os.File); ok && useColor {
-		useColor = term.IsTerminal(int(f.Fd()))
+	useColor := false
+	if os.Getenv("NO_COLOR") == "" {
+		if f, ok := w.(*os.File); ok {
+			useColor = term.IsTerminal(int(f.Fd()))
+		}
 	}
 	sh := &sharedWriter{
 		w:        w,

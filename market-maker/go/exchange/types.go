@@ -52,13 +52,20 @@ type PlaceOrderOutcome struct {
 	OrderID string
 }
 
+// Time-in-force values for PlaceOrderRequest.TimeInForce (matches on-chain u8).
+const (
+	TimeInForceGTC      = 0
+	TimeInForcePostOnly = 1
+	TimeInForceIOC      = 2
+)
+
 // PlaceOrderRequest describes an order to be placed.
 type PlaceOrderRequest struct {
 	MarketID    string
 	Price       float64
 	Size        float64
 	IsBuy       bool
-	TimeInForce int // 0=GTC, 1=POST_ONLY, 2=IOC
+	TimeInForce int // use TimeInForceGTC, TimeInForcePostOnly, TimeInForceIOC
 	ReduceOnly  bool
 }
 

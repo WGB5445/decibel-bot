@@ -36,9 +36,6 @@ const shutdownBulkCancelMaxAttempts = 3
 // maxOpenOrderIDsLogged is the max number of open orders for which we log order_ids (comma-separated).
 const maxOpenOrderIDsLogged = 5
 
-// flattenTimeInForce is POST_ONLY so flatten orders rest as maker (no immediate take).
-const flattenTimeInForce = 1 // exchange: 0=GTC, 1=POST_ONLY, 2=IOC
-
 // MarketMaker runs the inventory-skew market-making strategy.
 type MarketMaker struct {
 	cfg    *config.Config
@@ -546,6 +543,21 @@ func (m *MarketMaker) placeFlattenOrder(ctx context.Context, inventory, mid floa
 		rawPrice = math.Ceil(p/m.market.TickSize) * m.market.TickSize
 	}
 
+	if m.cfg.FlattenMaxDeviation > 0 {
+		tick := m.market.TickSize
+		if isBuy {
+			minPx := mid * (1.0 - m.cfg.FlattenMaxDeviation)
+			if rawPrice < minPx {
+				rawPrice = math.Ceil(minPx/tick) * tick
+			}
+		} else {
+			maxPx := mid * (1.0 + m.cfg.FlattenMaxDeviation)
+			if rawPrice > maxPx {
+				rawPrice = math.Floor(maxPx/tick) * tick
+			}
+		}
+	}
+
 	size := math.Round(absInv/m.market.LotSize) * m.market.LotSize
 	if size <= 0 || size < m.market.MinSize {
 		slog.Warn("flatten size too small, skipping",
@@ -561,7 +573,7 @@ func (m *MarketMaker) placeFlattenOrder(ctx context.Context, inventory, mid floa
 			"raw_price", rawPrice,
 			"size", size,
 			"is_buy", isBuy,
-			"tif", flattenTimeInForce,
+			"tif", exchange.TimeInForcePostOnly,
 			"reduce_only", true,
 			"flatten_aggression", m.cfg.FlattenAggression,
 			"flatten_max_deviation", m.cfg.FlattenMaxDeviation,
@@ -575,7 +587,7 @@ func (m *MarketMaker) placeFlattenOrder(ctx context.Context, inventory, mid floa
 		Price:       rawPrice,
 		Size:        size,
 		IsBuy:       isBuy,
-		TimeInForce: flattenTimeInForce,
+		TimeInForce: exchange.TimeInForcePostOnly,
 		ReduceOnly:  true,
 	})
 }

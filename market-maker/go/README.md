@@ -189,7 +189,7 @@ These override the values set by `NETWORK`. Leave unset to use the network profi
 | `LOG_TRACE` | _(env only)_ | `false` | Alias for `LOG_CYCLE_JSON`. |
 | `LOG_VERBOSE` | `-log-verbose` | `false` | When `true` and level is `debug`, log successful REST GET paths. **Failed** REST calls log at `WARN` regardless. |
 
-**Greppable `msg` / keys (examples):** `state_snapshot` (`cycle`, `mid_f`, `open_orders`, `order_ids` when few orders), `mm_place_bulk`, `place_bulk_payload`, `flatten_intent`, `dex_place_order`, `dex_cancel_order`, `dex_cancel_order_ok`, `dex_cancel_order_skip`, `cancel_bulk_ok`, `cancel_bulk_skip`, `bulk_orders_ok`. On-chain paths also attach `cycle` when the call originates from the main MM loop (`context` from `logctx.WithCycle`). **Secrets are never logged** (no bearer token or private key in log fields).
+**Greppable `msg` / keys (examples):** `state_snapshot` (`cycle`, `mid_f`, `open_orders`, `order_ids` when few orders), `mm_place_bulk`, `place_bulk_payload`, `flatten_intent`, `dex_place_order`, `dex_cancel_order`, `dex_cancel_order_ok`, `dex_cancel_order_skip`, `cancel_bulk_ok`, `cancel_bulk_skip`, `bulk_orders_ok`. Most Decibel `slog` lines and green **Success** lines (`order placed`, `bulk orders placed`, …) include `cycle` when the request `context` was wrapped with `logctx.WithCycle` in the MM loop. `logging.Cycle` banners pass `cycle` as an explicit log attribute. **Secrets are never logged** (no bearer token or private key in log fields).
 
 ---
 

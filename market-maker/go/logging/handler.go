@@ -142,34 +142,35 @@ func formatAttr(group string, a slog.Attr) string {
 	var buf strings.Builder
 	buf.WriteString(key)
 	buf.WriteByte('=')
-	switch a.Value.Kind() {
+	v := a.Value.Resolve()
+	switch v.Kind() {
 	case slog.KindString:
-		s := a.Value.String()
+		s := v.String()
 		if strings.ContainsAny(s, " \t\n\"=") {
 			fmt.Fprintf(&buf, "%q", s)
 		} else {
 			buf.WriteString(s)
 		}
 	case slog.KindInt64:
-		fmt.Fprintf(&buf, "%d", a.Value.Int64())
+		fmt.Fprintf(&buf, "%d", v.Int64())
 	case slog.KindUint64:
-		fmt.Fprintf(&buf, "%d", a.Value.Uint64())
+		fmt.Fprintf(&buf, "%d", v.Uint64())
 	case slog.KindFloat64:
-		fmt.Fprintf(&buf, "%g", a.Value.Float64())
+		fmt.Fprintf(&buf, "%g", v.Float64())
 	case slog.KindBool:
-		fmt.Fprintf(&buf, "%t", a.Value.Bool())
+		fmt.Fprintf(&buf, "%t", v.Bool())
 	case slog.KindDuration:
-		buf.WriteString(a.Value.Duration().String())
+		buf.WriteString(v.Duration().String())
 	case slog.KindTime:
-		buf.WriteString(a.Value.Time().Format(time.RFC3339Nano))
+		buf.WriteString(v.Time().Format(time.RFC3339Nano))
 	case slog.KindAny:
-		if err, ok := a.Value.Any().(error); ok {
+		if err, ok := v.Any().(error); ok {
 			fmt.Fprintf(&buf, "%q", err.Error())
 		} else {
-			fmt.Fprintf(&buf, "%v", a.Value.Any())
+			fmt.Fprintf(&buf, "%v", v.Any())
 		}
 	default:
-		buf.WriteString(a.Value.String())
+		buf.WriteString(v.String())
 	}
 	return buf.String()
 }
