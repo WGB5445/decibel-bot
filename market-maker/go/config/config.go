@@ -61,7 +61,11 @@ type Config struct {
 	// Long (sell): price capped at mid×(1+dev). Short (buy): price floored at mid×(1−dev).
 	// 0 disables the bound.
 	FlattenMaxDeviation float64
-	DryRun              bool
+	// FlattenRepriceStallCycles: when >0 and auto-flatten has a resting reduce-only order
+	// for this many consecutive cycles, cancel it and place again (same aggression, new mid).
+	// 0 disables this behavior (legacy: single resting flatten until fill or external cancel).
+	FlattenRepriceStallCycles int
+	DryRun                    bool
 
 	// ── Adaptive spread ───────────────────────────────────────────────────────
 	AutoSpread         bool
@@ -96,6 +100,10 @@ type Config struct {
 	LogTeeFile string
 	// LogTeeFileDir is the directory used when LogTeeFile is "auto" (default "."). LOG_TEE_FILE_DIR / -log-tee-file-dir.
 	LogTeeFileDir string
+	// LogTeeAsyncIntervalMS when >0, tee file writes use a background worker with this ticker interval (ms); 0 = flush after each line on the hot path. LOG_TEE_ASYNC_MS / -log-tee-async-ms.
+	LogTeeAsyncIntervalMS int
+	// LogTeeFsync when true, fsync after each tee flush (slow; helps tail -f on NFS). LOG_TEE_FSYNC / -log-tee-fsync.
+	LogTeeFsync bool
 
 	// ── Telegram ─────────────────────────────────────────────────────────────
 	TGBotToken               string // TG_BOT_TOKEN or -tg-token
@@ -134,6 +142,13 @@ func (c *Config) validate() error {
 		c.LogTeeFileDir = "."
 	}
 
+	if c.LogTeeAsyncIntervalMS < 0 {
+		return fmt.Errorf("LOG_TEE_ASYNC_MS (-log-tee-async-ms) must be >= 0, got %d", c.LogTeeAsyncIntervalMS)
+	}
+	if c.LogTeeAsyncIntervalMS > 60_000 {
+		c.LogTeeAsyncIntervalMS = 60_000
+	}
+
 	// Clamp TGAlertInventoryInterval to avoid time.NewTicker(0) panic.
 	if c.TGAlertInventoryInterval <= 0 {
 		c.TGAlertInventoryInterval = 30
@@ -141,6 +156,10 @@ func (c *Config) validate() error {
 
 	if c.RefreshIntervalJitterS < 0 {
 		return fmt.Errorf("REFRESH_INTERVAL_JITTER_S (-refresh-interval-jitter) must be >= 0, got %v", c.RefreshIntervalJitterS)
+	}
+
+	if c.FlattenRepriceStallCycles < 0 {
+		return fmt.Errorf("FLATTEN_REPRICE_STALL_CYCLES (-flatten-reprice-stall-cycles) must be >= 0, got %d", c.FlattenRepriceStallCycles)
 	}
 
 	if c.ShutdownCancelTimeoutS <= 0 {
@@ -356,6 +375,15 @@ func envInt64(key string, def int64) int64 {
 	if v := os.Getenv(key); v != "" {
 		if i, err := strconv.ParseInt(v, 10, 64); err == nil {
 			return i
+		}
+	}
+	return def
+}
+
+func envInt(key string, def int) int {
+	if v := os.Getenv(key); v != "" {
+		if i, err := strconv.ParseInt(v, 10, 64); err == nil {
+			return int(i)
 		}
 	}
 	return def

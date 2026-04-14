@@ -5,6 +5,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"log/slog"
 	"math"
 	"os"
@@ -67,10 +68,10 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	var logTeeF *os.File
+	var logTee io.WriteCloser
 	defer func() {
-		if logTeeF != nil {
-			_ = logTeeF.Close()
+		if logTee != nil {
+			_ = logTee.Close()
 		}
 	}()
 
@@ -117,9 +118,12 @@ func main() {
 			slog.Error("log tee open file", "path", teePath, "err", err)
 			os.Exit(1)
 		}
-		logTeeF = f
-		logging.Setup(os.Stderr, cfg, f)
-		slog.Info("log tee enabled", "path", teePath)
+		logTee = logging.TeeFileWriter(f, cfg.LogTeeAsyncIntervalMS, cfg.LogTeeFsync)
+		logging.Setup(os.Stderr, cfg, logTee)
+		slog.Info("log tee enabled", "path", teePath,
+			"tee_async_ms", cfg.LogTeeAsyncIntervalMS,
+			"tee_fsync", cfg.LogTeeFsync,
+		)
 	}
 
 	slog.Info("market config loaded",

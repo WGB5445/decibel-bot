@@ -27,8 +27,9 @@ type FileConfig struct {
 	ShutdownCancelTimeout *float64 `json:"shutdown_cancel_timeout,omitempty" yaml:"shutdown_cancel_timeout,omitempty" toml:"shutdown_cancel_timeout,omitempty"`
 	AutoFlatten           *bool    `json:"auto_flatten,omitempty"           yaml:"auto_flatten,omitempty"           toml:"auto_flatten,omitempty"`
 	FlattenAggression     *float64 `json:"flatten_aggression,omitempty"      yaml:"flatten_aggression,omitempty"      toml:"flatten_aggression,omitempty"`
-	FlattenMaxDeviation   *float64 `json:"flatten_max_deviation,omitempty"   yaml:"flatten_max_deviation,omitempty"   toml:"flatten_max_deviation,omitempty"`
-	DryRun                *bool    `json:"dry_run,omitempty"                 yaml:"dry_run,omitempty"                 toml:"dry_run,omitempty"`
+	FlattenMaxDeviation         *float64 `json:"flatten_max_deviation,omitempty"           yaml:"flatten_max_deviation,omitempty"           toml:"flatten_max_deviation,omitempty"`
+	FlattenRepriceStallCycles *int     `json:"flatten_reprice_stall_cycles,omitempty"    yaml:"flatten_reprice_stall_cycles,omitempty"    toml:"flatten_reprice_stall_cycles,omitempty"`
+	DryRun                      *bool    `json:"dry_run,omitempty"                         yaml:"dry_run,omitempty"                         toml:"dry_run,omitempty"`
 	AutoSpread            *bool    `json:"auto_spread,omitempty"            yaml:"auto_spread,omitempty"            toml:"auto_spread,omitempty"`
 	SpreadMin             *float64 `json:"spread_min,omitempty"             yaml:"spread_min,omitempty"             toml:"spread_min,omitempty"`
 	SpreadMax             *float64 `json:"spread_max,omitempty"             yaml:"spread_max,omitempty"             toml:"spread_max,omitempty"`
@@ -51,8 +52,10 @@ type FileConfig struct {
 	LogFormat             *string  `json:"log_format,omitempty"             yaml:"log_format,omitempty"             toml:"log_format,omitempty"`
 	LogCycleJSON          *bool    `json:"log_cycle_json,omitempty"       yaml:"log_cycle_json,omitempty"       toml:"log_cycle_json,omitempty"`
 	LogVerbose            *bool    `json:"log_verbose,omitempty"            yaml:"log_verbose,omitempty"            toml:"log_verbose,omitempty"`
-	LogTeeFile            *string  `json:"log_tee_file,omitempty"             yaml:"log_tee_file,omitempty"             toml:"log_tee_file,omitempty"`
-	LogTeeFileDir         *string  `json:"log_tee_file_dir,omitempty"       yaml:"log_tee_file_dir,omitempty"       toml:"log_tee_file_dir,omitempty"`
+	LogTeeFile                *string `json:"log_tee_file,omitempty"                  yaml:"log_tee_file,omitempty"                  toml:"log_tee_file,omitempty"`
+	LogTeeFileDir             *string `json:"log_tee_file_dir,omitempty"                yaml:"log_tee_file_dir,omitempty"                toml:"log_tee_file_dir,omitempty"`
+	LogTeeAsyncIntervalMS     *int    `json:"log_tee_async_ms,omitempty"              yaml:"log_tee_async_ms,omitempty"              toml:"log_tee_async_ms,omitempty"`
+	LogTeeFsync               *bool   `json:"log_tee_fsync,omitempty"                 yaml:"log_tee_fsync,omitempty"                 toml:"log_tee_fsync,omitempty"`
 }
 
 func decodeFileConfig(data []byte, ext string) (*FileConfig, error) {
@@ -143,6 +146,10 @@ func applyFileConfig(dst *Config, src *FileConfig, explicitFile map[string]bool)
 	if src.FlattenMaxDeviation != nil {
 		dst.FlattenMaxDeviation = *src.FlattenMaxDeviation
 		set("FLATTEN_MAX_DEVIATION")
+	}
+	if src.FlattenRepriceStallCycles != nil {
+		dst.FlattenRepriceStallCycles = *src.FlattenRepriceStallCycles
+		set("FLATTEN_REPRICE_STALL_CYCLES")
 	}
 	if src.DryRun != nil {
 		dst.DryRun = *src.DryRun
@@ -243,6 +250,14 @@ func applyFileConfig(dst *Config, src *FileConfig, explicitFile map[string]bool)
 	if src.LogTeeFileDir != nil {
 		dst.LogTeeFileDir = strings.TrimSpace(*src.LogTeeFileDir)
 		set("LOG_TEE_FILE_DIR")
+	}
+	if src.LogTeeAsyncIntervalMS != nil {
+		dst.LogTeeAsyncIntervalMS = *src.LogTeeAsyncIntervalMS
+		set("LOG_TEE_ASYNC_MS")
+	}
+	if src.LogTeeFsync != nil {
+		dst.LogTeeFsync = *src.LogTeeFsync
+		set("LOG_TEE_FSYNC")
 	}
 }
 

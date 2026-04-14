@@ -91,7 +91,7 @@ Returns `nil` when `|inventory| >= max_inventory` (stop quoting) or size rounds 
 - **Fill detected** (inventory changed by > `lot_size × 0.5`): widen by `spread_step × 0.5`,
   capped at the initial `cfg.Spread`
 - **No fill for N cycles** (`SPREAD_NO_FILL_CYCLES`): narrow by `spread_step`, floored at
-  `SPREAD_MIN`
+  `SPREAD_MIN` — **not counted while `|inventory| ≥ MAX_INVENTORY`** (no bulk quotes that cycle)
 - When `AUTO_SPREAD=false` (default): only log a suggestion — never mutate the spread
 
 ### Aptos transaction lifecycle
@@ -167,6 +167,7 @@ which can then be individually overridden.
 | `SKEW_PER_UNIT` | `0.0001` | Extra half-spread per unit of inventory |
 | `REFRESH_INTERVAL` | `20.0` | Seconds between cycles |
 | `DRY_RUN` | `false` | Log without sending transactions |
+| `FLATTEN_REPRICE_STALL_CYCLES` | `0` | With `AUTO_FLATTEN`, cancel and re-place the resting flatten after N consecutive cycles (`0` = never) |
 | `AUTO_SPREAD` | `false` | Enable adaptive spread adjustment |
 
 `NODE_API_KEY` falls back to `BEARER_TOKEN` if unset.

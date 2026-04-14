@@ -69,8 +69,15 @@ func (m *mockExchange) CancelBulkOrders(_ context.Context) error {
 	}
 	return nil
 }
-func (m *mockExchange) CancelOrder(_ context.Context, _ string) error {
+func (m *mockExchange) CancelOrder(_ context.Context, id string) error {
 	m.cancelOrderCalls++
+	var kept []exchange.OpenOrder
+	for _, o := range m.state.OpenOrders {
+		if o.OrderID != id {
+			kept = append(kept, o)
+		}
+	}
+	m.state.OpenOrders = kept
 	return nil
 }
 func (m *mockExchange) WalletAddress() string { return "0xtest" }
@@ -211,6 +218,39 @@ func TestNoFillNarrowsSpreadWhenAutoSpread(t *testing.T) {
 	if mm.effectiveSpread >= spreadBefore {
 		t.Errorf("spread should narrow after %d no-fill cycles: before=%.6f after=%.6f",
 			cfg.SpreadNoFillCycles, spreadBefore, mm.effectiveSpread)
+	}
+}
+
+// At max inventory the bot does not place bulk quotes; no-fill cycles must not narrow spread.
+func TestNoFillDoesNotAccumulateAtMaxInventory(t *testing.T) {
+	cfg := testConfig()
+	cfg.MaxInventory = 0.001
+	cfg.SpreadNoFillCycles = 2
+	cfg.AutoSpread = true
+	cfg.AutoFlatten = false
+
+	ex := &mockExchange{state: exchange.StateSnapshot{
+		Inventory: 0.002,
+		Mid:       ptr(100_000),
+	}}
+
+	mm := New(cfg, ex, testMarket())
+	spreadWant := cfg.Spread
+
+	if err := mm.runCycle(context.Background(), 1); err != nil {
+		t.Fatalf("cycle 1: %v", err)
+	}
+	for i := 0; i < 8; i++ {
+		if err := mm.runCycle(context.Background(), 1); err != nil {
+			t.Fatalf("cycle %d: %v", i+2, err)
+		}
+	}
+
+	if mm.effectiveSpread != spreadWant {
+		t.Errorf("at max inventory spread must stay %.6f, got %.6f", spreadWant, mm.effectiveSpread)
+	}
+	if mm.noFillCycles != 0 {
+		t.Errorf("noFillCycles should stay 0 at max inventory, got %d", mm.noFillCycles)
 	}
 }
 
@@ -949,6 +989,57 @@ func TestFlattenNotDuplicatedWhileResting(t *testing.T) {
 
 	if len(ex.placed) != 1 {
 		t.Errorf("expected exactly 1 total PlaceOrder across 3 cycles, got %d", len(ex.placed))
+	}
+	if ex.cancelOrderCalls != 0 {
+		t.Errorf("with FlattenRepriceStallCycles=0, expected no CancelOrder, got %d", ex.cancelOrderCalls)
+	}
+}
+
+// After N consecutive cycles with the same resting flatten order, cancel and re-place once.
+func TestFlattenRepriceAfterStallCycles(t *testing.T) {
+	cfg := testConfig()
+	cfg.MaxInventory = 0.001
+	cfg.AutoFlatten = true
+	cfg.FlattenAggression = 0.001
+	cfg.FlattenRepriceStallCycles = 2
+
+	ex := &mockExchange{state: exchange.StateSnapshot{
+		Inventory: 0.002,
+		Mid:       ptr(100_000),
+	}}
+
+	mm := New(cfg, ex, testMarket())
+
+	if err := mm.runCycle(context.Background(), 1); err != nil {
+		t.Fatalf("cycle 1: %v", err)
+	}
+	if len(ex.placed) != 1 {
+		t.Fatalf("cycle 1: expected 1 PlaceOrder, got %d", len(ex.placed))
+	}
+	flattenID := ex.placedIDs[0]
+	ex.state.OpenOrders = []exchange.OpenOrder{{OrderID: flattenID, MarketID: "0xmarket"}}
+
+	if err := mm.runCycle(context.Background(), 2); err != nil {
+		t.Fatalf("cycle 2: %v", err)
+	}
+	if ex.cancelOrderCalls != 0 {
+		t.Fatalf("cycle 2: expected no cancel yet, got %d", ex.cancelOrderCalls)
+	}
+	if len(ex.placed) != 1 {
+		t.Fatalf("cycle 2: expected still 1 PlaceOrder, got %d", len(ex.placed))
+	}
+
+	if err := mm.runCycle(context.Background(), 3); err != nil {
+		t.Fatalf("cycle 3: %v", err)
+	}
+	if ex.cancelOrderCalls != 1 {
+		t.Fatalf("cycle 3: expected 1 CancelOrder, got %d", ex.cancelOrderCalls)
+	}
+	if len(ex.placed) != 2 {
+		t.Fatalf("cycle 3: expected 2 PlaceOrder total, got %d", len(ex.placed))
+	}
+	if mm.lastFlattenOrderID != ex.placedIDs[1] {
+		t.Errorf("lastFlattenOrderID want %q got %q", ex.placedIDs[1], mm.lastFlattenOrderID)
 	}
 }
 
