@@ -1,6 +1,6 @@
 module decibel-mm-bot
 
-go 1.24.0
+go 1.25.0
 
 require (
 	github.com/aptos-labs/aptos-go-sdk v1.12.1
@@ -8,6 +8,7 @@ require (
 	github.com/joho/godotenv v1.5.1
 	github.com/pelletier/go-toml/v2 v2.3.0
 	golang.org/x/sync v0.6.0
+	golang.org/x/term v0.39.0
 	gopkg.in/yaml.v3 v3.0.1
 )
 
@@ -19,5 +20,5 @@ require (
 	github.com/hasura/go-graphql-client v0.15.1 // indirect
 	github.com/hdevalence/ed25519consensus v0.2.0 // indirect
 	golang.org/x/crypto v0.46.0 // indirect
-	golang.org/x/sys v0.39.0 // indirect
+	golang.org/x/sys v0.43.0 // indirect
 )

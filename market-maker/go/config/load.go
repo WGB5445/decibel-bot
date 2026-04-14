@@ -131,9 +131,27 @@ func LoadWith(opts LoadOptions) (*Config, error) {
 	return cfg, cfg.validate()
 }
 
+// envLocale reads BOT_LOCALE first, then LOCALE, default "zh".
+func envLocale() string {
+	if v := strings.TrimSpace(os.Getenv("BOT_LOCALE")); v != "" {
+		return v
+	}
+	return envStr("LOCALE", "zh")
+}
+
 func newConfigFromEnvProfile(profile NetworkProfile, networkEnv string) *Config {
 	return &Config{
 		Network: networkEnv,
+
+		Locale: envLocale(),
+
+		LogLevel:     strings.ToLower(strings.TrimSpace(envStr("LOG_LEVEL", "info"))),
+		LogFormat:    strings.ToLower(strings.TrimSpace(envStr("LOG_FORMAT", "text"))),
+		LogCycleJSON: envBool("LOG_CYCLE_JSON", false) || envBool("LOG_TRACE", false),
+		LogVerbose:   envBool("LOG_VERBOSE", false),
+
+		LogTeeFile:    strings.TrimSpace(os.Getenv("LOG_TEE_FILE")),
+		LogTeeFileDir: envStr("LOG_TEE_FILE_DIR", "."),
 
 		MarketName:             envStr("MARKET_NAME", "BTC/USD"),
 		Spread:                 envFloat("SPREAD", 0.001),
@@ -178,6 +196,12 @@ func newConfigFromEnvProfile(profile NetworkProfile, networkEnv string) *Config 
 // Numeric / bool keys: non-empty getenv and successful parse (matches envFloat/envBool).
 func explicitEnvKeys() map[string]bool {
 	m := make(map[string]bool)
+	if os.Getenv("LOCALE") != "" {
+		m["LOCALE"] = true
+	}
+	if os.Getenv("BOT_LOCALE") != "" {
+		m["BOT_LOCALE"] = true
+	}
 	if os.Getenv("NETWORK") != "" {
 		m["NETWORK"] = true
 	}
@@ -311,6 +335,33 @@ func explicitEnvKeys() map[string]bool {
 			m["TG_STRICT_START"] = true
 		}
 	}
+	if strings.TrimSpace(os.Getenv("LOG_LEVEL")) != "" {
+		m["LOG_LEVEL"] = true
+	}
+	if strings.TrimSpace(os.Getenv("LOG_FORMAT")) != "" {
+		m["LOG_FORMAT"] = true
+	}
+	if v := os.Getenv("LOG_CYCLE_JSON"); v != "" {
+		if _, err := strconv.ParseBool(v); err == nil {
+			m["LOG_CYCLE_JSON"] = true
+		}
+	}
+	if v := os.Getenv("LOG_TRACE"); v != "" {
+		if _, err := strconv.ParseBool(v); err == nil {
+			m["LOG_TRACE"] = true
+		}
+	}
+	if v := os.Getenv("LOG_VERBOSE"); v != "" {
+		if _, err := strconv.ParseBool(v); err == nil {
+			m["LOG_VERBOSE"] = true
+		}
+	}
+	if strings.TrimSpace(os.Getenv("LOG_TEE_FILE")) != "" {
+		m["LOG_TEE_FILE"] = true
+	}
+	if strings.TrimSpace(os.Getenv("LOG_TEE_FILE_DIR")) != "" {
+		m["LOG_TEE_FILE_DIR"] = true
+	}
 	return m
 }
 
@@ -364,6 +415,7 @@ func configPathFromCLI(envPath string, args []string) string {
 func registerAllFlags(fs *flag.FlagSet, cfg *Config) {
 	fs.StringVar(&cfg.Network, "network", cfg.Network,
 		"Network preset: testnet | mainnet  (sets default URLs and package address)")
+	fs.StringVar(&cfg.Locale, "locale", cfg.Locale, "UI language for Telegram copy: zh | en (overrides LOCALE / BOT_LOCALE)")
 	fs.StringVar(&cfg.MarketName, "market-name", cfg.MarketName, "Market symbol (e.g. BTC/USD)")
 	fs.Float64Var(&cfg.Spread, "spread", cfg.Spread, "Total spread fraction (0.001 = 0.1%)")
 	fs.Float64Var(&cfg.OrderSize, "order-size", cfg.OrderSize, "Base units per side per quote")
@@ -376,8 +428,8 @@ func registerAllFlags(fs *flag.FlagSet, cfg *Config) {
 	fs.Float64Var(&cfg.ShutdownCancelTimeoutS, "shutdown-cancel-timeout", cfg.ShutdownCancelTimeoutS,
 		"Seconds; time budget for graceful shutdown bulk cancel (CancelBulkOrders); min 5 after validation")
 	fs.BoolVar(&cfg.AutoFlatten, "auto-flatten", cfg.AutoFlatten, "Auto reduce-only order when inventory hits limit")
-	fs.Float64Var(&cfg.FlattenAggression, "flatten-aggression", cfg.FlattenAggression, "Flatten order price offset from mid")
-	fs.Float64Var(&cfg.FlattenMaxDeviation, "flatten-max-deviation", cfg.FlattenMaxDeviation, "Max price deviation from mid for flatten orders (0 = no cap)")
+	fs.Float64Var(&cfg.FlattenAggression, "flatten-aggression", cfg.FlattenAggression, "POST_ONLY flatten: fraction above mid (sell) / below mid (buy); mid is API reference")
+	fs.Float64Var(&cfg.FlattenMaxDeviation, "flatten-max-deviation", cfg.FlattenMaxDeviation, "Cap sell / floor buy vs mid for POST_ONLY flatten (0 = no bound)")
 	fs.BoolVar(&cfg.DryRun, "dry-run", cfg.DryRun, "Log without sending transactions")
 	fs.BoolVar(&cfg.AutoSpread, "auto-spread", cfg.AutoSpread, "Automatically narrow spread after spread-no-fill-cycles cycles with no fill")
 	fs.Float64Var(&cfg.SpreadMin, "spread-min", cfg.SpreadMin, "Minimum spread the auto-adjuster will narrow to")
@@ -387,6 +439,13 @@ func registerAllFlags(fs *flag.FlagSet, cfg *Config) {
 	fs.StringVar(&cfg.PackageAddress, "package-address", cfg.PackageAddress, "Move package address (overrides network profile)")
 	fs.StringVar(&cfg.AptosFullnodeURL, "fullnode-url", cfg.AptosFullnodeURL, "Aptos fullnode URL (overrides network profile)")
 	fs.StringVar(&cfg.RestAPIBase, "api-base", cfg.RestAPIBase, "Decibel REST API base URL (overrides network profile)")
+
+	fs.StringVar(&cfg.LogLevel, "log-level", cfg.LogLevel, "Logger level: debug | info | warn | error (overrides LOG_LEVEL)")
+	fs.StringVar(&cfg.LogFormat, "log-format", cfg.LogFormat, "Logger format: text | json (overrides LOG_FORMAT)")
+	fs.BoolVar(&cfg.LogCycleJSON, "log-cycle-json", cfg.LogCycleJSON, "Emit one JSON line per successful bulk quote cycle (overrides LOG_CYCLE_JSON / LOG_TRACE)")
+	fs.BoolVar(&cfg.LogVerbose, "log-verbose", cfg.LogVerbose, "Verbose REST GET logs when log-level is debug (overrides LOG_VERBOSE)")
+	fs.StringVar(&cfg.LogTeeFile, "log-tee-file", cfg.LogTeeFile, "Mirror logs to file: empty=off, auto=dir/subaccount_market.log, else path (overrides LOG_TEE_FILE)")
+	fs.StringVar(&cfg.LogTeeFileDir, "log-tee-file-dir", cfg.LogTeeFileDir, "Directory for log-tee-file=auto (overrides LOG_TEE_FILE_DIR)")
 
 	fs.StringVar(&cfg.BearerToken, "bearer-token", cfg.BearerToken, "Decibel REST bearer token (overrides BEARER_TOKEN)")
 	fs.StringVar(&cfg.SubaccountAddress, "subaccount", cfg.SubaccountAddress, "Subaccount object address (overrides SUBACCOUNT_ADDRESS)")

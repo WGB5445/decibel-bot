@@ -4,16 +4,21 @@ package strategy
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
 	"math"
+	"strings"
 	"sync"
 	"time"
 
+	"decibel-mm-bot/api"
 	"decibel-mm-bot/botstate"
 	"decibel-mm-bot/config"
 	"decibel-mm-bot/exchange"
+	"decibel-mm-bot/logctx"
+	"decibel-mm-bot/logging"
 	"decibel-mm-bot/pricing"
 )
 
@@ -27,6 +32,9 @@ const marginStuckThreshold = 100
 
 // shutdownBulkCancelMaxAttempts limits REST/Aptos retries for CancelBulkOrders during shutdown.
 const shutdownBulkCancelMaxAttempts = 3
+
+// maxOpenOrderIDsLogged is the max number of open orders for which we log order_ids (comma-separated).
+const maxOpenOrderIDsLogged = 5
 
 // MarketMaker runs the inventory-skew market-making strategy.
 type MarketMaker struct {
@@ -59,7 +67,7 @@ type MarketMaker struct {
 
 	// lastFlattenOrderID records the most recently placed reduce-only flatten order.
 	// If this order is still present in state.OpenOrders we skip placing a new one,
-	// preventing unbounded accumulation of GTC flatten orders while inventory stays
+	// preventing unbounded accumulation of POST_ONLY flatten orders while inventory stays
 	// at the limit. Reset to "" when inventory recovers below MaxInventory.
 	lastFlattenOrderID string
 }
@@ -107,21 +115,21 @@ func (m *MarketMaker) FlattenPosition(ctx context.Context) (exchange.PlaceOrderO
 // Run starts the main market-making loop. Blocks until ctx is cancelled.
 func (m *MarketMaker) Run(ctx context.Context) error {
 	for cycle := uint64(1); ; cycle++ {
-		slog.Info("─── cycle start ────────────────────────────────────", "cycle", cycle)
+		logging.Cycle("─── cycle start ────────────────────────────────────", "cycle", cycle)
 
-		if err := m.runCycle(ctx); err != nil {
+		if err := m.runCycle(ctx, cycle); err != nil {
 			slog.Error("cycle failed", "cycle", cycle, "err", err)
 		}
 
 		sleep := cycleSleepDuration(m.cfg.RefreshInterval, m.cfg.RefreshIntervalJitterS)
-		slog.Info("sleeping",
+		logging.Cycle("sleeping",
 			"refresh_interval", m.cfg.RefreshInterval,
 			"refresh_interval_jitter", m.cfg.RefreshIntervalJitterS,
 			"sleep_seconds", sleep.Seconds(),
 		)
 		select {
 		case <-ctx.Done():
-			slog.Info("shutting down", "reason", ctx.Err())
+			logging.Cycle("shutting down", "reason", ctx.Err())
 			if err := m.shutdownCancelQuotes(); err != nil {
 				return fmt.Errorf("shutdown cancel: %w", err)
 			}
@@ -133,12 +141,12 @@ func (m *MarketMaker) Run(ctx context.Context) error {
 
 // shutdownCancelQuotes revokes bulk market-making quotes for the configured market only.
 // It uses a fresh timeout context because the main ctx is already cancelled on SIGINT/SIGTERM.
-// Single resting orders (e.g. GTC auto-flatten) are not cancelled here by design.
+// Single resting orders (e.g. POST_ONLY auto-flatten) are not cancelled here by design.
 func (m *MarketMaker) shutdownCancelQuotes() error {
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), m.cfg.ShutdownCancelTimeout())
 	defer cancel()
 
-	slog.Info("shutdown: cancelling bulk quotes for this market only (single resting orders, e.g. GTC auto-flatten, are not cancelled)",
+	slog.Info("shutdown: cancelling bulk quotes for this market only (single resting orders, e.g. POST_ONLY auto-flatten, are not cancelled)",
 		"market", m.market.MarketName,
 		"timeout", m.cfg.ShutdownCancelTimeout(),
 	)
@@ -158,7 +166,7 @@ func (m *MarketMaker) shutdownCancelQuotes() error {
 		}
 		err := m.ex.CancelBulkOrders(shutdownCtx)
 		if err == nil {
-			slog.Info("shutdown cleanup complete: bulk cancel succeeded or no bulk quotes to cancel")
+			logging.Success("shutdown cleanup complete: bulk cancel succeeded or no bulk quotes to cancel")
 			return nil
 		}
 		lastErr = err
@@ -180,7 +188,9 @@ func (m *MarketMaker) shutdownCancelQuotes() error {
 	return fmt.Errorf("CancelBulkOrders retries exhausted: %w", lastErr)
 }
 
-func (m *MarketMaker) runCycle(ctx context.Context) error {
+func (m *MarketMaker) runCycle(ctx context.Context, cycle uint64) error {
+	ctx = logctx.WithCycle(ctx, cycle)
+
 	// ── 1. Parallel state fetch ───────────────────────────────────────────────
 	state, err := m.ex.FetchState(ctx)
 	if err != nil {
@@ -188,16 +198,31 @@ func (m *MarketMaker) runCycle(ctx context.Context) error {
 	}
 
 	midStr := "<nil>"
+	var midVal float64
+	hasMid := false
 	if state.Mid != nil {
-		midStr = fmt.Sprintf("%.4f", *state.Mid)
+		midVal = *state.Mid
+		midStr = fmt.Sprintf("%.4f", midVal)
+		hasMid = true
 	}
-	slog.Info("state snapshot",
+	ss := []any{
+		"cycle", cycle,
 		"equity", state.Equity,
 		"margin_usage", state.MarginUsage,
 		"inventory", state.Inventory,
-		"open_orders", len(state.OpenOrders),
 		"mid", midStr,
-	)
+		"market_name", m.market.MarketName,
+		"market_id", api.AddrSuffix(m.market.MarketID),
+		"max_inventory", m.cfg.MaxInventory,
+		"order_size", m.cfg.OrderSize,
+		"cfg_spread", m.cfg.Spread,
+		"effective_spread", m.effectiveSpread,
+	}
+	if hasMid {
+		ss = append(ss, "mid_f", midVal)
+	}
+	ss = append(ss, openOrderSummaryArgs(state.OpenOrders)...)
+	slog.Info("state_snapshot", ss...)
 
 	// Share state with notification layer before lastInventory is updated this cycle.
 	m.state.Update(botstate.StateUpdate{
@@ -221,6 +246,7 @@ func (m *MarketMaker) runCycle(ctx context.Context) error {
 	// ── 2. First-cycle recovery ───────────────────────────────────────────────
 	if m.firstCycle {
 		slog.Info("first cycle: recovering state from chain",
+			"cycle", cycle,
 			"inventory", state.Inventory,
 			"open_orders", len(state.OpenOrders),
 		)
@@ -236,9 +262,10 @@ func (m *MarketMaker) runCycle(ctx context.Context) error {
 			if newSpread > m.effectiveSpread {
 				m.effectiveSpread = newSpread
 				slog.Info("fill detected, spread widened slightly",
+					"cycle", cycle,
 					"inv_change", invChange, "spread", m.effectiveSpread)
 			} else {
-				slog.Info("fill detected", "inv_change", invChange, "spread", m.effectiveSpread)
+				slog.Info("fill detected", "cycle", cycle, "inv_change", invChange, "spread", m.effectiveSpread)
 			}
 		} else {
 			m.noFillCycles++
@@ -249,10 +276,12 @@ func (m *MarketMaker) runCycle(ctx context.Context) error {
 						m.effectiveSpread = suggested
 						m.noFillCycles = 0
 						slog.Warn("auto-spread narrowed (no fill)",
+							"cycle", cycle,
 							"spread", m.effectiveSpread,
 							"no_fill_cycles", m.cfg.SpreadNoFillCycles)
 					} else {
 						slog.Warn("suggestion: spread may be too wide",
+							"cycle", cycle,
 							"current_spread", m.effectiveSpread,
 							"suggested_spread", suggested,
 							"no_fill_cycles", m.noFillCycles,
@@ -270,12 +299,14 @@ func (m *MarketMaker) runCycle(ctx context.Context) error {
 		m.marginHighCycles++
 		if m.marginHighCycles >= marginStuckThreshold {
 			slog.Error("CRITICAL: margin has been too high for many cycles — manual intervention may be required",
+				"cycle", cycle,
 				"margin_usage", state.MarginUsage,
 				"threshold", m.cfg.MaxMarginUsage,
 				"cycles_paused", m.marginHighCycles,
 			)
 		} else {
 			slog.Warn("PAUSED: margin usage too high",
+				"cycle", cycle,
 				"margin_usage", state.MarginUsage,
 				"threshold", m.cfg.MaxMarginUsage,
 				"cycles_paused", m.marginHighCycles,
@@ -287,7 +318,7 @@ func (m *MarketMaker) runCycle(ctx context.Context) error {
 
 	// ── 3b. Risk guard: no price ──────────────────────────────────────────────
 	if state.Mid == nil {
-		slog.Warn("PAUSED: no mid price available")
+		slog.Warn("PAUSED: no mid price available", "cycle", cycle)
 		return nil
 	}
 	mid := *state.Mid
@@ -313,6 +344,7 @@ func (m *MarketMaker) runCycle(ctx context.Context) error {
 		if invExceeded {
 			if !m.invLimitBulkCancelDone {
 				slog.Info("inventory at limit, cancelling bulk orders",
+					"cycle", cycle,
 					"inventory", state.Inventory, "max", m.cfg.MaxInventory)
 				if err := m.ex.CancelBulkOrders(ctx); err != nil {
 					return fmt.Errorf("cancel bulk orders: %w", err)
@@ -320,11 +352,13 @@ func (m *MarketMaker) runCycle(ctx context.Context) error {
 				m.invLimitBulkCancelDone = true
 			} else {
 				slog.Info("inventory at limit; skipping cancel bulk until inventory recovers",
+					"cycle", cycle,
 					"inventory", state.Inventory, "max", m.cfg.MaxInventory)
 			}
 			if m.cfg.AutoFlatten {
 				if m.shouldSkipFlatten(state.OpenOrders) {
-					slog.Info("flatten order already resting, skipping", "order_id", m.lastFlattenOrderID)
+					slog.Info("flatten order already resting, skipping",
+						"cycle", cycle, "order_id", m.lastFlattenOrderID)
 				} else {
 					outcome, err := m.placeFlattenOrder(ctx, state.Inventory, mid)
 					if err != nil && !errors.Is(err, ErrNoPositionToFlatten) {
@@ -335,19 +369,21 @@ func (m *MarketMaker) runCycle(ctx context.Context) error {
 					}
 				}
 			} else {
-				slog.Warn("at max inventory; manually flatten or enable --auto-flatten")
+				slog.Warn("at max inventory; manually flatten or enable --auto-flatten", "cycle", cycle)
 			}
 			return nil
 		}
 
 		slog.Info("cannot quote, cancelling bulk orders",
+			"cycle", cycle,
 			"inventory", state.Inventory, "reason", "size rounds to zero or below min_size")
 		if err := m.ex.CancelBulkOrders(ctx); err != nil {
 			return fmt.Errorf("cancel bulk orders: %w", err)
 		}
 		if m.cfg.AutoFlatten {
 			if m.shouldSkipFlatten(state.OpenOrders) {
-				slog.Info("flatten order already resting, skipping", "order_id", m.lastFlattenOrderID)
+				slog.Info("flatten order already resting, skipping",
+					"cycle", cycle, "order_id", m.lastFlattenOrderID)
 			} else {
 				outcome, err := m.placeFlattenOrder(ctx, state.Inventory, mid)
 				if err != nil && !errors.Is(err, ErrNoPositionToFlatten) {
@@ -361,18 +397,31 @@ func (m *MarketMaker) runCycle(ctx context.Context) error {
 		return nil
 	}
 
-	slog.Info("computed quotes", "bid", quotes.Bid, "ask", quotes.Ask, "size", quotes.Size)
+	slog.Info("computed quotes",
+		"cycle", cycle, "bid", quotes.Bid, "ask", quotes.Ask, "size", quotes.Size)
 
 	// ── 5. Atomically replace bulk quotes (bid + ask in one transaction) ──────
 
 	// Circuit breaker: if we're in a backoff window, skip placing and warn.
 	if time.Now().Before(m.bulkOrderBackoffUntil) {
 		slog.Warn("circuit breaker active, skipping PlaceBulkOrders",
+			"cycle", cycle,
 			"failures", m.bulkOrderFailures,
 			"backoff_remaining_s", math.Round(time.Until(m.bulkOrderBackoffUntil).Seconds()),
 		)
 		return nil
 	}
+
+	slog.Info("mm_place_bulk",
+		"cycle", cycle,
+		"market", m.market.MarketName,
+		"market_id", api.AddrSuffix(m.market.MarketID),
+		"bid_price", quotes.Bid,
+		"ask_price", quotes.Ask,
+		"size", quotes.Size,
+		"tif", "POST_ONLY",
+		"dry_run", m.ex.DryRun(),
+	)
 
 	if err := m.ex.PlaceBulkOrders(ctx,
 		[]exchange.BulkOrderEntry{{Price: quotes.Bid, Size: quotes.Size}},
@@ -386,6 +435,7 @@ func (m *MarketMaker) runCycle(ctx context.Context) error {
 		)) * time.Second
 		m.bulkOrderBackoffUntil = time.Now().Add(backoff)
 		slog.Error("PlaceBulkOrders failed, circuit breaker engaged",
+			"cycle", cycle,
 			"failures", m.bulkOrderFailures,
 			"backoff_s", backoff.Seconds(),
 		)
@@ -395,7 +445,32 @@ func (m *MarketMaker) runCycle(ctx context.Context) error {
 	// Success — reset circuit breaker.
 	m.bulkOrderFailures = 0
 	m.bulkOrderBackoffUntil = time.Time{}
-	slog.Info("cycle complete")
+
+	if m.cfg.LogCycleJSON {
+		trace := struct {
+			Msg             string  `json:"msg"`
+			Cycle           uint64  `json:"cycle"`
+			Market          string  `json:"market"`
+			Mid             float64 `json:"mid"`
+			Inventory       float64 `json:"inventory"`
+			Bid             float64 `json:"bid"`
+			Ask             float64 `json:"ask"`
+			Size            float64 `json:"size"`
+			DryRun          bool    `json:"dry_run"`
+			EffectiveSpread float64 `json:"effective_spread"`
+			CfgSpread       float64 `json:"cfg_spread"`
+		}{
+			Msg: "mm_cycle", Cycle: cycle, Market: m.market.MarketName,
+			Mid: mid, Inventory: state.Inventory,
+			Bid: quotes.Bid, Ask: quotes.Ask, Size: quotes.Size,
+			DryRun: m.ex.DryRun(), EffectiveSpread: m.effectiveSpread, CfgSpread: m.cfg.Spread,
+		}
+		if b, err := json.Marshal(trace); err == nil {
+			slog.Info("cycle_trace_json", "cycle", cycle, "payload", string(b))
+		}
+	}
+
+	logging.Cycle("cycle complete")
 	return nil
 }
 
@@ -405,10 +480,10 @@ func (m *MarketMaker) cancelAllOrders(ctx context.Context, orders []exchange.Ope
 	if len(orders) == 0 {
 		return 0, 0, nil
 	}
-	slog.Info("cancelling all resting orders", "count", len(orders))
+	slog.Info("cancelling all resting orders", logctx.AppendAttrs(ctx, "count", len(orders))...)
 	for _, o := range orders {
 		if err := m.ex.CancelOrder(ctx, o.OrderID); err != nil {
-			slog.Warn("cancel failed", "order_id", o.OrderID, "err", err)
+			slog.Warn("cancel failed", logctx.AppendAttrs(ctx, "order_id", o.OrderID, "err", err)...)
 			nFail++
 		} else {
 			nOK++
@@ -438,51 +513,107 @@ func (m *MarketMaker) placeFlattenOrder(ctx context.Context, inventory, mid floa
 	isBuy := inventory < 0
 	absInv := math.Abs(inventory)
 
+	// POST_ONLY: price on the passive side of mid so the order rests as maker
+	// (we do not have BBO in StateSnapshot — mid-based passive quote is the best proxy).
+	// Long → sell above mid; short → buy below mid.
 	var rawPrice float64
 	if isBuy {
-		p := mid * (1.0 + m.cfg.FlattenAggression)
-		// Cap at FlattenMaxDeviation above mid (when non-zero).
-		if m.cfg.FlattenMaxDeviation > 0 {
-			cap := mid * (1.0 + m.cfg.FlattenMaxDeviation)
-			if p > cap {
-				slog.Warn("flatten buy price capped by FlattenMaxDeviation",
-					"uncapped", p, "capped", cap)
-				p = cap
-			}
-		}
-		rawPrice = math.Ceil(p/m.market.TickSize) * m.market.TickSize
-	} else {
 		p := mid * (1.0 - m.cfg.FlattenAggression)
-		// Floor at FlattenMaxDeviation below mid (when non-zero).
 		if m.cfg.FlattenMaxDeviation > 0 {
 			floor := mid * (1.0 - m.cfg.FlattenMaxDeviation)
 			if p < floor {
-				slog.Warn("flatten sell price floored by FlattenMaxDeviation",
-					"uncapped", p, "floored", floor)
+				slog.Warn("flatten buy price floored by FlattenMaxDeviation",
+					logctx.AppendAttrs(ctx, "uncapped", p, "floored", floor)...,
+				)
 				p = floor
 			}
 		}
 		rawPrice = math.Floor(p/m.market.TickSize) * m.market.TickSize
+	} else {
+		p := mid * (1.0 + m.cfg.FlattenAggression)
+		if m.cfg.FlattenMaxDeviation > 0 {
+			cap := mid * (1.0 + m.cfg.FlattenMaxDeviation)
+			if p > cap {
+				slog.Warn("flatten sell price capped by FlattenMaxDeviation",
+					logctx.AppendAttrs(ctx, "uncapped", p, "capped", cap)...,
+				)
+				p = cap
+			}
+		}
+		rawPrice = math.Ceil(p/m.market.TickSize) * m.market.TickSize
+	}
+
+	if m.cfg.FlattenMaxDeviation > 0 {
+		tick := m.market.TickSize
+		if isBuy {
+			minPx := mid * (1.0 - m.cfg.FlattenMaxDeviation)
+			if rawPrice < minPx {
+				rawPrice = math.Ceil(minPx/tick) * tick
+			}
+		} else {
+			maxPx := mid * (1.0 + m.cfg.FlattenMaxDeviation)
+			if rawPrice > maxPx {
+				rawPrice = math.Floor(maxPx/tick) * tick
+			}
+		}
 	}
 
 	size := math.Round(absInv/m.market.LotSize) * m.market.LotSize
 	if size <= 0 || size < m.market.MinSize {
 		slog.Warn("flatten size too small, skipping",
-			"size", size, "min_size", m.market.MinSize)
+			logctx.AppendAttrs(ctx, "size", size, "min_size", m.market.MinSize)...,
+		)
 		return exchange.PlaceOrderOutcome{}, ErrNoPositionToFlatten
 	}
+
+	slog.Info("flatten_intent",
+		logctx.AppendAttrs(ctx,
+			"inventory", inventory,
+			"mid", mid,
+			"raw_price", rawPrice,
+			"size", size,
+			"is_buy", isBuy,
+			"tif", exchange.TimeInForcePostOnly,
+			"reduce_only", true,
+			"flatten_aggression", m.cfg.FlattenAggression,
+			"flatten_max_deviation", m.cfg.FlattenMaxDeviation,
+			"market", m.market.MarketName,
+			"market_id", api.AddrSuffix(m.market.MarketID),
+		)...,
+	)
 
 	return m.ex.PlaceOrder(ctx, exchange.PlaceOrderRequest{
 		MarketID:    m.market.MarketID,
 		Price:       rawPrice,
 		Size:        size,
 		IsBuy:       isBuy,
-		TimeInForce: 0, // GTC
+		TimeInForce: exchange.TimeInForcePostOnly,
 		ReduceOnly:  true,
 	})
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
+
+func shortOrderID(id string) string {
+	id = strings.TrimSpace(id)
+	if len(id) <= 16 {
+		return id
+	}
+	return id[len(id)-10:]
+}
+
+func openOrderSummaryArgs(orders []exchange.OpenOrder) []any {
+	n := len(orders)
+	out := []any{"open_orders", n}
+	if n > 0 && n <= maxOpenOrderIDsLogged {
+		ids := make([]string, n)
+		for i, o := range orders {
+			ids[i] = shortOrderID(o.OrderID)
+		}
+		out = append(out, "order_ids", strings.Join(ids, ","))
+	}
+	return out
+}
 
 func exchangePositionsToBotstate(positions []exchange.Position) []botstate.Position {
 	result := make([]botstate.Position, len(positions))

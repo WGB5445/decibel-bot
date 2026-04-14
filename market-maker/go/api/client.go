@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"math"
 	"net/http"
 	"net/url"
@@ -140,11 +141,22 @@ type StateSnapshot struct {
 // Client
 // ─────────────────────────────────────────────────────────────────────────────
 
+// ClientOption configures a REST [Client].
+type ClientOption func(*Client)
+
+// WithRESTVerbose enables per-request DEBUG logs on successful GETs when slog is at DEBUG.
+func WithRESTVerbose(on bool) ClientOption {
+	return func(c *Client) {
+		c.restVerbose = on
+	}
+}
+
 // Client is a REST API client for the Decibel exchange.
 type Client struct {
 	http        *http.Client
 	baseURL     string
 	bearerToken string
+	restVerbose bool
 
 	marketsMu    sync.RWMutex
 	marketsCache []MarketConfig // scaled human-readable rows; populated after first successful GET /markets
@@ -161,12 +173,16 @@ func cloneMarketConfigs(src []MarketConfig) []MarketConfig {
 }
 
 // NewClient creates a Client with a 15-second timeout.
-func NewClient(baseURL, bearerToken string) *Client {
-	return &Client{
+func NewClient(baseURL, bearerToken string, opts ...ClientOption) *Client {
+	c := &Client{
 		http:        &http.Client{Timeout: 15 * time.Second},
 		baseURL:     strings.TrimRight(baseURL, "/"),
 		bearerToken: bearerToken,
 	}
+	for _, o := range opts {
+		o(c)
+	}
+	return c
 }
 
 // ── Internal helpers ──────────────────────────────────────────────────────────
@@ -180,12 +196,17 @@ func (c *Client) getJSON(ctx context.Context, path string, dst any) error {
 
 	resp, err := c.http.Do(req)
 	if err != nil {
+		slog.Warn("rest_request_failed", "method", http.MethodGet, "path", path, "err", err)
 		return fmt.Errorf("do request: %w", err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		slog.Warn("rest_http_error", "method", http.MethodGet, "path", path, "status", resp.StatusCode)
 		return fmt.Errorf("HTTP %d: GET %s", resp.StatusCode, path)
+	}
+	if c.restVerbose && slog.Default().Enabled(ctx, slog.LevelDebug) {
+		slog.Debug("rest_get_ok", "path", path)
 	}
 	return json.NewDecoder(resp.Body).Decode(dst)
 }
@@ -446,6 +467,15 @@ func NormalizeAddr(addr string) string {
 		return "0"
 	}
 	return s
+}
+
+// AddrSuffix returns the last 6 characters of [NormalizeAddr] for compact logs.
+func AddrSuffix(addr string) string {
+	n := NormalizeAddr(addr)
+	if len(n) <= 6 {
+		return n
+	}
+	return n[len(n)-6:]
 }
 
 func normalizeMarket(name string) string {

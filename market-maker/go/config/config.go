@@ -57,9 +57,9 @@ type Config struct {
 	ShutdownCancelTimeoutS float64
 	AutoFlatten            bool
 	FlattenAggression      float64
-	// FlattenMaxDeviation is the maximum price deviation from mid allowed for a
-	// flatten order (e.g. 0.05 = 5%). Prevents over-aggressive pricing in fast
-	// markets. 0 disables the cap.
+	// FlattenMaxDeviation bounds passive POST_ONLY flatten prices vs mid (e.g. 0.05 = 5%).
+	// Long (sell): price capped at mid×(1+dev). Short (buy): price floored at mid×(1−dev).
+	// 0 disables the bound.
 	FlattenMaxDeviation float64
 	DryRun              bool
 
@@ -80,6 +80,23 @@ type Config struct {
 	MarketAddrOverride string // skips API discovery
 	RestAPIBase        string
 
+	// Locale is UI language for bot-facing copy: "zh" (default) or "en". Set via LOCALE / BOT_LOCALE, config file, or -locale.
+	Locale string
+
+	// LogLevel is slog level: debug | info | warn | error (default info). LOG_LEVEL / -log-level.
+	LogLevel string
+	// LogFormat is text (default, ANSI when TTY) or json (one JSON object per line). LOG_FORMAT / -log-format.
+	LogFormat string
+	// LogCycleJSON emits a single structured JSON line after each successful bulk quote cycle. LOG_CYCLE_JSON or LOG_TRACE / -log-cycle-json.
+	LogCycleJSON bool
+	// LogVerbose enables extra REST DEBUG lines when LogLevel is debug. LOG_VERBOSE / -log-verbose.
+	LogVerbose bool
+
+	// LogTeeFile mirrors logs to a file: empty = off; "auto" = LOG_TEE_FILE_DIR + subaccount_market.log; else path. LOG_TEE_FILE / -log-tee-file.
+	LogTeeFile string
+	// LogTeeFileDir is the directory used when LogTeeFile is "auto" (default "."). LOG_TEE_FILE_DIR / -log-tee-file-dir.
+	LogTeeFileDir string
+
 	// ── Telegram ─────────────────────────────────────────────────────────────
 	TGBotToken               string // TG_BOT_TOKEN or -tg-token
 	TGAdminID                int64  // TG_ADMIN_ID or -tg-admin-id
@@ -94,6 +111,29 @@ func (c *Config) TelegramEnabled() bool {
 }
 
 func (c *Config) validate() error {
+	c.Locale = normalizeBotLocale(c.Locale)
+
+	c.LogLevel = strings.ToLower(strings.TrimSpace(c.LogLevel))
+	if c.LogLevel == "" {
+		c.LogLevel = "info"
+	}
+	switch c.LogLevel {
+	case "debug", "info", "warn", "warning", "error":
+	default:
+		c.LogLevel = "info"
+	}
+	c.LogFormat = strings.ToLower(strings.TrimSpace(c.LogFormat))
+	if c.LogFormat == "" {
+		c.LogFormat = "text"
+	}
+	if c.LogFormat != "text" && c.LogFormat != "json" {
+		c.LogFormat = "text"
+	}
+
+	if strings.TrimSpace(c.LogTeeFileDir) == "" {
+		c.LogTeeFileDir = "."
+	}
+
 	// Clamp TGAlertInventoryInterval to avoid time.NewTicker(0) panic.
 	if c.TGAlertInventoryInterval <= 0 {
 		c.TGAlertInventoryInterval = 30
@@ -196,6 +236,8 @@ var boolCLIFlagNames = map[string]struct{}{
 	"auto-flatten":       {},
 	"dry-run":            {},
 	"auto-spread":        {},
+	"log-cycle-json":     {},
+	"log-verbose":        {},
 	"tg-alert-inventory": {},
 	"tg-strict-start":    {},
 }
@@ -270,6 +312,16 @@ func isBoolToken(s string) bool {
 		return true
 	default:
 		return false
+	}
+}
+
+// normalizeBotLocale returns a stable UI language tag: "zh" or "en".
+func normalizeBotLocale(s string) string {
+	switch strings.ToLower(strings.TrimSpace(s)) {
+	case "en", "english":
+		return "en"
+	default:
+		return "zh"
 	}
 }
 

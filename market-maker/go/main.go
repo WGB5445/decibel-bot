@@ -9,6 +9,7 @@ import (
 	"math"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"sync"
 	"syscall"
@@ -23,19 +24,18 @@ import (
 	"decibel-mm-bot/config"
 	"decibel-mm-bot/exchange"
 	decibelExchange "decibel-mm-bot/exchange/decibel"
+	"decibel-mm-bot/logging"
 	"decibel-mm-bot/notify"
 	"decibel-mm-bot/notify/telegram"
 	"decibel-mm-bot/strategy"
 )
 
 func main() {
-	// Load .env before config so all env vars are visible to flag defaults.
-	if err := godotenv.Load(); err == nil {
-		slog.Info("loaded .env file")
-	}
+	envLoaded := godotenv.Load() == nil
 
 	args := config.NormalizeBoolCLIArgsForInit(os.Args)
 	if out, ok := config.ParseInitConfigFlag(args); ok {
+		logging.Setup(os.Stderr, nil, nil)
 		if err := config.WriteInitConfigYAML(out); err != nil {
 			slog.Error("init-config failed", "err", err)
 			os.Exit(1)
@@ -49,8 +49,13 @@ func main() {
 		if errors.Is(err, flag.ErrHelp) {
 			os.Exit(0)
 		}
+		logging.Setup(os.Stderr, nil, nil)
 		slog.Error("config error", "err", err)
 		os.Exit(1)
+	}
+	logging.Setup(os.Stderr, cfg, nil)
+	if envLoaded {
+		slog.Info("loaded .env file")
 	}
 	slog.Info("network profile",
 		"network", cfg.Network,
@@ -61,6 +66,13 @@ func main() {
 	// Graceful shutdown on SIGINT / SIGTERM.
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+
+	var logTeeF *os.File
+	defer func() {
+		if logTeeF != nil {
+			_ = logTeeF.Close()
+		}
+	}()
 
 	// ── 1. Exchange layer ────────────────────────────────────────────────────
 	slog.Info("starting Decibel Market Maker",
@@ -89,6 +101,26 @@ func main() {
 		os.Exit(1)
 	}
 	ex.SetMarket(market)
+
+	if teePath, err := resolveLogTeePath(cfg, market); err != nil {
+		slog.Error("log tee path invalid", "err", err)
+		os.Exit(1)
+	} else if teePath != "" {
+		if d := filepath.Dir(teePath); d != "." && d != "" {
+			if err := os.MkdirAll(d, 0o755); err != nil {
+				slog.Error("log tee mkdir", "dir", d, "err", err)
+				os.Exit(1)
+			}
+		}
+		f, err := os.OpenFile(teePath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+		if err != nil {
+			slog.Error("log tee open file", "path", teePath, "err", err)
+			os.Exit(1)
+		}
+		logTeeF = f
+		logging.Setup(os.Stderr, cfg, f)
+		slog.Info("log tee enabled", "path", teePath)
+	}
 
 	slog.Info("market config loaded",
 		"market_id", market.MarketID,
@@ -119,6 +151,7 @@ func main() {
 			AdminID:                cfg.TGAdminID,
 			AlertInventory:         cfg.TGAlertInventory,
 			AlertInventoryInterval: cfg.TGAlertInventoryInterval,
+			Locale:                 cfg.Locale,
 		}
 		info := &infoAdapter{mm: mm, ex: ex, cfg: cfg, apiClient: apiCatalog, marketNames: nameLookup}
 		tg, err := telegram.New(tgCfg, info)
@@ -158,6 +191,22 @@ func main() {
 		slog.Error("strategy exited with error", "err", err)
 		os.Exit(1)
 	}
+}
+
+// resolveLogTeePath returns an absolute or cwd-relative log file path, or "" if tee is disabled.
+func resolveLogTeePath(cfg *config.Config, market *exchange.MarketConfig) (string, error) {
+	raw := strings.TrimSpace(cfg.LogTeeFile)
+	if raw == "" {
+		return "", nil
+	}
+	if strings.EqualFold(raw, "auto") {
+		name := strings.TrimSpace(market.MarketName)
+		if name == "" {
+			name = cfg.MarketName
+		}
+		return logging.TeeAutoPath(cfg.LogTeeFileDir, cfg.SubaccountAddress, name)
+	}
+	return filepath.Clean(raw), nil
 }
 
 func buildMarketNameLookup(markets []api.MarketConfig) map[string]string {

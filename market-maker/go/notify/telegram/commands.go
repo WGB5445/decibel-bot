@@ -31,12 +31,12 @@ func (t *TelegramNotifier) sendBalance(ctx context.Context, chatID int64) {
 	snap, err := t.info.FetchLiveSnapshot(ctx)
 	if err != nil {
 		slog.Warn("tgbot: fetch live snapshot for balance failed", "err", err)
-		t.send(tgbotapi.NewMessage(chatID, fmt.Sprintf("查询失败，请稍后重试: %v", err)))
+		t.send(tgbotapi.NewMessage(chatID, fmt.Sprintf(t.tr.ErrQueryRetryFmt, err)))
 		return
 	}
-	m := tgbotapi.NewMessage(chatID, formatBalance(snap))
+	m := tgbotapi.NewMessage(chatID, formatBalance(t.tr, snap))
 	m.ParseMode = tgbotapi.ModeMarkdown
-	m.ReplyMarkup = balanceKeyboard()
+	m.ReplyMarkup = t.balanceKeyboard()
 	t.send(m)
 }
 
@@ -44,9 +44,9 @@ func (t *TelegramNotifier) sendBalance(ctx context.Context, chatID int64) {
 func (t *TelegramNotifier) sendGas(ctx context.Context, chatID int64) {
 	aptBal, _, err := t.info.GasBalance(ctx)
 	walletAddr := t.info.WalletAddress()
-	m := tgbotapi.NewMessage(chatID, formatGas(walletAddr, aptBal, err))
+	m := tgbotapi.NewMessage(chatID, formatGas(t.tr, walletAddr, aptBal, err))
 	m.ParseMode = tgbotapi.ModeMarkdown
-	m.ReplyMarkup = gasKeyboard()
+	m.ReplyMarkup = t.gasKeyboard()
 	t.send(m)
 }
 
@@ -55,10 +55,10 @@ func (t *TelegramNotifier) sendPositions(ctx context.Context, chatID int64) {
 	snap, err := t.info.FetchLiveSnapshot(ctx)
 	if err != nil {
 		slog.Warn("tgbot: fetch live snapshot for positions failed", "err", err)
-		t.send(tgbotapi.NewMessage(chatID, fmt.Sprintf("查询失败，请稍后重试: %v", err)))
+		t.send(tgbotapi.NewMessage(chatID, fmt.Sprintf(t.tr.ErrQueryRetryFmt, err)))
 		return
 	}
-	m := tgbotapi.NewMessage(chatID, formatPositions(snap, 0, t.info.MarketDisplayName))
+	m := tgbotapi.NewMessage(chatID, formatPositions(t.tr, snap, 0, t.info.MarketDisplayName))
 	m.ParseMode = tgbotapi.ModeMarkdown
 	m.ReplyMarkup = t.positionsReplyMarkup(snap, 0)
 	t.send(m)
@@ -69,19 +69,19 @@ func (t *TelegramNotifier) sendRecentTrades(ctx context.Context, chatID int64) {
 	items, err := t.info.FetchRecentTrades(ctx, TradesHistoryFetchLimit)
 	if err != nil {
 		slog.Warn("tgbot: fetch recent trades failed", "err", err)
-		t.send(tgbotapi.NewMessage(chatID, fmt.Sprintf("查询失败，请稍后重试: %v", err)))
+		t.send(tgbotapi.NewMessage(chatID, fmt.Sprintf(t.tr.ErrQueryRetryFmt, err)))
 		return
 	}
-	m := tgbotapi.NewMessage(chatID, formatRecentTrades(items, 0, t.info.MarketDisplayName))
+	m := tgbotapi.NewMessage(chatID, formatRecentTrades(t.tr, items, 0, t.info.MarketDisplayName))
 	m.ParseMode = tgbotapi.ModeMarkdown
-	m.ReplyMarkup = tradesReplyMarkup(0, len(items))
+	m.ReplyMarkup = t.tradesReplyMarkup(0, len(items))
 	t.send(m)
 }
 
 // sendHelp sends the help/command list message.
 func (t *TelegramNotifier) sendHelp(chatID int64) {
-	m := tgbotapi.NewMessage(chatID, formatHelp(t.cfg))
+	m := tgbotapi.NewMessage(chatID, formatHelp(t.cfg, t.tr))
 	m.ParseMode = tgbotapi.ModeMarkdown
-	m.ReplyMarkup = helpKeyboard()
+	m.ReplyMarkup = t.helpKeyboard()
 	t.send(m)
 }

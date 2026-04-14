@@ -179,6 +179,24 @@ These override the values set by `NETWORK`. Leave unset to use the network profi
 
 ---
 
+### Logging & debugging (structured `slog`)
+
+| Env var | CLI flag | Default | Description |
+|---------|----------|---------|-------------|
+| `LOG_LEVEL` | `-log-level` | `info` | `debug`, `info`, `warn`, or `error`. `debug` enables verbose paths (e.g. per-request REST OK lines when `LOG_VERBOSE` is on). |
+| `LOG_FORMAT` | `-log-format` | `text` | `text` (default, ANSI on TTY unless `NO_COLOR`) or `json` (one JSON object per line for `jq` / tooling). |
+| `LOG_CYCLE_JSON` | `-log-cycle-json` | `false` | After each **successful** bulk quote cycle, emit one `cycle_trace_json` line with a JSON `payload` (mid, inventory, bid/ask/size, spreads). Same as `LOG_TRACE`. |
+| `LOG_TRACE` | _(env only)_ | `false` | Alias for `LOG_CYCLE_JSON`. |
+| `LOG_VERBOSE` | `-log-verbose` | `false` | When `true` and level is `debug`, log successful REST GET paths. **Failed** REST calls log at `WARN` regardless. |
+| `LOG_TEE_FILE` | `-log-tee-file` | _(empty)_ | Mirror every log line to a file **in addition to** stderr. Empty = disabled. Value `auto` builds `{LOG_TEE_FILE_DIR}/{subaccount8}_{market}.log` after market discovery (uses resolved `market_name`). Any other non-empty value is treated as a **file path** (relative to process cwd if not absolute); `LOG_TEE_FILE_DIR` is ignored in that case. |
+| `LOG_TEE_FILE_DIR` | `-log-tee-file-dir` | `.` | Directory prefix used **only** when `-log-tee-file=auto`. Parent directories are created with `mkdir -p` semantics before opening the file. |
+
+When tee is enabled, **stderr** keeps ANSI colors on a TTY; the **file** sink uses the same text layout (or JSON if `LOG_FORMAT=json`) **without** ANSI escape codes.
+
+**Greppable `msg` / keys (examples):** `state_snapshot` (`cycle`, `mid_f`, `open_orders`, `order_ids` when few orders), `mm_place_bulk`, `place_bulk_payload`, `flatten_intent`, `dex_place_order`, `dex_cancel_order`, `dex_cancel_order_ok`, `dex_cancel_order_skip`, `cancel_bulk_ok`, `cancel_bulk_skip`, `bulk_orders_ok`. Most Decibel `slog` lines and green **Success** lines (`order placed`, `bulk orders placed`, …) include `cycle` when the request `context` was wrapped with `logctx.WithCycle` in the MM loop. `logging.Cycle` banners pass `cycle` as an explicit log attribute. **Secrets are never logged** (no bearer token or private key in log fields).
+
+---
+
 ## Ways to pass parameters
 
 ### 1. `.env` file (recommended for credentials)

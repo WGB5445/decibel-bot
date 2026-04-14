@@ -3,6 +3,7 @@
 # Keys use snake_case. Omit keys you do not want to set (nil = do not override env).
 
 network: testnet
+locale: zh # zh | en — Telegram UI language (optional; default zh)
 market_name: BTC/USD
 spread: 0.001
 order_size: 0.001

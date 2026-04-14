@@ -14,6 +14,7 @@ import (
 // FileConfig is the on-disk shape (JSON / YAML / TOML). Pointer fields mean
 // "omit": nil does not override; non-nil overrides the current Config value.
 type FileConfig struct {
+	Locale                *string  `json:"locale,omitempty"                 yaml:"locale,omitempty"                 toml:"locale,omitempty"`
 	Network               *string  `json:"network,omitempty"                yaml:"network,omitempty"                toml:"network,omitempty"`
 	MarketName            *string  `json:"market_name,omitempty"            yaml:"market_name,omitempty"            toml:"market_name,omitempty"`
 	Spread                *float64 `json:"spread,omitempty"                 yaml:"spread,omitempty"                 toml:"spread,omitempty"`
@@ -46,6 +47,12 @@ type FileConfig struct {
 	TGAlertInventory      *bool    `json:"tg_alert_inventory,omitempty"     yaml:"tg_alert_inventory,omitempty"     toml:"tg_alert_inventory,omitempty"`
 	TGAlertInvIntervalMin *int     `json:"tg_alert_inventory_interval_min,omitempty" yaml:"tg_alert_inventory_interval_min,omitempty" toml:"tg_alert_inventory_interval_min,omitempty"`
 	TGStrictStart         *bool    `json:"tg_strict_start,omitempty"        yaml:"tg_strict_start,omitempty"        toml:"tg_strict_start,omitempty"`
+	LogLevel              *string  `json:"log_level,omitempty"              yaml:"log_level,omitempty"              toml:"log_level,omitempty"`
+	LogFormat             *string  `json:"log_format,omitempty"             yaml:"log_format,omitempty"             toml:"log_format,omitempty"`
+	LogCycleJSON          *bool    `json:"log_cycle_json,omitempty"       yaml:"log_cycle_json,omitempty"       toml:"log_cycle_json,omitempty"`
+	LogVerbose            *bool    `json:"log_verbose,omitempty"            yaml:"log_verbose,omitempty"            toml:"log_verbose,omitempty"`
+	LogTeeFile            *string  `json:"log_tee_file,omitempty"             yaml:"log_tee_file,omitempty"             toml:"log_tee_file,omitempty"`
+	LogTeeFileDir         *string  `json:"log_tee_file_dir,omitempty"       yaml:"log_tee_file_dir,omitempty"       toml:"log_tee_file_dir,omitempty"`
 }
 
 func decodeFileConfig(data []byte, ext string) (*FileConfig, error) {
@@ -80,6 +87,10 @@ func applyFileConfig(dst *Config, src *FileConfig, explicitFile map[string]bool)
 	}
 	if src == nil {
 		return
+	}
+	if src.Locale != nil {
+		dst.Locale = strings.TrimSpace(*src.Locale)
+		set("LOCALE")
 	}
 	if src.Network != nil {
 		dst.Network = strings.TrimSpace(*src.Network)
@@ -208,6 +219,30 @@ func applyFileConfig(dst *Config, src *FileConfig, explicitFile map[string]bool)
 	if src.TGStrictStart != nil {
 		dst.TGStrictStart = *src.TGStrictStart
 		set("TG_STRICT_START")
+	}
+	if src.LogLevel != nil {
+		dst.LogLevel = strings.ToLower(strings.TrimSpace(*src.LogLevel))
+		set("LOG_LEVEL")
+	}
+	if src.LogFormat != nil {
+		dst.LogFormat = strings.ToLower(strings.TrimSpace(*src.LogFormat))
+		set("LOG_FORMAT")
+	}
+	if src.LogCycleJSON != nil {
+		dst.LogCycleJSON = *src.LogCycleJSON
+		set("LOG_CYCLE_JSON")
+	}
+	if src.LogVerbose != nil {
+		dst.LogVerbose = *src.LogVerbose
+		set("LOG_VERBOSE")
+	}
+	if src.LogTeeFile != nil {
+		dst.LogTeeFile = strings.TrimSpace(*src.LogTeeFile)
+		set("LOG_TEE_FILE")
+	}
+	if src.LogTeeFileDir != nil {
+		dst.LogTeeFileDir = strings.TrimSpace(*src.LogTeeFileDir)
+		set("LOG_TEE_FILE_DIR")
 	}
 }
 
