@@ -448,8 +448,8 @@ func TestFlattenOrderPlacedWhenAutoFlattenOn(t *testing.T) {
 	if len(ex.placed) > 0 && !ex.placed[0].ReduceOnly {
 		t.Error("flatten order must be ReduceOnly=true")
 	}
-	if len(ex.placed) > 0 && ex.placed[0].TimeInForce != 0 {
-		t.Errorf("flatten order must use GTC (TimeInForce=0), got %d", ex.placed[0].TimeInForce)
+	if len(ex.placed) > 0 && ex.placed[0].TimeInForce != 1 {
+		t.Errorf("flatten order must use POST_ONLY (TimeInForce=1), got %d", ex.placed[0].TimeInForce)
 	}
 }
 
@@ -495,9 +495,9 @@ func TestFlattenLongPositionSells(t *testing.T) {
 	if ex.placed[0].IsBuy {
 		t.Error("flatten for long position must be a sell (IsBuy=false)")
 	}
-	// Long flatten: sell below mid
-	if ex.placed[0].Price >= 100_000 {
-		t.Errorf("flatten sell price %.2f should be below mid 100000", ex.placed[0].Price)
+	// Long flatten: POST_ONLY sell above mid (maker side vs mid proxy).
+	if ex.placed[0].Price <= 100_000 {
+		t.Errorf("flatten sell price %.2f should be above mid 100000", ex.placed[0].Price)
 	}
 }
 
@@ -523,9 +523,9 @@ func TestFlattenShortPositionBuys(t *testing.T) {
 	if !ex.placed[0].IsBuy {
 		t.Error("flatten for short position must be a buy (IsBuy=true)")
 	}
-	// Short flatten: buy above mid
-	if ex.placed[0].Price <= 100_000 {
-		t.Errorf("flatten buy price %.2f should be above mid 100000", ex.placed[0].Price)
+	// Short flatten: POST_ONLY buy below mid (maker side vs mid proxy).
+	if ex.placed[0].Price >= 100_000 {
+		t.Errorf("flatten buy price %.2f should be below mid 100000", ex.placed[0].Price)
 	}
 }
 
@@ -655,13 +655,13 @@ func TestQuoteSizeSymmetric(t *testing.T) {
 // ── Tests: State Update ───────────────────────────────────────────────────────
 
 // FlattenMaxDeviation caps the flatten sell price (long position) when FlattenAggression
-// would place the order too far below mid.
+// would place the order too far above mid.
 func TestFlattenMaxDeviationCapsLongSellPrice(t *testing.T) {
 	cfg := testConfig()
 	cfg.MaxInventory = 0.001
 	cfg.AutoFlatten = true
-	cfg.FlattenAggression = 0.10   // 10% below mid — very aggressive
-	cfg.FlattenMaxDeviation = 0.02 // cap at 2% below mid
+	cfg.FlattenAggression = 0.10   // 10% above mid — would be wide without cap
+	cfg.FlattenMaxDeviation = 0.02 // cap at 2% above mid
 	mid := 100_000.0
 	ex := &mockExchange{state: exchange.StateSnapshot{
 		Inventory: 0.002, // long
@@ -675,22 +675,22 @@ func TestFlattenMaxDeviationCapsLongSellPrice(t *testing.T) {
 	if len(ex.placed) == 0 {
 		t.Fatal("expected flatten order")
 	}
-	// Price must not be more than 2% below mid.
-	minAllowed := mid * (1.0 - cfg.FlattenMaxDeviation)
-	if ex.placed[0].Price < minAllowed {
-		t.Errorf("flatten sell price %.2f is below FlattenMaxDeviation floor %.2f",
-			ex.placed[0].Price, minAllowed)
+	// Price must not be more than 2% above mid.
+	maxAllowed := mid * (1.0 + cfg.FlattenMaxDeviation)
+	if ex.placed[0].Price > maxAllowed {
+		t.Errorf("flatten sell price %.2f exceeds FlattenMaxDeviation cap %.2f",
+			ex.placed[0].Price, maxAllowed)
 	}
 }
 
-// FlattenMaxDeviation caps the flatten buy price (short position) when FlattenAggression
-// would place the order too far above mid.
+// FlattenMaxDeviation floors the flatten buy price (short position) when FlattenAggression
+// would place the order too far below mid.
 func TestFlattenMaxDeviationCapsShortBuyPrice(t *testing.T) {
 	cfg := testConfig()
 	cfg.MaxInventory = 0.001
 	cfg.AutoFlatten = true
-	cfg.FlattenAggression = 0.10   // 10% above mid — very aggressive
-	cfg.FlattenMaxDeviation = 0.02 // cap at 2% above mid
+	cfg.FlattenAggression = 0.10   // 10% below mid — would be wide without floor
+	cfg.FlattenMaxDeviation = 0.02 // floor at 2% below mid
 	mid := 100_000.0
 	ex := &mockExchange{state: exchange.StateSnapshot{
 		Inventory: -0.002, // short
@@ -704,11 +704,11 @@ func TestFlattenMaxDeviationCapsShortBuyPrice(t *testing.T) {
 	if len(ex.placed) == 0 {
 		t.Fatal("expected flatten order")
 	}
-	// Price must not be more than 2% above mid.
-	maxAllowed := mid * (1.0 + cfg.FlattenMaxDeviation)
-	if ex.placed[0].Price > maxAllowed {
-		t.Errorf("flatten buy price %.2f exceeds FlattenMaxDeviation cap %.2f",
-			ex.placed[0].Price, maxAllowed)
+	// Price must not be more than 2% below mid.
+	minAllowed := mid * (1.0 - cfg.FlattenMaxDeviation)
+	if ex.placed[0].Price < minAllowed {
+		t.Errorf("flatten buy price %.2f is below FlattenMaxDeviation floor %.2f",
+			ex.placed[0].Price, minAllowed)
 	}
 }
 
@@ -717,7 +717,7 @@ func TestFlattenMaxDeviationZeroDisablesCap(t *testing.T) {
 	cfg := testConfig()
 	cfg.MaxInventory = 0.001
 	cfg.AutoFlatten = true
-	cfg.FlattenAggression = 0.10  // 10% below mid
+	cfg.FlattenAggression = 0.10  // 10% above mid
 	cfg.FlattenMaxDeviation = 0.0 // disabled
 	mid := 100_000.0
 	ex := &mockExchange{state: exchange.StateSnapshot{
@@ -732,9 +732,9 @@ func TestFlattenMaxDeviationZeroDisablesCap(t *testing.T) {
 	if len(ex.placed) == 0 {
 		t.Fatal("expected flatten order")
 	}
-	// With no cap, price should be ~10% below mid (after tick rounding).
-	expected := mid * (1.0 - cfg.FlattenAggression)
-	if ex.placed[0].Price > expected+1.0 {
+	// With no cap, price should be ~10% above mid (after tick rounding).
+	expected := mid * (1.0 + cfg.FlattenAggression)
+	if ex.placed[0].Price < expected-1.0 {
 		t.Errorf("expected uncapped price near %.2f, got %.2f", expected, ex.placed[0].Price)
 	}
 }

@@ -16,6 +16,7 @@ import (
 	"decibel-mm-bot/aptos"
 	"decibel-mm-bot/config"
 	"decibel-mm-bot/exchange"
+	"decibel-mm-bot/logging"
 )
 
 // DecibelExchange implements exchange.Exchange for Decibel DEX on Aptos.
@@ -157,7 +158,14 @@ func (d *DecibelExchange) PlaceOrder(ctx context.Context, req exchange.PlaceOrde
 
 	label := "POST_ONLY"
 	if req.ReduceOnly {
-		label = "reduce-only GTC"
+		switch req.TimeInForce {
+		case 1:
+			label = "reduce-only POST_ONLY"
+		case 2:
+			label = "reduce-only IOC"
+		default:
+			label = "reduce-only GTC"
+		}
 	}
 	slog.Info(fmt.Sprintf("placing %s order", label),
 		"side", side, "price", req.Price, "size", req.Size,
@@ -190,9 +198,9 @@ func (d *DecibelExchange) PlaceOrder(ctx context.Context, req exchange.PlaceOrde
 	}
 	oid := aptos.OrderIDFromEvents(result.Events)
 	if oid != "" {
-		slog.Info("order placed", "side", side, "price", req.Price, "size", req.Size, "tx_hash", result.Hash, "order_id", oid)
+		logging.Success("order placed", "side", side, "price", req.Price, "size", req.Size, "tx_hash", result.Hash, "order_id", oid)
 	} else {
-		slog.Info("order placed", "side", side, "price", req.Price, "size", req.Size, "tx_hash", result.Hash)
+		logging.Success("order placed", "side", side, "price", req.Price, "size", req.Size, "tx_hash", result.Hash)
 	}
 	return exchange.PlaceOrderOutcome{TxHash: result.Hash, OrderID: oid}, nil
 }
@@ -310,12 +318,11 @@ func (d *DecibelExchange) PlaceBulkOrders(ctx context.Context, bids, asks []exch
 		slog.Error("bulk orders submission failed", "bids", len(bids), "asks", len(asks), "err", err)
 		return err
 	}
-	slog.Info("bulk orders submitted", "tx_hash", result.Hash)
 	if !result.Success {
 		slog.Error("bulk orders execution failed", "vm_status", result.VMStatus)
 		return fmt.Errorf("place bulk orders failed: vm_status=%s", result.VMStatus)
 	}
-	slog.Info("bulk orders placed", "bids", len(bids), "asks", len(asks), "tx_hash", result.Hash)
+	logging.Success("bulk orders placed", "bids", len(bids), "asks", len(asks), "tx_hash", result.Hash)
 	return nil
 }
 
@@ -360,12 +367,11 @@ func (d *DecibelExchange) CancelBulkOrders(ctx context.Context) error {
 		}
 		return err
 	}
-	slog.Info("cancel bulk orders submitted", "tx_hash", result.Hash)
 	if !result.Success {
 		slog.Error("cancel bulk orders execution failed", "vm_status", result.VMStatus)
 		return fmt.Errorf("cancel bulk orders failed: vm_status=%s", result.VMStatus)
 	}
-	slog.Info("bulk orders cancelled", "tx_hash", result.Hash)
+	logging.Success("bulk orders cancelled", "tx_hash", result.Hash)
 	return nil
 }
 

@@ -29,7 +29,7 @@ type InfoProvider interface {
 	// stays owned by the strategy.
 	FetchLiveSnapshot(ctx context.Context) (botstate.Snapshot, error)
 
-	// FlattenPosition places a reduce-only order to close the current position.
+	// FlattenPosition places a reduce-only POST_ONLY order to close the current position.
 	// On VM success, PlaceOrderOutcome includes TxHash and OrderID when parsed from events.
 	FlattenPosition(ctx context.Context) (exchange.PlaceOrderOutcome, error)
 

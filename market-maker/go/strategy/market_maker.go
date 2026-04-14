@@ -14,6 +14,7 @@ import (
 	"decibel-mm-bot/botstate"
 	"decibel-mm-bot/config"
 	"decibel-mm-bot/exchange"
+	"decibel-mm-bot/logging"
 	"decibel-mm-bot/pricing"
 )
 
@@ -27,6 +28,9 @@ const marginStuckThreshold = 100
 
 // shutdownBulkCancelMaxAttempts limits REST/Aptos retries for CancelBulkOrders during shutdown.
 const shutdownBulkCancelMaxAttempts = 3
+
+// flattenTimeInForce is POST_ONLY so flatten orders rest as maker (no immediate take).
+const flattenTimeInForce = 1 // exchange: 0=GTC, 1=POST_ONLY, 2=IOC
 
 // MarketMaker runs the inventory-skew market-making strategy.
 type MarketMaker struct {
@@ -59,7 +63,7 @@ type MarketMaker struct {
 
 	// lastFlattenOrderID records the most recently placed reduce-only flatten order.
 	// If this order is still present in state.OpenOrders we skip placing a new one,
-	// preventing unbounded accumulation of GTC flatten orders while inventory stays
+	// preventing unbounded accumulation of POST_ONLY flatten orders while inventory stays
 	// at the limit. Reset to "" when inventory recovers below MaxInventory.
 	lastFlattenOrderID string
 }
@@ -107,21 +111,21 @@ func (m *MarketMaker) FlattenPosition(ctx context.Context) (exchange.PlaceOrderO
 // Run starts the main market-making loop. Blocks until ctx is cancelled.
 func (m *MarketMaker) Run(ctx context.Context) error {
 	for cycle := uint64(1); ; cycle++ {
-		slog.Info("─── cycle start ────────────────────────────────────", "cycle", cycle)
+		logging.Cycle("─── cycle start ────────────────────────────────────", "cycle", cycle)
 
 		if err := m.runCycle(ctx); err != nil {
 			slog.Error("cycle failed", "cycle", cycle, "err", err)
 		}
 
 		sleep := cycleSleepDuration(m.cfg.RefreshInterval, m.cfg.RefreshIntervalJitterS)
-		slog.Info("sleeping",
+		logging.Cycle("sleeping",
 			"refresh_interval", m.cfg.RefreshInterval,
 			"refresh_interval_jitter", m.cfg.RefreshIntervalJitterS,
 			"sleep_seconds", sleep.Seconds(),
 		)
 		select {
 		case <-ctx.Done():
-			slog.Info("shutting down", "reason", ctx.Err())
+			logging.Cycle("shutting down", "reason", ctx.Err())
 			if err := m.shutdownCancelQuotes(); err != nil {
 				return fmt.Errorf("shutdown cancel: %w", err)
 			}
@@ -133,12 +137,12 @@ func (m *MarketMaker) Run(ctx context.Context) error {
 
 // shutdownCancelQuotes revokes bulk market-making quotes for the configured market only.
 // It uses a fresh timeout context because the main ctx is already cancelled on SIGINT/SIGTERM.
-// Single resting orders (e.g. GTC auto-flatten) are not cancelled here by design.
+// Single resting orders (e.g. POST_ONLY auto-flatten) are not cancelled here by design.
 func (m *MarketMaker) shutdownCancelQuotes() error {
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), m.cfg.ShutdownCancelTimeout())
 	defer cancel()
 
-	slog.Info("shutdown: cancelling bulk quotes for this market only (single resting orders, e.g. GTC auto-flatten, are not cancelled)",
+	slog.Info("shutdown: cancelling bulk quotes for this market only (single resting orders, e.g. POST_ONLY auto-flatten, are not cancelled)",
 		"market", m.market.MarketName,
 		"timeout", m.cfg.ShutdownCancelTimeout(),
 	)
@@ -158,7 +162,7 @@ func (m *MarketMaker) shutdownCancelQuotes() error {
 		}
 		err := m.ex.CancelBulkOrders(shutdownCtx)
 		if err == nil {
-			slog.Info("shutdown cleanup complete: bulk cancel succeeded or no bulk quotes to cancel")
+			logging.Success("shutdown cleanup complete: bulk cancel succeeded or no bulk quotes to cancel")
 			return nil
 		}
 		lastErr = err
@@ -395,7 +399,7 @@ func (m *MarketMaker) runCycle(ctx context.Context) error {
 	// Success — reset circuit breaker.
 	m.bulkOrderFailures = 0
 	m.bulkOrderBackoffUntil = time.Time{}
-	slog.Info("cycle complete")
+	logging.Cycle("cycle complete")
 	return nil
 }
 
@@ -438,31 +442,32 @@ func (m *MarketMaker) placeFlattenOrder(ctx context.Context, inventory, mid floa
 	isBuy := inventory < 0
 	absInv := math.Abs(inventory)
 
+	// POST_ONLY: price on the passive side of mid so the order rests as maker
+	// (we do not have BBO in StateSnapshot — mid-based passive quote is the best proxy).
+	// Long → sell above mid; short → buy below mid.
 	var rawPrice float64
 	if isBuy {
-		p := mid * (1.0 + m.cfg.FlattenAggression)
-		// Cap at FlattenMaxDeviation above mid (when non-zero).
-		if m.cfg.FlattenMaxDeviation > 0 {
-			cap := mid * (1.0 + m.cfg.FlattenMaxDeviation)
-			if p > cap {
-				slog.Warn("flatten buy price capped by FlattenMaxDeviation",
-					"uncapped", p, "capped", cap)
-				p = cap
-			}
-		}
-		rawPrice = math.Ceil(p/m.market.TickSize) * m.market.TickSize
-	} else {
 		p := mid * (1.0 - m.cfg.FlattenAggression)
-		// Floor at FlattenMaxDeviation below mid (when non-zero).
 		if m.cfg.FlattenMaxDeviation > 0 {
 			floor := mid * (1.0 - m.cfg.FlattenMaxDeviation)
 			if p < floor {
-				slog.Warn("flatten sell price floored by FlattenMaxDeviation",
+				slog.Warn("flatten buy price floored by FlattenMaxDeviation",
 					"uncapped", p, "floored", floor)
 				p = floor
 			}
 		}
 		rawPrice = math.Floor(p/m.market.TickSize) * m.market.TickSize
+	} else {
+		p := mid * (1.0 + m.cfg.FlattenAggression)
+		if m.cfg.FlattenMaxDeviation > 0 {
+			cap := mid * (1.0 + m.cfg.FlattenMaxDeviation)
+			if p > cap {
+				slog.Warn("flatten sell price capped by FlattenMaxDeviation",
+					"uncapped", p, "capped", cap)
+				p = cap
+			}
+		}
+		rawPrice = math.Ceil(p/m.market.TickSize) * m.market.TickSize
 	}
 
 	size := math.Round(absInv/m.market.LotSize) * m.market.LotSize
@@ -477,7 +482,7 @@ func (m *MarketMaker) placeFlattenOrder(ctx context.Context, inventory, mid floa
 		Price:       rawPrice,
 		Size:        size,
 		IsBuy:       isBuy,
-		TimeInForce: 0, // GTC
+		TimeInForce: flattenTimeInForce,
 		ReduceOnly:  true,
 	})
 }

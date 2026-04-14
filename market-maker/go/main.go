@@ -23,12 +23,15 @@ import (
 	"decibel-mm-bot/config"
 	"decibel-mm-bot/exchange"
 	decibelExchange "decibel-mm-bot/exchange/decibel"
+	"decibel-mm-bot/logging"
 	"decibel-mm-bot/notify"
 	"decibel-mm-bot/notify/telegram"
 	"decibel-mm-bot/strategy"
 )
 
 func main() {
+	logging.Setup(os.Stderr)
+
 	// Load .env before config so all env vars are visible to flag defaults.
 	if err := godotenv.Load(); err == nil {
 		slog.Info("loaded .env file")

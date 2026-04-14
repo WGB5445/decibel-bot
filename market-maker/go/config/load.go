@@ -376,8 +376,8 @@ func registerAllFlags(fs *flag.FlagSet, cfg *Config) {
 	fs.Float64Var(&cfg.ShutdownCancelTimeoutS, "shutdown-cancel-timeout", cfg.ShutdownCancelTimeoutS,
 		"Seconds; time budget for graceful shutdown bulk cancel (CancelBulkOrders); min 5 after validation")
 	fs.BoolVar(&cfg.AutoFlatten, "auto-flatten", cfg.AutoFlatten, "Auto reduce-only order when inventory hits limit")
-	fs.Float64Var(&cfg.FlattenAggression, "flatten-aggression", cfg.FlattenAggression, "Flatten order price offset from mid")
-	fs.Float64Var(&cfg.FlattenMaxDeviation, "flatten-max-deviation", cfg.FlattenMaxDeviation, "Max price deviation from mid for flatten orders (0 = no cap)")
+	fs.Float64Var(&cfg.FlattenAggression, "flatten-aggression", cfg.FlattenAggression, "POST_ONLY flatten: fraction above mid (sell) / below mid (buy); mid is API reference")
+	fs.Float64Var(&cfg.FlattenMaxDeviation, "flatten-max-deviation", cfg.FlattenMaxDeviation, "Cap sell / floor buy vs mid for POST_ONLY flatten (0 = no bound)")
 	fs.BoolVar(&cfg.DryRun, "dry-run", cfg.DryRun, "Log without sending transactions")
 	fs.BoolVar(&cfg.AutoSpread, "auto-spread", cfg.AutoSpread, "Automatically narrow spread after spread-no-fill-cycles cycles with no fill")
 	fs.Float64Var(&cfg.SpreadMin, "spread-min", cfg.SpreadMin, "Minimum spread the auto-adjuster will narrow to")

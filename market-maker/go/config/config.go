@@ -57,9 +57,9 @@ type Config struct {
 	ShutdownCancelTimeoutS float64
 	AutoFlatten            bool
 	FlattenAggression      float64
-	// FlattenMaxDeviation is the maximum price deviation from mid allowed for a
-	// flatten order (e.g. 0.05 = 5%). Prevents over-aggressive pricing in fast
-	// markets. 0 disables the cap.
+	// FlattenMaxDeviation bounds passive POST_ONLY flatten prices vs mid (e.g. 0.05 = 5%).
+	// Long (sell): price capped at mid×(1+dev). Short (buy): price floored at mid×(1−dev).
+	// 0 disables the bound.
 	FlattenMaxDeviation float64
 	DryRun              bool
 
