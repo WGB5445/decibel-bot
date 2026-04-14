@@ -63,7 +63,7 @@ func (t *TelegramNotifier) checkInventoryAlert(as *alertState) {
 	if !exceeded {
 		if activeMsgID != 0 {
 			edit := tgbotapi.NewEditMessageText(as.chatID, activeMsgID,
-				"✅ 仓位已恢复正常范围。")
+				t.tr.PositionRecovered)
 			if _, err := t.api.Send(edit); err != nil && !isTelegramMessageNotModified(err) {
 				slog.Warn("tgbot: failed to update inventory alert (recovery)", "err", err)
 			}
@@ -74,9 +74,9 @@ func (t *TelegramNotifier) checkInventoryAlert(as *alertState) {
 		return
 	}
 
-	text := formatInventoryAlert(snap, maxInv)
+	text := formatInventoryAlert(t.tr, snap, maxInv)
 	showClose := math.Abs(snap.Inventory) >= 1e-9
-	kb := inventoryAlertKeyboard(showClose)
+	kb := t.inventoryAlertKeyboard(showClose)
 
 	if activeMsgID == 0 {
 		// Send a brand-new alert message.
@@ -108,28 +108,28 @@ func (t *TelegramNotifier) handleInventoryCallback(ctx context.Context, cb *tgbo
 
 	switch action {
 	case "close":
-		t.edit(chatID, msgID, "正在平仓", inventoryAlertKeyboard(false))
+		t.edit(chatID, msgID, t.tr.Flattening, t.inventoryAlertKeyboard(false))
 		out, err := t.info.FlattenPosition(ctx)
 		if err != nil {
-			kb := inventoryAlertKeyboard(false)
+			kb := t.inventoryAlertKeyboard(false)
 			if snap, fe := t.info.FetchLiveSnapshot(ctx); fe == nil {
-				kb = inventoryAlertKeyboard(math.Abs(snap.Inventory) >= 1e-9)
+				kb = t.inventoryAlertKeyboard(math.Abs(snap.Inventory) >= 1e-9)
 			}
 			if errors.Is(err, strategy.ErrNoPositionToFlatten) {
-				t.editPlain(chatID, msgID, "ℹ️ 当前目标市场无仓位或仓位过小，无需重复平仓。", kb)
+				t.editPlain(chatID, msgID, t.tr.FlattenNoNeed, kb)
 				return
 			}
-			t.editPlain(chatID, msgID, fmt.Sprintf("❌ 平仓失败: %v", err), kb)
+			t.editPlain(chatID, msgID, fmt.Sprintf(t.tr.FlattenFailFmt, err), kb)
 			return
 		}
 		snap, err2 := t.info.FetchLiveSnapshot(ctx)
 		if err2 != nil {
 			slog.Warn("tgbot: fetch live snapshot after inv flatten failed", "err", err2)
-			t.editPlain(chatID, msgID, fmt.Sprintf("平仓已提交但刷新失败: %v", err2), inventoryAlertKeyboard(true))
+			t.editPlain(chatID, msgID, fmt.Sprintf(t.tr.FlattenInvRefreshFailFmt, err2), t.inventoryAlertKeyboard(true))
 			return
 		}
 		// 平仓结果定格：刷新走新消息仓位；返回走新消息帮助，不 edit 本条。
-		kb := positionsPostCloseKeyboard()
+		kb := t.positionsPostCloseKeyboard()
 		md, plain := t.flattenFollowUpMessage(ctx, out.TxHash, out.OrderID, snap)
 		if plain != "" {
 			t.editPlain(chatID, msgID, plain, kb)
@@ -141,29 +141,29 @@ func (t *TelegramNotifier) handleInventoryCallback(ctx context.Context, cb *tgbo
 		snap, err := t.info.FetchLiveSnapshot(ctx)
 		if err != nil {
 			slog.Warn("tgbot: inv refresh fetch live snapshot failed", "err", err)
-			t.editPlain(chatID, msgID, fmt.Sprintf("刷新失败: %v", err), inventoryAlertKeyboard(true))
+			t.editPlain(chatID, msgID, fmt.Sprintf(t.tr.ErrRefreshFmt, err), t.inventoryAlertKeyboard(true))
 			return
 		}
 		maxInv := t.info.MaxInventory()
 		exceeded := math.Abs(snap.Inventory) >= maxInv
 		if !exceeded {
-			t.edit(chatID, msgID, "✅ 仓位已恢复正常范围。", nil)
+			t.edit(chatID, msgID, t.tr.PositionRecovered, nil)
 			return
 		}
-		text := formatInventoryAlert(snap, maxInv)
+		text := formatInventoryAlert(t.tr, snap, maxInv)
 		showClose := math.Abs(snap.Inventory) >= 1e-9
-		kb := inventoryAlertKeyboard(showClose)
+		kb := t.inventoryAlertKeyboard(showClose)
 		t.edit(chatID, msgID, text, kb)
 	}
 }
 
 // inventoryAlertKeyboard builds the inline keyboard for the inventory alert.
-func inventoryAlertKeyboard(showClose bool) *tgbotapi.InlineKeyboardMarkup {
+func (t *TelegramNotifier) inventoryAlertKeyboard(showClose bool) *tgbotapi.InlineKeyboardMarkup {
 	var row []tgbotapi.InlineKeyboardButton
 	if showClose {
-		row = append(row, tgbotapi.NewInlineKeyboardButtonData("❌ 市价平仓", "inv:close"))
+		row = append(row, tgbotapi.NewInlineKeyboardButtonData(t.tr.BtnMarketClose, "inv:close"))
 	}
-	row = append(row, tgbotapi.NewInlineKeyboardButtonData("🔄 刷新", "inv:refresh"))
+	row = append(row, tgbotapi.NewInlineKeyboardButtonData(t.tr.BtnRefresh, "inv:refresh"))
 	kb := tgbotapi.NewInlineKeyboardMarkup(tgbotapi.NewInlineKeyboardRow(row...))
 	return &kb
 }

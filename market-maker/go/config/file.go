@@ -14,6 +14,7 @@ import (
 // FileConfig is the on-disk shape (JSON / YAML / TOML). Pointer fields mean
 // "omit": nil does not override; non-nil overrides the current Config value.
 type FileConfig struct {
+	Locale                *string  `json:"locale,omitempty"                 yaml:"locale,omitempty"                 toml:"locale,omitempty"`
 	Network               *string  `json:"network,omitempty"                yaml:"network,omitempty"                toml:"network,omitempty"`
 	MarketName            *string  `json:"market_name,omitempty"            yaml:"market_name,omitempty"            toml:"market_name,omitempty"`
 	Spread                *float64 `json:"spread,omitempty"                 yaml:"spread,omitempty"                 toml:"spread,omitempty"`
@@ -80,6 +81,10 @@ func applyFileConfig(dst *Config, src *FileConfig, explicitFile map[string]bool)
 	}
 	if src == nil {
 		return
+	}
+	if src.Locale != nil {
+		dst.Locale = strings.TrimSpace(*src.Locale)
+		set("LOCALE")
 	}
 	if src.Network != nil {
 		dst.Network = strings.TrimSpace(*src.Network)

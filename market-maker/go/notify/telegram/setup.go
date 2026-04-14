@@ -53,11 +53,11 @@ func (t *TelegramNotifier) SetBotCommands(ctx context.Context) error {
 
 	scope := tgbotapi.NewBotCommandScopeAllPrivateChats()
 	cmd := tgbotapi.NewSetMyCommandsWithScope(scope,
-		tgbotapi.BotCommand{Command: "balance", Description: "查看账户余额"},
-		tgbotapi.BotCommand{Command: "gas", Description: "查看钱包 APT 余额"},
-		tgbotapi.BotCommand{Command: "positions", Description: "查看当前仓位"},
-		tgbotapi.BotCommand{Command: "trade_history", Description: "成交历史 trade_history（每页5条，可翻页）"},
-		tgbotapi.BotCommand{Command: "help", Description: "显示帮助"},
+		tgbotapi.BotCommand{Command: "balance", Description: t.tr.CmdBalanceDesc},
+		tgbotapi.BotCommand{Command: "gas", Description: t.tr.CmdGasDesc},
+		tgbotapi.BotCommand{Command: "positions", Description: t.tr.CmdPositionsDesc},
+		tgbotapi.BotCommand{Command: "trade_history", Description: t.tr.CmdTradeHistDesc},
+		tgbotapi.BotCommand{Command: "help", Description: t.tr.CmdHelpDesc},
 	)
 
 	ch := make(chan error, 1)

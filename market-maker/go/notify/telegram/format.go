@@ -12,29 +12,25 @@ import (
 
 	"decibel-mm-bot/api"
 	"decibel-mm-bot/botstate"
+	"decibel-mm-bot/i18n"
 )
 
 // ── Balance ──────────────────────────────────────────────────────────────────
 
-func formatBalance(snap botstate.Snapshot) string {
+func formatBalance(tr *i18n.Telegram, snap botstate.Snapshot) string {
 	available := snap.Equity * (1.0 - snap.MarginUsage)
-	return fmt.Sprintf(
-		"*💰 账户余额*\n"+
-			"可用余额: `$%.2f`\n"+
-			"总权益: `$%.2f`\n"+
-			"保证金占用: `%.1f%%`\n"+
-			"_%s_",
-		available, snap.Equity, snap.MarginUsage*100, cycleAge(snap.LastCycleAt),
+	return fmt.Sprintf(tr.BalanceFmt,
+		available, snap.Equity, snap.MarginUsage*100, cycleAge(tr, snap.LastCycleAt),
 	)
 }
 
 // ── Gas ──────────────────────────────────────────────────────────────────────
 
-func formatGas(walletAddr string, aptBal float64, err error) string {
+func formatGas(tr *i18n.Telegram, walletAddr string, aptBal float64, err error) string {
 	if err != nil {
-		return fmt.Sprintf("*⛽ Gas 钱包*\n地址: `%s`\n❌ 查询失败: %v", walletAddr, err)
+		return fmt.Sprintf(tr.GasErrFmt, walletAddr, err)
 	}
-	return fmt.Sprintf("*⛽ Gas 钱包*\n地址: `%s`\nAPT 余额: `%.4f APT`", walletAddr, aptBal)
+	return fmt.Sprintf(tr.GasFmt, walletAddr, aptBal)
 }
 
 // ── Positions ────────────────────────────────────────────────────────────────
@@ -110,8 +106,8 @@ func telegramPlainDisplayWidth(s string) int {
 }
 
 // markdownHeadingWithPage renders one Markdown line: bold left, padded spaces, italic page.
-func markdownHeadingWithPage(leftBold string, page1Based, totalPages int) string {
-	right := fmt.Sprintf("_第 %d/%d 页_", page1Based, totalPages)
+func markdownHeadingWithPage(tr *i18n.Telegram, leftBold string, page1Based, totalPages int) string {
+	right := fmt.Sprintf(tr.PageFmt, page1Based, totalPages)
 	leftInner := strings.TrimSuffix(strings.TrimPrefix(leftBold, "*"), "*")
 	rightInner := strings.TrimSuffix(strings.TrimPrefix(right, "_"), "_")
 	lw := telegramPlainDisplayWidth(leftInner)
@@ -125,8 +121,8 @@ func markdownHeadingWithPage(leftBold string, page1Based, totalPages int) string
 }
 
 // positionsHeadingLine is one Markdown line: bold title left, italic page right.
-func positionsHeadingLine(page1Based, totalPages int) string {
-	return markdownHeadingWithPage("*📊 当前仓位*", page1Based, totalPages)
+func positionsHeadingLine(tr *i18n.Telegram, page1Based, totalPages int) string {
+	return markdownHeadingWithPage(tr, tr.PositionsTitleBold, page1Based, totalPages)
 }
 
 func positionMid(snap botstate.Snapshot, marketID string) (float64, bool) {
@@ -163,18 +159,18 @@ func positionPnL(p botstate.Position, markMid float64) (float64, float64, bool) 
 	return pnl, pnl / base * 100, true
 }
 
-func positionDirectionDisplay(size float64) string {
+func positionDirectionDisplay(tr *i18n.Telegram, size float64) string {
 	if size < 0 {
-		return "空 ▼"
+		return tr.PosShort
 	}
-	return "多 ▲"
+	return tr.PosLong
 }
 
-func positionPnLLabel(pnl float64) string {
+func positionPnLLabel(tr *i18n.Telegram, pnl float64) string {
 	if pnl < 0 {
-		return "亏损"
+		return tr.PnLLoss
 	}
-	return "盈利"
+	return tr.PnLProfit
 }
 
 // positionsEmptySpacer adds vertical whitespace so the “no positions” message is
@@ -192,7 +188,7 @@ func positionsEmptySpacer() string {
 // formatPositions renders the positions view for Telegram (paged).
 // marketName resolves market addr to display name (e.g. from /markets catalog).
 // page is zero-based; refresh should pass 0 per product spec.
-func formatPositions(snap botstate.Snapshot, page int, marketName func(string) string) string {
+func formatPositions(tr *i18n.Telegram, snap botstate.Snapshot, page int, marketName func(string) string) string {
 	if marketName == nil {
 		marketName = func(addr string) string {
 			if botstate.IDEqual(addr, snap.TargetMarketID) {
@@ -204,11 +200,11 @@ func formatPositions(snap botstate.Snapshot, page int, marketName func(string) s
 	list := positionsForDisplay(snap)
 	if len(list) == 0 {
 		var sb strings.Builder
-		sb.WriteString(positionsHeadingLine(1, 1))
+		sb.WriteString(positionsHeadingLine(tr, 1, 1))
 		sb.WriteString("\n\n")
-		sb.WriteString("_暂无持仓_\n")
+		sb.WriteString(tr.PosEmpty + "\n")
 		sb.WriteString(positionsEmptySpacer())
-		sb.WriteString(fmt.Sprintf("\n_%s_", cycleAge(snap.LastCycleAt)))
+		sb.WriteString(fmt.Sprintf("\n_%s_", cycleAge(tr, snap.LastCycleAt)))
 		return sb.String()
 	}
 	page = ClampPositionsPage(page, snap)
@@ -220,61 +216,61 @@ func formatPositions(snap botstate.Snapshot, page int, marketName func(string) s
 	}
 
 	var sb strings.Builder
-	sb.WriteString(positionsHeadingLine(page+1, tp))
+	sb.WriteString(positionsHeadingLine(tr, page+1, tp))
 	sb.WriteString("\n\n")
 
 	for i, p := range list[start:end] {
 		if i > 0 {
-			sb.WriteString("  ──────────────\n")
+			sb.WriteString(tr.PosSep + "\n")
 		}
 		label := marketName(p.MarketID)
 		markMid, hasMid := positionMid(snap, p.MarketID)
 		notional, hasNotional := positionNotional(p, markMid, hasMid)
-		dir := positionDirectionDisplay(p.Size)
+		dir := positionDirectionDisplay(tr, p.Size)
 		sb.WriteString(fmt.Sprintf("• *%s* · *%s*\n", escapeMarkdown(label), dir))
-		sb.WriteString(fmt.Sprintf("  持仓 `%.5f` · 杠杆 `%.0fx`\n", math.Abs(p.Size), p.UserLeverage))
+		sb.WriteString(fmt.Sprintf(tr.SizeLevFmt, math.Abs(p.Size), p.UserLeverage))
 
 		switch {
 		case p.EntryPrice > 0 && hasMid:
-			sb.WriteString(fmt.Sprintf("  开仓价 `$%.2f` · 当前价 `$%.2f`\n", p.EntryPrice, markMid))
+			sb.WriteString(fmt.Sprintf(tr.EntryMidFmt, p.EntryPrice, markMid))
 		case p.EntryPrice > 0:
-			sb.WriteString(fmt.Sprintf("  开仓价 `$%.2f` · 当前价 `—`\n", p.EntryPrice))
+			sb.WriteString(fmt.Sprintf(tr.EntryDashFmt, p.EntryPrice))
 		case hasMid:
-			sb.WriteString(fmt.Sprintf("  当前价 `$%.2f`\n", markMid))
+			sb.WriteString(fmt.Sprintf(tr.MidOnlyFmt, markMid))
 		}
 
 		switch {
 		case hasNotional && hasMid:
-			sb.WriteString(fmt.Sprintf("  持仓价值 `$%.2f`\n", notional))
+			sb.WriteString(fmt.Sprintf(tr.NotionalFmt, notional))
 			pnl, pct, ok := positionPnL(p, markMid)
 			if ok {
-				sb.WriteString(fmt.Sprintf("  %s(估算) %s\n", positionPnLLabel(pnl), formatPnL(pnl, pct)))
+				sb.WriteString(fmt.Sprintf(tr.PnLEstFmt, positionPnLLabel(tr, pnl), formatPnL(pnl, pct)))
 			} else {
-				sb.WriteString("  盈亏(估算) `—`\n")
+				sb.WriteString(tr.PnLNA)
 			}
 		case hasNotional:
-			sb.WriteString(fmt.Sprintf("  持仓价值 `$%.2f`\n", notional))
-			sb.WriteString("  盈亏(估算) `—`\n")
+			sb.WriteString(fmt.Sprintf(tr.NotionalFmt, notional))
+			sb.WriteString(tr.PnLNA)
 		case hasMid:
 			if pnl, pct, ok := positionPnL(p, markMid); ok {
-				sb.WriteString(fmt.Sprintf("  %s(估算) %s\n", positionPnLLabel(pnl), formatPnL(pnl, pct)))
+				sb.WriteString(fmt.Sprintf(tr.PnLEstFmt, positionPnLLabel(tr, pnl), formatPnL(pnl, pct)))
 			} else {
-				sb.WriteString("  盈亏(估算) `—`\n")
+				sb.WriteString(tr.PnLNA)
 			}
 		}
 
 		var extras []string
 		if p.UnrealizedFunding != 0 {
-			extras = append(extras, fmt.Sprintf("资金费 `$%.4f`", p.UnrealizedFunding))
+			extras = append(extras, fmt.Sprintf(tr.FundingFmt, p.UnrealizedFunding))
 		}
 		if p.EstimatedLiquidationPrice > 0 {
-			extras = append(extras, fmt.Sprintf("强平 `$%.2f`", p.EstimatedLiquidationPrice))
+			extras = append(extras, fmt.Sprintf(tr.LiqFmt, p.EstimatedLiquidationPrice))
 		}
 		if len(extras) > 0 {
 			sb.WriteString("  " + strings.Join(extras, " · ") + "\n")
 		}
 	}
-	sb.WriteString(fmt.Sprintf("\n_%s_", cycleAge(snap.LastCycleAt)))
+	sb.WriteString(fmt.Sprintf("\n_%s_", cycleAge(tr, snap.LastCycleAt)))
 	return sb.String()
 }
 
@@ -286,31 +282,30 @@ func telegramPreBlock(body string) string {
 }
 
 // formatTradeFromHistory formats one trade_history row after a successful flatten.
-// Source is intentionally omitted in Telegram UI (no "来源" line).
-func formatTradeFromHistory(tr api.TradeHistoryItem, marketName, txHash string) string {
-	ts := "—"
-	if tr.TransactionUnixMs > 0 {
-		ts = time.UnixMilli(tr.TransactionUnixMs).In(time.Local).Format("2006-01-02 15:04:05")
+func formatTradeFromHistory(tr *i18n.Telegram, trd api.TradeHistoryItem, marketName, txHash string) string {
+	ts := tr.EmDash
+	if trd.TransactionUnixMs > 0 {
+		ts = time.UnixMilli(trd.TransactionUnixMs).In(time.Local).Format("2006-01-02 15:04:05")
 	}
-	action := tradeActionDisplay(tr.Action)
+	action := tradeActionDisplay(tr, trd.Action)
 	var sb strings.Builder
-	sb.WriteString("*✅ 平仓成交*\n\n")
-	sb.WriteString(fmt.Sprintf("• *%s*\n", escapeMarkdown(marketName)))
-	sb.WriteString(fmt.Sprintf("  *%s*\n", action))
-	sb.WriteString(fmt.Sprintf("  成交价 `$%.4f` · 数量 `%.4f`\n", tr.Price, tr.Size))
-	sb.WriteString(fmt.Sprintf("  实现盈亏 `$%.4f`\n", tr.RealizedPnlAmount))
-	sb.WriteString(fmt.Sprintf("  资金费 `$%.4f` · 手续费 `$%.4f`\n", tr.RealizedFundingAmount, tr.FeeAmount))
-	sb.WriteString(fmt.Sprintf("  时间 `%s`\n", escapeMarkdown(ts)))
-	sb.WriteString("tx:\n")
+	sb.WriteString(tr.TradeFilledTitle)
+	sb.WriteString(fmt.Sprintf(tr.TradeLineMarket, escapeMarkdown(marketName)))
+	sb.WriteString(fmt.Sprintf(tr.TradeLineAction, action))
+	sb.WriteString(fmt.Sprintf(tr.TradePxQtyFmt, trd.Price, trd.Size))
+	sb.WriteString(fmt.Sprintf(tr.TradeRealFmt, trd.RealizedPnlAmount))
+	sb.WriteString(fmt.Sprintf(tr.TradeFeeFmt, trd.RealizedFundingAmount, trd.FeeAmount))
+	sb.WriteString(fmt.Sprintf(tr.TradeTimeFmt, escapeMarkdown(ts)))
+	sb.WriteString(tr.TradeTxLine)
 	sb.WriteString(telegramPreBlock(strings.TrimSpace(txHash)))
-	sb.WriteString("\n_本条为平仓结果，不再更新。点「刷新」在下方新消息查看仓位。_")
+	sb.WriteString(tr.TradeResultFootnote)
 	return sb.String()
 }
 
 // formatFlattenSubmittedNoHistory is shown when the chain accepted the order but
 // REST has no matching trade row yet (or order_id unknown).
-func formatFlattenSubmittedNoHistory(snap botstate.Snapshot, txHash, orderID string, reason string) string {
-	midStr := "市价"
+func formatFlattenSubmittedNoHistory(tr *i18n.Telegram, snap botstate.Snapshot, txHash, orderID string, reason string) string {
+	midStr := tr.MarketPriceWord
 	if snap.Mid != nil {
 		midStr = fmt.Sprintf("$%.2f", *snap.Mid)
 	}
@@ -321,14 +316,12 @@ func formatFlattenSubmittedNoHistory(snap botstate.Snapshot, txHash, orderID str
 	if strings.TrimSpace(reason) != "" {
 		extra += "\n_" + escapeMarkdown(reason) + "_"
 	}
-	return fmt.Sprintf(
-		"*✅ 平仓单已提交* (~%s)\n"+
-			"tx:\n%s%s\n"+
-			"请稍后点「刷新」在新消息查看仓位，或点「成交」查看历史。\n"+
-			"_本条为平仓结果，不再更新。_\n"+
-			"_%s_",
-		midStr, telegramPreBlock(strings.TrimSpace(txHash)), extra, cycleAge(snap.LastCycleAt),
-	)
+	return fmt.Sprintf(tr.FlattenSubmittedTitleFmt, midStr) +
+		tr.FlattenSubmittedTx +
+		telegramPreBlock(strings.TrimSpace(txHash)) + extra + "\n" +
+		tr.FlattenSubmittedHint +
+		tr.FlattenSubmittedFoot +
+		fmt.Sprintf("_%s_", cycleAge(tr, snap.LastCycleAt))
 }
 
 // ── Recent trades (Telegram) ───────────────────────────────────────────────
@@ -346,21 +339,21 @@ func normTradeAction(action string) string {
 	return strings.ToLower(s)
 }
 
-// tradeActionDisplay maps API action strings to short Chinese labels for Telegram.
-func tradeActionDisplay(action string) string {
+// tradeActionDisplay maps API action strings to short labels for Telegram.
+func tradeActionDisplay(tr *i18n.Telegram, action string) string {
 	switch normTradeAction(action) {
 	case "closelong":
-		return "平多"
+		return tr.TradeCloseLong
 	case "closeshort":
-		return "平空"
+		return tr.TradeCloseShort
 	case "openlong":
-		return "开多"
+		return tr.TradeOpenLong
 	case "openshort":
-		return "开空"
+		return tr.TradeOpenShort
 	default:
 		a := strings.TrimSpace(action)
 		if a == "" {
-			return "—"
+			return tr.EmDash
 		}
 		return a
 	}
@@ -386,8 +379,8 @@ func ClampTradesPage(page, itemCount int) int {
 	return page
 }
 
-func tradesHeadingLine(page1Based, totalPages int) string {
-	return markdownHeadingWithPage("*📜 最近成交*", page1Based, totalPages)
+func tradesHeadingLine(tr *i18n.Telegram, page1Based, totalPages int) string {
+	return markdownHeadingWithPage(tr, tr.TradesTitleBold, page1Based, totalPages)
 }
 
 // tradeCardSeparator is a plain-text rule between fills (Telegram legacy Markdown).
@@ -403,44 +396,39 @@ func tradeMarketForCode(mname string) string {
 }
 
 // formatOneRecentTrade renders one fill. rank1 is the global 1-based index across all fetched rows (stable across pages).
-func formatOneRecentTrade(tr api.TradeHistoryItem, marketName func(string) string, rank1 int) string {
+func formatOneRecentTrade(tr *i18n.Telegram, trd api.TradeHistoryItem, marketName func(string) string, rank1 int) string {
 	if marketName == nil {
 		marketName = func(addr string) string { return addr }
 	}
-	mname := strings.TrimSpace(marketName(tr.Market))
+	mname := strings.TrimSpace(marketName(trd.Market))
 	if mname == "" {
-		mname = tr.Market
+		mname = trd.Market
 	}
-	ts := "—"
-	if tr.TransactionUnixMs > 0 {
-		ts = time.UnixMilli(tr.TransactionUnixMs).In(time.Local).Format("1/2 15:04")
+	ts := tr.EmDash
+	if trd.TransactionUnixMs > 0 {
+		ts = time.UnixMilli(trd.TransactionUnixMs).In(time.Local).Format("1/2 15:04")
 	}
-	sz := math.Abs(tr.Size)
+	sz := math.Abs(trd.Size)
 	mktCode := tradeMarketForCode(mname)
 
 	var b strings.Builder
-	// Global numbering (page 2 starts at 6 when page size is 5). ZWSP avoids ordered-list parsing.
 	b.WriteString(telegramLineNoListPrefix)
 	b.WriteString(fmt.Sprintf("%d. ", rank1))
-	// Title: action + market (code span keeps names readable even with slashes / underscores).
-	b.WriteString("*" + tradeActionDisplay(tr.Action) + "* · `" + mktCode + "`\n")
-	// Fill: price / size on one labeled row.
-	b.WriteString(fmt.Sprintf("  成交价 `$%.4f` · 数量 `%.4f`\n", tr.Price, sz))
-	// PnL + fees: one scan line.
+	b.WriteString("*" + tradeActionDisplay(tr, trd.Action) + "* · `" + mktCode + "`\n")
+	b.WriteString(fmt.Sprintf(tr.RecentPxQtyFmt, trd.Price, sz))
 	b.WriteString(fmt.Sprintf(
-		"  盈亏 `$%.4f` · 资金费 `$%.4f` · 手续费 `$%.4f`\n",
-		tr.RealizedPnlAmount, tr.RealizedFundingAmount, tr.FeeAmount,
+		tr.RecentPnLLineFmt,
+		trd.RealizedPnlAmount, trd.RealizedFundingAmount, trd.FeeAmount,
 	))
-	// Meta: time only (source omitted in Telegram UI).
-	b.WriteString(fmt.Sprintf("  时间 `%s`", escapeMarkdown(ts)))
+	b.WriteString(fmt.Sprintf(tr.RecentTimeFmt, escapeMarkdown(ts)))
 	return b.String()
 }
 
 // formatRecentTrades renders paged trade_history for Telegram (Markdown).
 // page is zero-based; refresh should pass 0.
-func formatRecentTrades(items []api.TradeHistoryItem, page int, marketName func(string) string) string {
+func formatRecentTrades(tr *i18n.Telegram, items []api.TradeHistoryItem, page int, marketName func(string) string) string {
 	if len(items) == 0 {
-		return "*📜 最近成交*\n暂无记录。"
+		return tr.RecentTradesEmpty
 	}
 	page = ClampTradesPage(page, len(items))
 	tp := TradesTotalPages(len(items))
@@ -451,23 +439,23 @@ func formatRecentTrades(items []api.TradeHistoryItem, page int, marketName func(
 	}
 
 	var sb strings.Builder
-	sb.WriteString(tradesHeadingLine(page+1, tp))
+	sb.WriteString(tradesHeadingLine(tr, page+1, tp))
 	sb.WriteString("\n\n")
 	for i := start; i < end; i++ {
 		if i > start {
 			sb.WriteString("\n" + tradeCardSeparator + "\n")
 		}
-		sb.WriteString(formatOneRecentTrade(items[i], marketName, i+1))
+		sb.WriteString(formatOneRecentTrade(tr, items[i], marketName, i+1))
 	}
 	return sb.String()
 }
 
 // ── Inventory alert ──────────────────────────────────────────────────────────
 
-func formatInventoryAlert(snap botstate.Snapshot, maxInventory float64) string {
-	dir := "LONG ▲"
+func formatInventoryAlert(tr *i18n.Telegram, snap botstate.Snapshot, maxInventory float64) string {
+	dir := tr.InvSideLong
 	if snap.Inventory < 0 {
-		dir = "SHORT ▼"
+		dir = tr.InvSideShort
 	}
 	midStr := "N/A"
 	if snap.Mid != nil {
@@ -478,15 +466,15 @@ func formatInventoryAlert(snap botstate.Snapshot, maxInventory float64) string {
 	if snap.EntryPrice > 0 && snap.Mid != nil {
 		pnl := (*snap.Mid - snap.EntryPrice) * snap.Inventory
 		pct := (*snap.Mid - snap.EntryPrice) / snap.EntryPrice * 100
-		pnlLine = fmt.Sprintf("\n~盈亏: %s", formatPnL(pnl, pct))
+		pnlLine = fmt.Sprintf(tr.InvPnLPrefixFmt+"%s", formatPnL(pnl, pct))
 	}
 
 	return fmt.Sprintf(
-		"⚠️ *仓位超限提醒*\n"+
-			"市场: `%s`\n"+
-			"方向: `%s`\n"+
-			"仓位: `%.5f` (限制: `%.5f`)"+
-			"\n当前价: `%s`%s",
+		tr.InvAlertTitle+
+			tr.InvAlertMarketFmt+
+			tr.InvAlertSideFmt+
+			tr.InvAlertPosFmt+
+			tr.InvAlertMidFmt+"%s",
 		escapeMarkdown(snap.TargetMarketName), dir,
 		math.Abs(snap.Inventory), maxInventory,
 		midStr, pnlLine,
@@ -495,50 +483,46 @@ func formatInventoryAlert(snap botstate.Snapshot, maxInventory float64) string {
 
 // ── Help ─────────────────────────────────────────────────────────────────────
 
-func formatHelp(cfg Config) string {
+func formatHelp(cfg Config, tr *i18n.Telegram) string {
 	var sb strings.Builder
-	sb.WriteString("*🤖 Decibel 做市机器人*\n\n")
-	sb.WriteString("*可用命令*\n")
-	sb.WriteString("/balance — 查看账户余额\n")
-	sb.WriteString("/gas — 查看钱包 APT 余额\n")
-	sb.WriteString("/positions — 查看当前仓位\n")
-	sb.WriteString("`/trade_history` — 最近成交（每页 5 条，可翻页）\n")
-	sb.WriteString("/help — 显示帮助\n")
-	sb.WriteString("下方按钮可快捷打开对应视图（与命令等价）。\n\n")
+	sb.WriteString(tr.HelpTitle)
+	sb.WriteString(tr.HelpCmdHeader)
+	sb.WriteString(tr.HelpCmdBalance)
+	sb.WriteString(tr.HelpCmdGas)
+	sb.WriteString(tr.HelpCmdPositions)
+	sb.WriteString(tr.HelpCmdTrades)
+	sb.WriteString(tr.HelpCmdHelp)
+	sb.WriteString(tr.HelpButtonsHint)
 
-	sb.WriteString("*Telegram 配置*\n")
-	sb.WriteString("启用 bot 需同时设置 `TG_BOT_TOKEN` 与 `TG_ADMIN_ID`（环境变量或 `--tg-token` / `--tg-admin-id`）。\n")
-	sb.WriteString("凭证优先用 `.env`；命令行传参会出现在进程列表。\n")
-	sb.WriteString("库存告警：`TG_ALERT_INVENTORY`（或 `--tg-alert-inventory`）\n")
-	sb.WriteString("告警间隔（分钟）：`TG_ALERT_INVENTORY_INTERVAL_MIN`（或 `--tg-alert-interval`）\n")
-	sb.WriteString("严格启动：`TG_STRICT_START`（或 `--tg-strict-start`）— Telegram 就绪失败则进程退出。\n\n")
+	sb.WriteString(tr.HelpTgHeader)
+	sb.WriteString(tr.HelpTgBody)
 
-	alertLine := "仓位超限提醒: 关闭"
+	alertLine := tr.HelpAlertOff
 	if cfg.AlertInventory {
-		alertLine = fmt.Sprintf("仓位超限提醒: 开启（每 %d 分钟检查）", cfg.AlertInventoryInterval)
+		alertLine = fmt.Sprintf(tr.HelpAlertOnFmt, cfg.AlertInventoryInterval)
 	}
-	sb.WriteString("*当前进程*\n")
+	sb.WriteString(tr.HelpProcessHeader)
 	sb.WriteString(alertLine)
 	sb.WriteString("\n\n")
 
-	sb.WriteString("*安全说明*\n")
-	sb.WriteString("仅在私聊中与配置的 admin 生效；群组内不响应。\n")
+	sb.WriteString(tr.HelpSecurityHeader)
+	sb.WriteString(tr.HelpSecurityBody)
 
 	return sb.String()
 }
 
 // ── Internal helpers ─────────────────────────────────────────────────────────
 
-func cycleAge(lastCycleAt time.Time) string {
+func cycleAge(tr *i18n.Telegram, lastCycleAt time.Time) string {
 	if lastCycleAt.IsZero() {
-		return "正在获取..."
+		return tr.CycleAgeFetching
 	}
 	t := lastCycleAt.Local()
 	now := time.Now().In(t.Location())
 	if t.Year() == now.Year() {
-		return "更新于 " + t.Format("1/2 15:04:05")
+		return tr.CycleAgeUpdatedPrefix + t.Format("1/2 15:04:05")
 	}
-	return "更新于 " + t.Format("2006/1/2 15:04:05")
+	return tr.CycleAgeUpdatedPrefix + t.Format("2006/1/2 15:04:05")
 }
 
 func formatPnL(pnl, pct float64) string {

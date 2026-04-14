@@ -80,6 +80,9 @@ type Config struct {
 	MarketAddrOverride string // skips API discovery
 	RestAPIBase        string
 
+	// Locale is UI language for bot-facing copy: "zh" (default) or "en". Set via LOCALE / BOT_LOCALE, config file, or -locale.
+	Locale string
+
 	// ── Telegram ─────────────────────────────────────────────────────────────
 	TGBotToken               string // TG_BOT_TOKEN or -tg-token
 	TGAdminID                int64  // TG_ADMIN_ID or -tg-admin-id
@@ -94,6 +97,8 @@ func (c *Config) TelegramEnabled() bool {
 }
 
 func (c *Config) validate() error {
+	c.Locale = normalizeBotLocale(c.Locale)
+
 	// Clamp TGAlertInventoryInterval to avoid time.NewTicker(0) panic.
 	if c.TGAlertInventoryInterval <= 0 {
 		c.TGAlertInventoryInterval = 30
@@ -270,6 +275,16 @@ func isBoolToken(s string) bool {
 		return true
 	default:
 		return false
+	}
+}
+
+// normalizeBotLocale returns a stable UI language tag: "zh" or "en".
+func normalizeBotLocale(s string) string {
+	switch strings.ToLower(strings.TrimSpace(s)) {
+	case "en", "english":
+		return "en"
+	default:
+		return "zh"
 	}
 }
 

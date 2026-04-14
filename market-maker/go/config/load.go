@@ -131,9 +131,19 @@ func LoadWith(opts LoadOptions) (*Config, error) {
 	return cfg, cfg.validate()
 }
 
+// envLocale reads BOT_LOCALE first, then LOCALE, default "zh".
+func envLocale() string {
+	if v := strings.TrimSpace(os.Getenv("BOT_LOCALE")); v != "" {
+		return v
+	}
+	return envStr("LOCALE", "zh")
+}
+
 func newConfigFromEnvProfile(profile NetworkProfile, networkEnv string) *Config {
 	return &Config{
 		Network: networkEnv,
+
+		Locale: envLocale(),
 
 		MarketName:             envStr("MARKET_NAME", "BTC/USD"),
 		Spread:                 envFloat("SPREAD", 0.001),
@@ -178,6 +188,12 @@ func newConfigFromEnvProfile(profile NetworkProfile, networkEnv string) *Config 
 // Numeric / bool keys: non-empty getenv and successful parse (matches envFloat/envBool).
 func explicitEnvKeys() map[string]bool {
 	m := make(map[string]bool)
+	if os.Getenv("LOCALE") != "" {
+		m["LOCALE"] = true
+	}
+	if os.Getenv("BOT_LOCALE") != "" {
+		m["BOT_LOCALE"] = true
+	}
 	if os.Getenv("NETWORK") != "" {
 		m["NETWORK"] = true
 	}
@@ -364,6 +380,7 @@ func configPathFromCLI(envPath string, args []string) string {
 func registerAllFlags(fs *flag.FlagSet, cfg *Config) {
 	fs.StringVar(&cfg.Network, "network", cfg.Network,
 		"Network preset: testnet | mainnet  (sets default URLs and package address)")
+	fs.StringVar(&cfg.Locale, "locale", cfg.Locale, "UI language for Telegram copy: zh | en (overrides LOCALE / BOT_LOCALE)")
 	fs.StringVar(&cfg.MarketName, "market-name", cfg.MarketName, "Market symbol (e.g. BTC/USD)")
 	fs.Float64Var(&cfg.Spread, "spread", cfg.Spread, "Total spread fraction (0.001 = 0.1%)")
 	fs.Float64Var(&cfg.OrderSize, "order-size", cfg.OrderSize, "Base units per side per quote")

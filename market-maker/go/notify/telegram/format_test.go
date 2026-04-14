@@ -7,7 +7,10 @@ import (
 
 	"decibel-mm-bot/api"
 	"decibel-mm-bot/botstate"
+	"decibel-mm-bot/i18n"
 )
+
+var trZH = i18n.Bundle(i18n.LocaleZH)
 
 func TestPositionsForDisplay_filtersAndSorts(t *testing.T) {
 	snap := botstate.Snapshot{
@@ -91,7 +94,7 @@ func TestFormatPositions_paging(t *testing.T) {
 	name := func(addr string) string {
 		return "M-" + addr
 	}
-	p0 := formatPositions(snap, 0, name)
+	p0 := formatPositions(trZH, snap, 0, name)
 	if !strings.Contains(p0, "第 1/2 页") {
 		t.Fatalf("page header missing: %q", p0)
 	}
@@ -104,7 +107,7 @@ func TestFormatPositions_paging(t *testing.T) {
 	if strings.Count(p0, "M-0x") != 3 {
 		t.Fatalf("want 3 markets on page 0, got:\n%s", p0)
 	}
-	p1 := formatPositions(snap, 1, name)
+	p1 := formatPositions(trZH, snap, 1, name)
 	if !strings.Contains(p1, "第 2/2 页") {
 		t.Fatalf("page 2 header missing: %q", p1)
 	}
@@ -139,7 +142,7 @@ func TestFormatPositions_showsPerMarketPnL(t *testing.T) {
 			},
 		},
 	}
-	got := formatPositions(snap, 0, func(string) string { return "ETH/USD" })
+	got := formatPositions(trZH, snap, 0, func(string) string { return "ETH/USD" })
 	for _, want := range []string{
 		"ETH/USD",
 		"*多 ▲*",
@@ -157,13 +160,13 @@ func TestFormatPositions_showsPerMarketPnL(t *testing.T) {
 }
 
 func TestTradeActionDisplay(t *testing.T) {
-	if got, want := tradeActionDisplay("CloseLong"), "平多"; got != want {
+	if got, want := tradeActionDisplay(trZH, "CloseLong"), "平多"; got != want {
 		t.Fatalf("CloseLong: got %q want %q", got, want)
 	}
-	if got, want := tradeActionDisplay("close_short"), "平空"; got != want {
+	if got, want := tradeActionDisplay(trZH, "close_short"), "平空"; got != want {
 		t.Fatalf("close_short: got %q want %q", got, want)
 	}
-	if got, want := tradeActionDisplay("OpenLong"), "开多"; got != want {
+	if got, want := tradeActionDisplay(trZH, "OpenLong"), "开多"; got != want {
 		t.Fatalf("OpenLong: got %q want %q", got, want)
 	}
 }
@@ -181,7 +184,7 @@ func TestFormatRecentTrades_pagingAndLayout(t *testing.T) {
 		})
 	}
 	name := func(string) string { return "BTC/USD" }
-	p0 := formatRecentTrades(items, 0, name)
+	p0 := formatRecentTrades(trZH, items, 0, name)
 	if !strings.Contains(p0, "第 1/3 页") || !strings.Contains(p0, "*平多*") {
 		t.Fatalf("page0 header/layout: %q", p0)
 	}
@@ -194,7 +197,7 @@ func TestFormatRecentTrades_pagingAndLayout(t *testing.T) {
 	if c := strings.Count(p0, "*平多*"); c != TradesPageSize {
 		t.Fatalf("want %d trades on page0, count *平多*=%d", TradesPageSize, c)
 	}
-	p1 := formatRecentTrades(items, 1, name)
+	p1 := formatRecentTrades(trZH, items, 1, name)
 	if !strings.Contains(p1, "第 2/3 页") {
 		t.Fatalf("page1: %q", p1)
 	}
@@ -204,7 +207,7 @@ func TestFormatRecentTrades_pagingAndLayout(t *testing.T) {
 	if c := strings.Count(p1, "*平多*"); c != TradesPageSize {
 		t.Fatalf("want %d trades on page1, got %d", TradesPageSize, c)
 	}
-	p2 := formatRecentTrades(items, 2, name)
+	p2 := formatRecentTrades(trZH, items, 2, name)
 	if !strings.Contains(p2, "第 3/3 页") {
 		t.Fatalf("page2: %q", p2)
 	}
@@ -214,16 +217,24 @@ func TestFormatRecentTrades_pagingAndLayout(t *testing.T) {
 }
 
 func TestFormatHelp_tradeHistoryInCodeSpan(t *testing.T) {
-	got := formatHelp(Config{})
+	got := formatHelp(Config{}, trZH)
 	if !strings.Contains(got, "`/trade_history` —") {
 		t.Fatalf("want `/trade_history` wrapped in code span before em dash, got:\n%s", got)
+	}
+}
+
+func TestFormatHelp_englishUsesPageWord(t *testing.T) {
+	trEN := i18n.Bundle(i18n.LocaleEN)
+	got := formatHelp(Config{}, trEN)
+	if !strings.Contains(got, "/balance — account balance") {
+		t.Fatalf("want English help line, got:\n%s", got)
 	}
 }
 
 func TestCycleAge_includesSeconds(t *testing.T) {
 	y := time.Now().Year()
 	sameYear := time.Date(y, 4, 11, 22, 17, 45, 0, time.Local)
-	got := cycleAge(sameYear)
+	got := cycleAge(trZH, sameYear)
 	if !strings.HasPrefix(got, "更新于 ") {
 		t.Fatalf("prefix: %q", got)
 	}
@@ -232,7 +243,7 @@ func TestCycleAge_includesSeconds(t *testing.T) {
 	}
 
 	crossYear := time.Date(1999, 4, 11, 22, 17, 45, 0, time.Local)
-	got2 := cycleAge(crossYear)
+	got2 := cycleAge(trZH, crossYear)
 	if !strings.HasPrefix(got2, "更新于 ") {
 		t.Fatalf("prefix: %q", got2)
 	}
@@ -245,7 +256,7 @@ func TestCycleAge_includesSeconds(t *testing.T) {
 }
 
 func TestFormatTradeFromHistory_noSource_cardLayout(t *testing.T) {
-	tr := api.TradeHistoryItem{
+	trd := api.TradeHistoryItem{
 		Action:                "CloseLong",
 		Source:                "OrderFill",
 		Price:                 100_000.5,
@@ -255,7 +266,7 @@ func TestFormatTradeFromHistory_noSource_cardLayout(t *testing.T) {
 		FeeAmount:             0.02,
 		TransactionUnixMs:     time.Date(2026, 4, 11, 12, 34, 56, 0, time.Local).UnixMilli(),
 	}
-	got := formatTradeFromHistory(tr, "BTC/USD", "0xdeadbeef")
+	got := formatTradeFromHistory(trZH, trd, "BTC/USD", "0xdeadbeef")
 	for _, bad := range []string{"来源", "OrderFill"} {
 		if strings.Contains(got, bad) {
 			t.Fatalf("must not contain %q:\n%s", bad, got)

@@ -122,6 +122,7 @@ func main() {
 			AdminID:                cfg.TGAdminID,
 			AlertInventory:         cfg.TGAlertInventory,
 			AlertInventoryInterval: cfg.TGAlertInventoryInterval,
+			Locale:                 cfg.Locale,
 		}
 		info := &infoAdapter{mm: mm, ex: ex, cfg: cfg, apiClient: apiCatalog, marketNames: nameLookup}
 		tg, err := telegram.New(tgCfg, info)
