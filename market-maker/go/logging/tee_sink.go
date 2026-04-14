@@ -169,7 +169,10 @@ func (a *asyncTeeSink) Write(p []byte) (int, error) {
 				return n, err
 			}
 		}
-		return len(p), nil
+		if n < len(p) {
+			return n, io.ErrShortWrite
+		}
+		return n, nil
 	}
 }
 
