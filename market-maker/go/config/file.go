@@ -47,6 +47,10 @@ type FileConfig struct {
 	TGAlertInventory      *bool    `json:"tg_alert_inventory,omitempty"     yaml:"tg_alert_inventory,omitempty"     toml:"tg_alert_inventory,omitempty"`
 	TGAlertInvIntervalMin *int     `json:"tg_alert_inventory_interval_min,omitempty" yaml:"tg_alert_inventory_interval_min,omitempty" toml:"tg_alert_inventory_interval_min,omitempty"`
 	TGStrictStart         *bool    `json:"tg_strict_start,omitempty"        yaml:"tg_strict_start,omitempty"        toml:"tg_strict_start,omitempty"`
+	LogLevel              *string  `json:"log_level,omitempty"              yaml:"log_level,omitempty"              toml:"log_level,omitempty"`
+	LogFormat             *string  `json:"log_format,omitempty"             yaml:"log_format,omitempty"             toml:"log_format,omitempty"`
+	LogCycleJSON          *bool    `json:"log_cycle_json,omitempty"       yaml:"log_cycle_json,omitempty"       toml:"log_cycle_json,omitempty"`
+	LogVerbose            *bool    `json:"log_verbose,omitempty"            yaml:"log_verbose,omitempty"            toml:"log_verbose,omitempty"`
 }
 
 func decodeFileConfig(data []byte, ext string) (*FileConfig, error) {
@@ -213,6 +217,22 @@ func applyFileConfig(dst *Config, src *FileConfig, explicitFile map[string]bool)
 	if src.TGStrictStart != nil {
 		dst.TGStrictStart = *src.TGStrictStart
 		set("TG_STRICT_START")
+	}
+	if src.LogLevel != nil {
+		dst.LogLevel = strings.ToLower(strings.TrimSpace(*src.LogLevel))
+		set("LOG_LEVEL")
+	}
+	if src.LogFormat != nil {
+		dst.LogFormat = strings.ToLower(strings.TrimSpace(*src.LogFormat))
+		set("LOG_FORMAT")
+	}
+	if src.LogCycleJSON != nil {
+		dst.LogCycleJSON = *src.LogCycleJSON
+		set("LOG_CYCLE_JSON")
+	}
+	if src.LogVerbose != nil {
+		dst.LogVerbose = *src.LogVerbose
+		set("LOG_VERBOSE")
 	}
 }
 

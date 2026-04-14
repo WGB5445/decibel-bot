@@ -121,7 +121,7 @@ func TestFirstCycleSkipsSpreadAdjustment(t *testing.T) {
 	mm := New(cfg, ex, testMarket())
 	initialSpread := mm.effectiveSpread
 
-	if err := mm.runCycle(context.Background()); err != nil {
+	if err := mm.runCycle(context.Background(), 1); err != nil {
 		t.Fatalf("runCycle: %v", err)
 	}
 
@@ -144,14 +144,14 @@ func TestFillDetectedWidensSpread(t *testing.T) {
 	mm.effectiveSpread = cfg.Spread - cfg.SpreadStep
 
 	// Cycle 1 — first cycle, baseline only.
-	if err := mm.runCycle(context.Background()); err != nil {
+	if err := mm.runCycle(context.Background(), 1); err != nil {
 		t.Fatalf("cycle 1: %v", err)
 	}
 
 	// Cycle 2 — inventory jumps (>> lotSize × 0.5) → fill detected.
 	before := mm.effectiveSpread
 	ex.state.Inventory = 0.001
-	if err := mm.runCycle(context.Background()); err != nil {
+	if err := mm.runCycle(context.Background(), 1); err != nil {
 		t.Fatalf("cycle 2: %v", err)
 	}
 
@@ -173,11 +173,11 @@ func TestFillSpreadCappedAtInitial(t *testing.T) {
 	mm := New(cfg, ex, testMarket())
 	mm.effectiveSpread = 0.0005 // below cap so widen can fire
 
-	if err := mm.runCycle(context.Background()); err != nil {
+	if err := mm.runCycle(context.Background(), 1); err != nil {
 		t.Fatal(err)
 	}
 	ex.state.Inventory = 0.001
-	if err := mm.runCycle(context.Background()); err != nil {
+	if err := mm.runCycle(context.Background(), 1); err != nil {
 		t.Fatal(err)
 	}
 
@@ -196,14 +196,14 @@ func TestNoFillNarrowsSpreadWhenAutoSpread(t *testing.T) {
 	mm := New(cfg, ex, testMarket())
 
 	// Cycle 1 — first cycle, baseline only.
-	if err := mm.runCycle(context.Background()); err != nil {
+	if err := mm.runCycle(context.Background(), 1); err != nil {
 		t.Fatal(err)
 	}
 	spreadBefore := mm.effectiveSpread
 
 	// Cycles 2 and 3 — no inventory change → no fill.
 	for i := 0; i < cfg.SpreadNoFillCycles; i++ {
-		if err := mm.runCycle(context.Background()); err != nil {
+		if err := mm.runCycle(context.Background(), 1); err != nil {
 			t.Fatalf("cycle %d: %v", i+2, err)
 		}
 	}
@@ -224,7 +224,7 @@ func TestNoFillDoesNotMutateSpreadWhenAutoSpreadOff(t *testing.T) {
 	mm := New(cfg, ex, testMarket())
 
 	for i := 0; i < cfg.SpreadNoFillCycles+2; i++ {
-		if err := mm.runCycle(context.Background()); err != nil {
+		if err := mm.runCycle(context.Background(), 1); err != nil {
 			t.Fatalf("cycle %d: %v", i+1, err)
 		}
 	}
@@ -246,10 +246,10 @@ func TestSpreadFlooredAtSpreadMin(t *testing.T) {
 
 	mm := New(cfg, ex, testMarket())
 
-	if err := mm.runCycle(context.Background()); err != nil {
+	if err := mm.runCycle(context.Background(), 1); err != nil {
 		t.Fatal(err)
 	}
-	if err := mm.runCycle(context.Background()); err != nil {
+	if err := mm.runCycle(context.Background(), 1); err != nil {
 		t.Fatal(err)
 	}
 
@@ -271,7 +271,7 @@ func TestMarginGuardPausesQuoting(t *testing.T) {
 	}}
 
 	mm := New(cfg, ex, testMarket())
-	if err := mm.runCycle(context.Background()); err != nil {
+	if err := mm.runCycle(context.Background(), 1); err != nil {
 		t.Fatalf("runCycle: %v", err)
 	}
 
@@ -292,7 +292,7 @@ func TestMarginGuardAllowsQuotingBelowThreshold(t *testing.T) {
 	}}
 
 	mm := New(cfg, ex, testMarket())
-	if err := mm.runCycle(context.Background()); err != nil {
+	if err := mm.runCycle(context.Background(), 1); err != nil {
 		t.Fatalf("runCycle: %v", err)
 	}
 
@@ -310,7 +310,7 @@ func TestMidPriceMissingPausesQuoting(t *testing.T) {
 	}}
 
 	mm := New(cfg, ex, testMarket())
-	if err := mm.runCycle(context.Background()); err != nil {
+	if err := mm.runCycle(context.Background(), 1); err != nil {
 		t.Fatalf("runCycle: %v", err)
 	}
 
@@ -327,7 +327,7 @@ func TestStateFetchFailurePropagatesError(t *testing.T) {
 	ex := &mockExchange{fetchErr: fetchErr}
 
 	mm := New(cfg, ex, testMarket())
-	err := mm.runCycle(context.Background())
+	err := mm.runCycle(context.Background(), 1)
 	if err == nil {
 		t.Fatal("expected error from runCycle when FetchState fails, got nil")
 	}
@@ -349,7 +349,7 @@ func TestAtMaxInventoryCancelsBulkAndSkipsQuotes(t *testing.T) {
 	}}
 
 	mm := New(cfg, ex, testMarket())
-	if err := mm.runCycle(context.Background()); err != nil {
+	if err := mm.runCycle(context.Background(), 1); err != nil {
 		t.Fatalf("runCycle: %v", err)
 	}
 
@@ -374,7 +374,7 @@ func TestAtMaxInventoryCancelsBulkOnlyOnce(t *testing.T) {
 
 	mm := New(cfg, ex, testMarket())
 	for i := 0; i < 3; i++ {
-		if err := mm.runCycle(context.Background()); err != nil {
+		if err := mm.runCycle(context.Background(), 1); err != nil {
 			t.Fatalf("cycle %d: %v", i+1, err)
 		}
 	}
@@ -398,7 +398,7 @@ func TestInventoryRecoveryReArmsFlag(t *testing.T) {
 	mm := New(cfg, ex, testMarket())
 
 	// Cycle 1: hit limit — first cancel fires.
-	if err := mm.runCycle(context.Background()); err != nil {
+	if err := mm.runCycle(context.Background(), 1); err != nil {
 		t.Fatal(err)
 	}
 	if ex.bulkCancelCalls != 1 {
@@ -407,7 +407,7 @@ func TestInventoryRecoveryReArmsFlag(t *testing.T) {
 
 	// Cycle 2: inventory recovers below limit.
 	ex.state.Inventory = 0.0005
-	if err := mm.runCycle(context.Background()); err != nil {
+	if err := mm.runCycle(context.Background(), 1); err != nil {
 		t.Fatal(err)
 	}
 	if mm.invLimitBulkCancelDone {
@@ -416,7 +416,7 @@ func TestInventoryRecoveryReArmsFlag(t *testing.T) {
 
 	// Cycle 3: inventory hits limit again — cancel should fire again.
 	ex.state.Inventory = 0.002
-	if err := mm.runCycle(context.Background()); err != nil {
+	if err := mm.runCycle(context.Background(), 1); err != nil {
 		t.Fatal(err)
 	}
 	if ex.bulkCancelCalls != 2 {
@@ -438,7 +438,7 @@ func TestFlattenOrderPlacedWhenAutoFlattenOn(t *testing.T) {
 	}}
 
 	mm := New(cfg, ex, testMarket())
-	if err := mm.runCycle(context.Background()); err != nil {
+	if err := mm.runCycle(context.Background(), 1); err != nil {
 		t.Fatalf("runCycle: %v", err)
 	}
 
@@ -464,7 +464,7 @@ func TestFlattenOrderSkippedWhenAutoFlattenOff(t *testing.T) {
 	}}
 
 	mm := New(cfg, ex, testMarket())
-	if err := mm.runCycle(context.Background()); err != nil {
+	if err := mm.runCycle(context.Background(), 1); err != nil {
 		t.Fatalf("runCycle: %v", err)
 	}
 
@@ -485,7 +485,7 @@ func TestFlattenLongPositionSells(t *testing.T) {
 	}}
 
 	mm := New(cfg, ex, testMarket())
-	if err := mm.runCycle(context.Background()); err != nil {
+	if err := mm.runCycle(context.Background(), 1); err != nil {
 		t.Fatal(err)
 	}
 
@@ -513,7 +513,7 @@ func TestFlattenShortPositionBuys(t *testing.T) {
 	}}
 
 	mm := New(cfg, ex, testMarket())
-	if err := mm.runCycle(context.Background()); err != nil {
+	if err := mm.runCycle(context.Background(), 1); err != nil {
 		t.Fatal(err)
 	}
 
@@ -543,7 +543,7 @@ func TestFlattenSkippedWhenInventoryTooSmall(t *testing.T) {
 	}}
 
 	mm := New(cfg, ex, market)
-	if err := mm.runCycle(context.Background()); err != nil {
+	if err := mm.runCycle(context.Background(), 1); err != nil {
 		t.Fatal(err)
 	}
 
@@ -560,7 +560,7 @@ func TestNormalCyclePlacesBulkBidAndAsk(t *testing.T) {
 	ex := &mockExchange{state: exchange.StateSnapshot{Inventory: 0.0, Mid: ptr(100_000)}}
 
 	mm := New(cfg, ex, testMarket())
-	if err := mm.runCycle(context.Background()); err != nil {
+	if err := mm.runCycle(context.Background(), 1); err != nil {
 		t.Fatalf("runCycle: %v", err)
 	}
 
@@ -586,7 +586,7 @@ func TestPlaceBulkOrdersErrorPropagates(t *testing.T) {
 	}
 
 	mm := New(cfg, ex, testMarket())
-	err := mm.runCycle(context.Background())
+	err := mm.runCycle(context.Background(), 1)
 	if err == nil {
 		t.Fatal("expected error when PlaceBulkOrders fails, got nil")
 	}
@@ -607,7 +607,7 @@ func TestSkewShiftsBidAskForLongPosition(t *testing.T) {
 	// Cycle with zero inventory (baseline prices).
 	ex := &mockExchange{state: exchange.StateSnapshot{Inventory: 0.0, Mid: ptr(mid)}}
 	mm := New(cfg, ex, testMarket())
-	if err := mm.runCycle(context.Background()); err != nil {
+	if err := mm.runCycle(context.Background(), 1); err != nil {
 		t.Fatal(err)
 	}
 	baseBid := ex.bulkBids[0].Price
@@ -617,7 +617,7 @@ func TestSkewShiftsBidAskForLongPosition(t *testing.T) {
 	// skew = 0.1 × 0.1 = 0.01 (1%), well above tick size.
 	ex2 := &mockExchange{state: exchange.StateSnapshot{Inventory: 0.1, Mid: ptr(mid)}}
 	mm2 := New(cfg, ex2, testMarket())
-	if err := mm2.runCycle(context.Background()); err != nil {
+	if err := mm2.runCycle(context.Background(), 1); err != nil {
 		t.Fatal(err)
 	}
 	skewBid := ex2.bulkBids[0].Price
@@ -639,7 +639,7 @@ func TestQuoteSizeSymmetric(t *testing.T) {
 	for _, inv := range []float64{-0.005, 0.0, 0.005} {
 		ex := &mockExchange{state: exchange.StateSnapshot{Inventory: inv, Mid: ptr(mid)}}
 		mm := New(cfg, ex, testMarket())
-		if err := mm.runCycle(context.Background()); err != nil {
+		if err := mm.runCycle(context.Background(), 1); err != nil {
 			t.Fatalf("inv=%.4f: %v", inv, err)
 		}
 		if len(ex.bulkBids) == 0 || len(ex.bulkAsks) == 0 {
@@ -669,7 +669,7 @@ func TestFlattenMaxDeviationCapsLongSellPrice(t *testing.T) {
 	}}
 
 	mm := New(cfg, ex, testMarket())
-	if err := mm.runCycle(context.Background()); err != nil {
+	if err := mm.runCycle(context.Background(), 1); err != nil {
 		t.Fatal(err)
 	}
 	if len(ex.placed) == 0 {
@@ -698,7 +698,7 @@ func TestFlattenMaxDeviationCapsShortBuyPrice(t *testing.T) {
 	}}
 
 	mm := New(cfg, ex, testMarket())
-	if err := mm.runCycle(context.Background()); err != nil {
+	if err := mm.runCycle(context.Background(), 1); err != nil {
 		t.Fatal(err)
 	}
 	if len(ex.placed) == 0 {
@@ -726,7 +726,7 @@ func TestFlattenMaxDeviationZeroDisablesCap(t *testing.T) {
 	}}
 
 	mm := New(cfg, ex, testMarket())
-	if err := mm.runCycle(context.Background()); err != nil {
+	if err := mm.runCycle(context.Background(), 1); err != nil {
 		t.Fatal(err)
 	}
 	if len(ex.placed) == 0 {
@@ -753,7 +753,7 @@ func TestMarginHighCyclesIncrement(t *testing.T) {
 
 	mm := New(cfg, ex, testMarket())
 	for i := 0; i < 3; i++ {
-		if err := mm.runCycle(context.Background()); err != nil {
+		if err := mm.runCycle(context.Background(), 1); err != nil {
 			t.Fatalf("cycle %d: %v", i+1, err)
 		}
 	}
@@ -776,7 +776,7 @@ func TestMarginHighCyclesResetOnRecovery(t *testing.T) {
 	mm := New(cfg, ex, testMarket())
 	// 3 high-margin cycles.
 	for i := 0; i < 3; i++ {
-		_ = mm.runCycle(context.Background())
+		_ = mm.runCycle(context.Background(), 1)
 	}
 	if mm.marginHighCycles == 0 {
 		t.Fatal("expected marginHighCycles > 0 after high-margin cycles")
@@ -784,7 +784,7 @@ func TestMarginHighCyclesResetOnRecovery(t *testing.T) {
 
 	// Margin recovers.
 	ex.state.MarginUsage = 0.3
-	if err := mm.runCycle(context.Background()); err != nil {
+	if err := mm.runCycle(context.Background(), 1); err != nil {
 		t.Fatal(err)
 	}
 	if mm.marginHighCycles != 0 {
@@ -804,7 +804,7 @@ func TestCircuitBreakerEngagesOnFailure(t *testing.T) {
 	}
 
 	mm := New(cfg, ex, testMarket())
-	err := mm.runCycle(context.Background())
+	err := mm.runCycle(context.Background(), 1)
 	if err == nil {
 		t.Fatal("expected error from failed PlaceBulkOrders")
 	}
@@ -826,7 +826,7 @@ func TestCircuitBreakerResetsOnSuccess(t *testing.T) {
 	// Simulate prior failures.
 	mm.bulkOrderFailures = 3
 
-	if err := mm.runCycle(context.Background()); err != nil {
+	if err := mm.runCycle(context.Background(), 1); err != nil {
 		t.Fatalf("runCycle: %v", err)
 	}
 
@@ -848,7 +848,7 @@ func TestCircuitBreakerSkipsPlacementDuringBackoff(t *testing.T) {
 	mm.bulkOrderFailures = 2
 	mm.bulkOrderBackoffUntil = time.Now().Add(10 * time.Minute)
 
-	if err := mm.runCycle(context.Background()); err != nil {
+	if err := mm.runCycle(context.Background(), 1); err != nil {
 		t.Fatalf("expected no error during backoff, got: %v", err)
 	}
 
@@ -877,7 +877,7 @@ func TestFlattenNotDuplicatedWhileResting(t *testing.T) {
 	mm := New(cfg, ex, testMarket())
 
 	// Cycle 1: no resting order yet → flatten placed, returns "order-1".
-	if err := mm.runCycle(context.Background()); err != nil {
+	if err := mm.runCycle(context.Background(), 1); err != nil {
 		t.Fatalf("cycle 1: %v", err)
 	}
 	if len(ex.placed) != 1 {
@@ -892,7 +892,7 @@ func TestFlattenNotDuplicatedWhileResting(t *testing.T) {
 	ex.state.OpenOrders = []exchange.OpenOrder{{OrderID: flattenID, MarketID: "0xmarket"}}
 
 	for cycle := 2; cycle <= 3; cycle++ {
-		if err := mm.runCycle(context.Background()); err != nil {
+		if err := mm.runCycle(context.Background(), 1); err != nil {
 			t.Fatalf("cycle %d: %v", cycle, err)
 		}
 	}
@@ -918,7 +918,7 @@ func TestFlattenReplacedAfterFill(t *testing.T) {
 	mm := New(cfg, ex, testMarket())
 
 	// Cycle 1: places flatten order "order-1".
-	if err := mm.runCycle(context.Background()); err != nil {
+	if err := mm.runCycle(context.Background(), 1); err != nil {
 		t.Fatalf("cycle 1: %v", err)
 	}
 	if len(ex.placed) != 1 {
@@ -927,7 +927,7 @@ func TestFlattenReplacedAfterFill(t *testing.T) {
 
 	// Cycle 2: order is gone from OpenOrders (filled) → new flatten placed.
 	ex.state.OpenOrders = nil // empty — order was filled
-	if err := mm.runCycle(context.Background()); err != nil {
+	if err := mm.runCycle(context.Background(), 1); err != nil {
 		t.Fatalf("cycle 2: %v", err)
 	}
 	if len(ex.placed) != 2 {
@@ -955,7 +955,7 @@ func TestFlattenIDClearedOnInventoryRecovery(t *testing.T) {
 	mm := New(cfg, ex, testMarket())
 
 	// Cycle 1: place flatten, get an order ID.
-	if err := mm.runCycle(context.Background()); err != nil {
+	if err := mm.runCycle(context.Background(), 1); err != nil {
 		t.Fatalf("cycle 1: %v", err)
 	}
 	if mm.lastFlattenOrderID == "" {
@@ -965,7 +965,7 @@ func TestFlattenIDClearedOnInventoryRecovery(t *testing.T) {
 	// Inventory recovers.
 	ex.state.Inventory = 0.0005 // below MaxInventory
 	ex.state.OpenOrders = nil
-	if err := mm.runCycle(context.Background()); err != nil {
+	if err := mm.runCycle(context.Background(), 1); err != nil {
 		t.Fatalf("cycle 2 (recovery): %v", err)
 	}
 
@@ -995,7 +995,7 @@ func TestFlattenDeduplicatesSizeZeroPath(t *testing.T) {
 	mm := New(cfg, ex, market)
 
 	// Cycle 1: quotes == nil (size rounds to 0), flatten placed.
-	if err := mm.runCycle(context.Background()); err != nil {
+	if err := mm.runCycle(context.Background(), 1); err != nil {
 		t.Fatalf("cycle 1: %v", err)
 	}
 	if len(ex.placed) != 1 {
@@ -1007,7 +1007,7 @@ func TestFlattenDeduplicatesSizeZeroPath(t *testing.T) {
 	ex.state.OpenOrders = []exchange.OpenOrder{{OrderID: flattenID, MarketID: market.MarketID}}
 
 	for cycle := 2; cycle <= 3; cycle++ {
-		if err := mm.runCycle(context.Background()); err != nil {
+		if err := mm.runCycle(context.Background(), 1); err != nil {
 			t.Fatalf("cycle %d: %v", cycle, err)
 		}
 	}
@@ -1026,7 +1026,7 @@ func TestStateUpdateIncludesPrevInventory(t *testing.T) {
 	mm := New(cfg, ex, testMarket())
 
 	// Cycle 1: establishes lastInventory = 0.001.
-	if err := mm.runCycle(context.Background()); err != nil {
+	if err := mm.runCycle(context.Background(), 1); err != nil {
 		t.Fatal(err)
 	}
 	if mm.lastInventory != 0.001 {
@@ -1035,7 +1035,7 @@ func TestStateUpdateIncludesPrevInventory(t *testing.T) {
 
 	// Cycle 2: inventory changes; prevInventory in state update should be 0.001.
 	ex.state.Inventory = 0.003
-	if err := mm.runCycle(context.Background()); err != nil {
+	if err := mm.runCycle(context.Background(), 1); err != nil {
 		t.Fatal(err)
 	}
 

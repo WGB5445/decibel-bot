@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log/slog"
 	"math"
+	"strings"
 	"sync"
 	"time"
 
@@ -16,6 +17,7 @@ import (
 	"decibel-mm-bot/aptos"
 	"decibel-mm-bot/config"
 	"decibel-mm-bot/exchange"
+	"decibel-mm-bot/logctx"
 	"decibel-mm-bot/logging"
 )
 
@@ -41,7 +43,7 @@ type DecibelExchange struct {
 // New creates a DecibelExchange, initialising the Decibel REST client, Aptos
 // node client, and signing account from the provided config.
 func New(cfg *config.Config) (*DecibelExchange, error) {
-	apiClient := api.NewClient(cfg.RestAPIBase, cfg.BearerToken)
+	apiClient := api.NewClient(cfg.RestAPIBase, cfg.BearerToken, api.WithRESTVerbose(cfg.LogVerbose))
 
 	aptosNode, err := aptos.NewNodeClient(cfg.AptosFullnodeURL, cfg.NodeKey(), aptos.ChainIDForNetwork(cfg.Network))
 	if err != nil {
@@ -167,10 +169,15 @@ func (d *DecibelExchange) PlaceOrder(ctx context.Context, req exchange.PlaceOrde
 			label = "reduce-only GTC"
 		}
 	}
-	slog.Info(fmt.Sprintf("placing %s order", label),
-		"side", side, "price", req.Price, "size", req.Size,
-		"price_int", priceInt, "size_int", sizeInt,
-		"dry_run", d.dryRun,
+	slog.Info("dex_place_order",
+		logctx.AppendAttrs(ctx,
+			"label", label,
+			"side", side, "price", req.Price, "size", req.Size,
+			"price_int", priceInt, "size_int", sizeInt,
+			"dry_run", d.dryRun,
+			"market", d.market.MarketName,
+			"market_id", api.AddrSuffix(d.market.MarketID),
+		)...,
 	)
 	if d.dryRun {
 		return exchange.PlaceOrderOutcome{}, nil
@@ -189,7 +196,9 @@ func (d *DecibelExchange) PlaceOrder(ctx context.Context, req exchange.PlaceOrde
 	)
 	if err != nil {
 		if result != nil && result.Hash != "" {
-			slog.Warn("place order: tx submitted but confirmation incomplete", "tx_hash", result.Hash, "err", err)
+			slog.Warn("place order: tx submitted but confirmation incomplete",
+				logctx.AppendAttrs(ctx, "tx_hash", result.Hash, "err", err)...,
+			)
 		}
 		return exchange.PlaceOrderOutcome{}, err
 	}
@@ -281,23 +290,49 @@ func (d *DecibelExchange) PlaceBulkOrders(ctx context.Context, bids, asks []exch
 		askSizes[i] = fmt.Sprintf("%d", scaleSize(a.Size, d.market.SzDecimals))
 	}
 
+	nextSeq := d.bulkSeq + 1
+	bph, bphN := summarizeIntStrings(bidPrices, 3)
+	bsh, bshN := summarizeIntStrings(bidSizes, 3)
+	aph, aphN := summarizeIntStrings(askPrices, 3)
+	ash, ashN := summarizeIntStrings(askSizes, 3)
+	slog.Info("place_bulk_payload",
+		logctx.AppendAttrs(ctx,
+			"market", d.market.MarketName,
+			"market_id", api.AddrSuffix(d.market.MarketID),
+			"next_bulk_seq", nextSeq,
+			"bids_human", formatBulkHuman(bids, 3),
+			"asks_human", formatBulkHuman(asks, 3),
+			"bid_prices_int", bph, "bid_prices_int_n", bphN,
+			"bid_sizes_int", bsh, "bid_sizes_int_n", bshN,
+			"ask_prices_int", aph, "ask_prices_int_n", aphN,
+			"ask_sizes_int", ash, "ask_sizes_int_n", ashN,
+			"dry_run", d.dryRun,
+		)...,
+	)
+
 	if d.dryRun {
 		slog.Info("placing bulk orders (dry run)",
-			"bids", len(bids), "asks", len(asks),
-			"next_bulk_seq", d.bulkSeq+1,
+			logctx.AppendAttrs(ctx,
+				"bids", len(bids), "asks", len(asks),
+				"next_bulk_seq", nextSeq,
+			)...,
 		)
 		return nil
 	}
 
 	d.bulkSeq++
 	slog.Info("placing bulk orders",
-		"bids", len(bids), "asks", len(asks),
-		"bulk_seq", d.bulkSeq,
-		"dry_run", d.dryRun,
+		logctx.AppendAttrs(ctx,
+			"bids", len(bids), "asks", len(asks),
+			"bulk_seq", d.bulkSeq,
+			"dry_run", d.dryRun,
+		)...,
 	)
 
 	fn := d.cfg.PackageAddress + "::dex_accounts_entry::place_bulk_orders_to_subaccount"
-	slog.Info("submitting bulk orders", "bids", len(bids), "asks", len(asks), "bulk_seq", d.bulkSeq)
+	slog.Info("submitting bulk orders",
+		logctx.AppendAttrs(ctx, "bids", len(bids), "asks", len(asks), "bulk_seq", d.bulkSeq)...,
+	)
 	result, err := d.aptosNode.SubmitEntryFunction(ctx, d.aptosSigner, fn, nil, []any{
 		d.cfg.SubaccountAddress, //  1. subaccount
 		d.market.MarketID,       //  2. market
@@ -312,17 +347,32 @@ func (d *DecibelExchange) PlaceBulkOrders(ctx context.Context, bids, asks []exch
 	if err != nil {
 		if result != nil && result.Hash != "" {
 			slog.Error("bulk orders: tx submitted but confirmation incomplete",
-				"tx_hash", result.Hash, "bids", len(bids), "asks", len(asks), "err", err)
+				logctx.AppendAttrs(ctx,
+					"tx_hash", result.Hash, "bids", len(bids), "asks", len(asks), "err", err,
+				)...,
+			)
 			return err
 		}
-		slog.Error("bulk orders submission failed", "bids", len(bids), "asks", len(asks), "err", err)
+		slog.Error("bulk orders submission failed",
+			logctx.AppendAttrs(ctx, "bids", len(bids), "asks", len(asks), "err", err)...,
+		)
 		return err
 	}
 	if !result.Success {
-		slog.Error("bulk orders execution failed", "vm_status", result.VMStatus)
+		slog.Error("bulk orders execution failed",
+			logctx.AppendAttrs(ctx, "vm_status", result.VMStatus)...,
+		)
 		return fmt.Errorf("place bulk orders failed: vm_status=%s", result.VMStatus)
 	}
 	logging.Success("bulk orders placed", "bids", len(bids), "asks", len(asks), "tx_hash", result.Hash)
+	slog.Info("bulk_orders_ok",
+		logctx.AppendAttrs(ctx,
+			"bids", len(bids), "asks", len(asks), "tx_hash", result.Hash,
+			"bulk_seq", d.bulkSeq,
+			"market", d.market.MarketName,
+			"market_id", api.AddrSuffix(d.market.MarketID),
+		)...,
+	)
 	return nil
 }
 
@@ -344,12 +394,24 @@ func (d *DecibelExchange) CancelBulkOrders(ctx context.Context) error {
 		}
 	}
 	if !active {
-		slog.Info("skipping cancel bulk orders: no active bulk quotes on REST", "rows", len(rows))
+		slog.Info("cancel_bulk_skip",
+			logctx.AppendAttrs(ctx,
+				"reason", "no_active_bulk_quotes",
+				"rows", len(rows),
+				"market", d.market.MarketName,
+				"market_id", api.AddrSuffix(d.market.MarketID),
+			)...,
+		)
 		return nil
 	}
 
-	slog.Info("cancelling bulk orders", "dry_run", d.dryRun)
+	slog.Info("cancelling_bulk_orders",
+		logctx.AppendAttrs(ctx, "dry_run", d.dryRun, "rows", len(rows))...,
+	)
 	if d.dryRun {
+		slog.Info("cancel_bulk_skip",
+			logctx.AppendAttrs(ctx, "reason", "dry_run", "rows", len(rows))...,
+		)
 		return nil
 	}
 
@@ -361,17 +423,26 @@ func (d *DecibelExchange) CancelBulkOrders(ctx context.Context) error {
 	})
 	if err != nil {
 		if result != nil && result.Hash != "" {
-			slog.Warn("cancel bulk orders: tx submitted but confirmation incomplete", "tx_hash", result.Hash, "err", err)
+			slog.Warn("cancel bulk orders: tx submitted but confirmation incomplete",
+				logctx.AppendAttrs(ctx, "tx_hash", result.Hash, "err", err)...,
+			)
 		} else {
-			slog.Error("cancel bulk orders submission failed", "err", err)
+			slog.Error("cancel bulk orders submission failed", logctx.AppendAttrs(ctx, "err", err)...)
 		}
 		return err
 	}
 	if !result.Success {
-		slog.Error("cancel bulk orders execution failed", "vm_status", result.VMStatus)
+		slog.Error("cancel bulk orders execution failed", logctx.AppendAttrs(ctx, "vm_status", result.VMStatus)...)
 		return fmt.Errorf("cancel bulk orders failed: vm_status=%s", result.VMStatus)
 	}
 	logging.Success("bulk orders cancelled", "tx_hash", result.Hash)
+	slog.Info("cancel_bulk_ok",
+		logctx.AppendAttrs(ctx,
+			"tx_hash", result.Hash,
+			"market", d.market.MarketName,
+			"market_id", api.AddrSuffix(d.market.MarketID),
+		)...,
+	)
 	return nil
 }
 
@@ -382,10 +453,25 @@ func (d *DecibelExchange) CancelOrder(ctx context.Context, orderID string) error
 	}
 	fn := d.cfg.PackageAddress + "::dex_accounts_entry::cancel_order_to_subaccount"
 
-	slog.Info("cancelling order", "order_id", orderID, "dry_run", d.dryRun)
 	if d.dryRun {
+		slog.Info("dex_cancel_order_skip",
+			logctx.AppendAttrs(ctx,
+				"reason", "dry_run",
+				"order_id", orderID,
+				"market", d.market.MarketName,
+				"market_id", api.AddrSuffix(d.market.MarketID),
+			)...,
+		)
 		return nil
 	}
+	slog.Info("dex_cancel_order",
+		logctx.AppendAttrs(ctx,
+			"order_id", orderID,
+			"market", d.market.MarketName,
+			"market_id", api.AddrSuffix(d.market.MarketID),
+			"dry_run", d.dryRun,
+		)...,
+	)
 
 	result, err := d.aptosNode.SubmitEntryFunction(ctx, d.aptosSigner, fn, nil, []any{
 		d.cfg.SubaccountAddress,
@@ -394,14 +480,35 @@ func (d *DecibelExchange) CancelOrder(ctx context.Context, orderID string) error
 	})
 	if err != nil {
 		if result != nil && result.Hash != "" {
-			slog.Warn("cancel order: tx submitted but confirmation incomplete", "tx_hash", result.Hash, "order_id", orderID, "err", err)
+			slog.Warn("cancel order: tx submitted but confirmation incomplete",
+				logctx.AppendAttrs(ctx, "tx_hash", result.Hash, "order_id", orderID, "err", err)...,
+			)
 		}
 		return err
 	}
 	if !result.CancelSucceeded() {
 		return fmt.Errorf("cancel rejected: vm_status=%s", result.VMStatus)
 	}
-	slog.Debug("cancel accepted", "order_id", orderID, "vm_status", result.VMStatus)
+	if result.Success {
+		slog.Info("dex_cancel_order_ok",
+			logctx.AppendAttrs(ctx,
+				"order_id", orderID,
+				"vm_status", result.VMStatus,
+				"market", d.market.MarketName,
+				"market_id", api.AddrSuffix(d.market.MarketID),
+			)...,
+		)
+	} else {
+		slog.Info("dex_cancel_order_skip",
+			logctx.AppendAttrs(ctx,
+				"order_id", orderID,
+				"vm_status", result.VMStatus,
+				"reason", "order_already_gone_or_resource_missing",
+				"market", d.market.MarketName,
+				"market_id", api.AddrSuffix(d.market.MarketID),
+			)...,
+		)
+	}
 	return nil
 }
 
@@ -418,6 +525,33 @@ func (d *DecibelExchange) GasBalance(ctx context.Context) (float64, string, erro
 func (d *DecibelExchange) DryRun() bool { return d.dryRun }
 
 // ── Internal helpers ─────────────────────────────────────────────────────────
+
+func summarizeIntStrings(s []string, head int) (joined string, total int) {
+	total = len(s)
+	if total == 0 {
+		return "", 0
+	}
+	n := head
+	if len(s) < n {
+		n = len(s)
+	}
+	return strings.Join(s[:n], ","), total
+}
+
+func formatBulkHuman(entries []exchange.BulkOrderEntry, head int) string {
+	if len(entries) == 0 {
+		return ""
+	}
+	n := head
+	if len(entries) < n {
+		n = len(entries)
+	}
+	parts := make([]string, n)
+	for i := 0; i < n; i++ {
+		parts[i] = fmt.Sprintf("%g@%g", entries[i].Price, entries[i].Size)
+	}
+	return strings.Join(parts, ";")
+}
 
 // buildPlaceOrderArgs constructs the 15 ABI arguments for place_order_to_subaccount.
 func buildPlaceOrderArgs(

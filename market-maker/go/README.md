@@ -179,6 +179,20 @@ These override the values set by `NETWORK`. Leave unset to use the network profi
 
 ---
 
+### Logging & debugging (structured `slog`)
+
+| Env var | CLI flag | Default | Description |
+|---------|----------|---------|-------------|
+| `LOG_LEVEL` | `-log-level` | `info` | `debug`, `info`, `warn`, or `error`. `debug` enables verbose paths (e.g. per-request REST OK lines when `LOG_VERBOSE` is on). |
+| `LOG_FORMAT` | `-log-format` | `text` | `text` (default, ANSI on TTY unless `NO_COLOR`) or `json` (one JSON object per line for `jq` / tooling). |
+| `LOG_CYCLE_JSON` | `-log-cycle-json` | `false` | After each **successful** bulk quote cycle, emit one `cycle_trace_json` line with a JSON `payload` (mid, inventory, bid/ask/size, spreads). Same as `LOG_TRACE`. |
+| `LOG_TRACE` | _(env only)_ | `false` | Alias for `LOG_CYCLE_JSON`. |
+| `LOG_VERBOSE` | `-log-verbose` | `false` | When `true` and level is `debug`, log successful REST GET paths. **Failed** REST calls log at `WARN` regardless. |
+
+**Greppable `msg` / keys (examples):** `state_snapshot` (`cycle`, `mid_f`, `open_orders`, `order_ids` when few orders), `mm_place_bulk`, `place_bulk_payload`, `flatten_intent`, `dex_place_order`, `dex_cancel_order`, `dex_cancel_order_ok`, `dex_cancel_order_skip`, `cancel_bulk_ok`, `cancel_bulk_skip`, `bulk_orders_ok`. On-chain paths also attach `cycle` when the call originates from the main MM loop (`context` from `logctx.WithCycle`). **Secrets are never logged** (no bearer token or private key in log fields).
+
+---
+
 ## Ways to pass parameters
 
 ### 1. `.env` file (recommended for credentials)

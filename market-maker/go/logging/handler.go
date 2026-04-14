@@ -4,15 +4,12 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"os"
 	"slices"
 	"strings"
 	"sync"
 	"time"
 
 	"log/slog"
-
-	"golang.org/x/term"
 )
 
 // Internal attribute keys — stripped before printing; never user-facing.
@@ -42,21 +39,6 @@ type colorHandler struct {
 	sh     *sharedWriter
 	attrs  []slog.Attr
 	groups string // dot-separated prefix for keys (slog.WithGroup)
-}
-
-// Setup installs the default slog logger with optional ANSI colors on w (typically os.Stderr).
-// Colors are disabled when NO_COLOR is set, or when w is not a terminal *os.File.
-func Setup(w io.Writer) {
-	useColor := os.Getenv("NO_COLOR") == ""
-	if f, ok := w.(*os.File); ok && useColor {
-		useColor = term.IsTerminal(int(f.Fd()))
-	}
-	sh := &sharedWriter{
-		w:        w,
-		useColor: useColor,
-		minLevel: slog.LevelInfo,
-	}
-	slog.SetDefault(slog.New(&colorHandler{sh: sh}))
 }
 
 func (h *colorHandler) Enabled(_ context.Context, level slog.Level) bool {

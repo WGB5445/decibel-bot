@@ -30,15 +30,11 @@ import (
 )
 
 func main() {
-	logging.Setup(os.Stderr)
-
-	// Load .env before config so all env vars are visible to flag defaults.
-	if err := godotenv.Load(); err == nil {
-		slog.Info("loaded .env file")
-	}
+	envLoaded := godotenv.Load() == nil
 
 	args := config.NormalizeBoolCLIArgsForInit(os.Args)
 	if out, ok := config.ParseInitConfigFlag(args); ok {
+		logging.Setup(os.Stderr, nil)
 		if err := config.WriteInitConfigYAML(out); err != nil {
 			slog.Error("init-config failed", "err", err)
 			os.Exit(1)
@@ -52,8 +48,13 @@ func main() {
 		if errors.Is(err, flag.ErrHelp) {
 			os.Exit(0)
 		}
+		logging.Setup(os.Stderr, nil)
 		slog.Error("config error", "err", err)
 		os.Exit(1)
+	}
+	logging.Setup(os.Stderr, cfg)
+	if envLoaded {
+		slog.Info("loaded .env file")
 	}
 	slog.Info("network profile",
 		"network", cfg.Network,

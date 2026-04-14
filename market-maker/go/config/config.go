@@ -83,6 +83,15 @@ type Config struct {
 	// Locale is UI language for bot-facing copy: "zh" (default) or "en". Set via LOCALE / BOT_LOCALE, config file, or -locale.
 	Locale string
 
+	// LogLevel is slog level: debug | info | warn | error (default info). LOG_LEVEL / -log-level.
+	LogLevel string
+	// LogFormat is text (default, ANSI when TTY) or json (one JSON object per line). LOG_FORMAT / -log-format.
+	LogFormat string
+	// LogCycleJSON emits a single structured JSON line after each successful bulk quote cycle. LOG_CYCLE_JSON or LOG_TRACE / -log-cycle-json.
+	LogCycleJSON bool
+	// LogVerbose enables extra REST DEBUG lines when LogLevel is debug. LOG_VERBOSE / -log-verbose.
+	LogVerbose bool
+
 	// ── Telegram ─────────────────────────────────────────────────────────────
 	TGBotToken               string // TG_BOT_TOKEN or -tg-token
 	TGAdminID                int64  // TG_ADMIN_ID or -tg-admin-id
@@ -98,6 +107,23 @@ func (c *Config) TelegramEnabled() bool {
 
 func (c *Config) validate() error {
 	c.Locale = normalizeBotLocale(c.Locale)
+
+	c.LogLevel = strings.ToLower(strings.TrimSpace(c.LogLevel))
+	if c.LogLevel == "" {
+		c.LogLevel = "info"
+	}
+	switch c.LogLevel {
+	case "debug", "info", "warn", "warning", "error":
+	default:
+		c.LogLevel = "info"
+	}
+	c.LogFormat = strings.ToLower(strings.TrimSpace(c.LogFormat))
+	if c.LogFormat == "" {
+		c.LogFormat = "text"
+	}
+	if c.LogFormat != "text" && c.LogFormat != "json" {
+		c.LogFormat = "text"
+	}
 
 	// Clamp TGAlertInventoryInterval to avoid time.NewTicker(0) panic.
 	if c.TGAlertInventoryInterval <= 0 {
@@ -201,6 +227,8 @@ var boolCLIFlagNames = map[string]struct{}{
 	"auto-flatten":       {},
 	"dry-run":            {},
 	"auto-spread":        {},
+	"log-cycle-json":     {},
+	"log-verbose":        {},
 	"tg-alert-inventory": {},
 	"tg-strict-start":    {},
 }
