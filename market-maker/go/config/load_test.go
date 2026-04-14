@@ -216,6 +216,51 @@ func TestValidate_negativeRefreshIntervalJitter(t *testing.T) {
 	}
 }
 
+func TestValidate_negativeFlattenRepriceStallCycles(t *testing.T) {
+	t.Parallel()
+	c := &Config{
+		BearerToken:               "t",
+		SubaccountAddress:         "0x1",
+		PrivateKey:                testPrivateKeyHex,
+		PackageAddress:            "0xpackage",
+		FlattenRepriceStallCycles: -1,
+	}
+	if err := c.validate(); err == nil {
+		t.Fatal("expected error for negative flatten reprice stall cycles")
+	}
+}
+
+func TestValidate_negativeLogTeeAsyncMS(t *testing.T) {
+	t.Parallel()
+	c := &Config{
+		BearerToken:           "t",
+		SubaccountAddress:     "0x1",
+		PrivateKey:            testPrivateKeyHex,
+		PackageAddress:        "0xpackage",
+		LogTeeAsyncIntervalMS: -1,
+	}
+	if err := c.validate(); err == nil {
+		t.Fatal("expected error for negative LOG_TEE_ASYNC_MS")
+	}
+}
+
+func TestValidate_clampsLogTeeAsyncMSHigh(t *testing.T) {
+	t.Parallel()
+	c := &Config{
+		BearerToken:           "t",
+		SubaccountAddress:     "0x1",
+		PrivateKey:            testPrivateKeyHex,
+		PackageAddress:        "0xpackage",
+		LogTeeAsyncIntervalMS: 999_999,
+	}
+	if err := c.validate(); err != nil {
+		t.Fatal(err)
+	}
+	if c.LogTeeAsyncIntervalMS != 60_000 {
+		t.Fatalf("expected clamp to 60000, got %d", c.LogTeeAsyncIntervalMS)
+	}
+}
+
 func TestLoad_marketAddr_cliOverridesEnv(t *testing.T) {
 	t.Setenv("NETWORK", "testnet")
 	t.Setenv("BEARER_TOKEN", "t")

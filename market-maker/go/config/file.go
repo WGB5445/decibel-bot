@@ -14,45 +14,48 @@ import (
 // FileConfig is the on-disk shape (JSON / YAML / TOML). Pointer fields mean
 // "omit": nil does not override; non-nil overrides the current Config value.
 type FileConfig struct {
-	Locale                *string  `json:"locale,omitempty"                 yaml:"locale,omitempty"                 toml:"locale,omitempty"`
-	Network               *string  `json:"network,omitempty"                yaml:"network,omitempty"                toml:"network,omitempty"`
-	MarketName            *string  `json:"market_name,omitempty"            yaml:"market_name,omitempty"            toml:"market_name,omitempty"`
-	Spread                *float64 `json:"spread,omitempty"                 yaml:"spread,omitempty"                 toml:"spread,omitempty"`
-	OrderSize             *float64 `json:"order_size,omitempty"             yaml:"order_size,omitempty"             toml:"order_size,omitempty"`
-	MaxInventory          *float64 `json:"max_inventory,omitempty"          yaml:"max_inventory,omitempty"          toml:"max_inventory,omitempty"`
-	SkewPerUnit           *float64 `json:"skew_per_unit,omitempty"          yaml:"skew_per_unit,omitempty"          toml:"skew_per_unit,omitempty"`
-	MaxMarginUsage        *float64 `json:"max_margin_usage,omitempty"       yaml:"max_margin_usage,omitempty"       toml:"max_margin_usage,omitempty"`
-	RefreshInterval       *float64 `json:"refresh_interval,omitempty"       yaml:"refresh_interval,omitempty"       toml:"refresh_interval,omitempty"`
-	RefreshIntervalJitter *float64 `json:"refresh_interval_jitter,omitempty" yaml:"refresh_interval_jitter,omitempty" toml:"refresh_interval_jitter,omitempty"`
-	ShutdownCancelTimeout *float64 `json:"shutdown_cancel_timeout,omitempty" yaml:"shutdown_cancel_timeout,omitempty" toml:"shutdown_cancel_timeout,omitempty"`
-	AutoFlatten           *bool    `json:"auto_flatten,omitempty"           yaml:"auto_flatten,omitempty"           toml:"auto_flatten,omitempty"`
-	FlattenAggression     *float64 `json:"flatten_aggression,omitempty"      yaml:"flatten_aggression,omitempty"      toml:"flatten_aggression,omitempty"`
-	FlattenMaxDeviation   *float64 `json:"flatten_max_deviation,omitempty"   yaml:"flatten_max_deviation,omitempty"   toml:"flatten_max_deviation,omitempty"`
-	DryRun                *bool    `json:"dry_run,omitempty"                 yaml:"dry_run,omitempty"                 toml:"dry_run,omitempty"`
-	AutoSpread            *bool    `json:"auto_spread,omitempty"            yaml:"auto_spread,omitempty"            toml:"auto_spread,omitempty"`
-	SpreadMin             *float64 `json:"spread_min,omitempty"             yaml:"spread_min,omitempty"             toml:"spread_min,omitempty"`
-	SpreadMax             *float64 `json:"spread_max,omitempty"             yaml:"spread_max,omitempty"             toml:"spread_max,omitempty"`
-	SpreadNoFillCycles    *int     `json:"spread_no_fill_cycles,omitempty"  yaml:"spread_no_fill_cycles,omitempty"  toml:"spread_no_fill_cycles,omitempty"`
-	SpreadStep            *float64 `json:"spread_step,omitempty"            yaml:"spread_step,omitempty"            toml:"spread_step,omitempty"`
-	BearerToken           *string  `json:"bearer_token,omitempty"           yaml:"bearer_token,omitempty"           toml:"bearer_token,omitempty"`
-	SubaccountAddress     *string  `json:"subaccount_address,omitempty"     yaml:"subaccount_address,omitempty"     toml:"subaccount_address,omitempty"`
-	PrivateKey            *string  `json:"private_key,omitempty"            yaml:"private_key,omitempty"            toml:"private_key,omitempty"`
-	NodeAPIKey            *string  `json:"node_api_key,omitempty"           yaml:"node_api_key,omitempty"           toml:"node_api_key,omitempty"`
-	PackageAddress        *string  `json:"package_address,omitempty"        yaml:"package_address,omitempty"        toml:"package_address,omitempty"`
-	AptosFullnodeURL      *string  `json:"aptos_fullnode_url,omitempty"     yaml:"aptos_fullnode_url,omitempty"     toml:"aptos_fullnode_url,omitempty"`
-	MarketAddr            *string  `json:"market_addr,omitempty"            yaml:"market_addr,omitempty"            toml:"market_addr,omitempty"`
-	RestAPIBase           *string  `json:"rest_api_base,omitempty"          yaml:"rest_api_base,omitempty"          toml:"rest_api_base,omitempty"`
-	TGBotToken            *string  `json:"tg_bot_token,omitempty"           yaml:"tg_bot_token,omitempty"           toml:"tg_bot_token,omitempty"`
-	TGAdminID             *int64   `json:"tg_admin_id,omitempty"            yaml:"tg_admin_id,omitempty"            toml:"tg_admin_id,omitempty"`
-	TGAlertInventory      *bool    `json:"tg_alert_inventory,omitempty"     yaml:"tg_alert_inventory,omitempty"     toml:"tg_alert_inventory,omitempty"`
-	TGAlertInvIntervalMin *int     `json:"tg_alert_inventory_interval_min,omitempty" yaml:"tg_alert_inventory_interval_min,omitempty" toml:"tg_alert_inventory_interval_min,omitempty"`
-	TGStrictStart         *bool    `json:"tg_strict_start,omitempty"        yaml:"tg_strict_start,omitempty"        toml:"tg_strict_start,omitempty"`
-	LogLevel              *string  `json:"log_level,omitempty"              yaml:"log_level,omitempty"              toml:"log_level,omitempty"`
-	LogFormat             *string  `json:"log_format,omitempty"             yaml:"log_format,omitempty"             toml:"log_format,omitempty"`
-	LogCycleJSON          *bool    `json:"log_cycle_json,omitempty"       yaml:"log_cycle_json,omitempty"       toml:"log_cycle_json,omitempty"`
-	LogVerbose            *bool    `json:"log_verbose,omitempty"            yaml:"log_verbose,omitempty"            toml:"log_verbose,omitempty"`
-	LogTeeFile            *string  `json:"log_tee_file,omitempty"             yaml:"log_tee_file,omitempty"             toml:"log_tee_file,omitempty"`
-	LogTeeFileDir         *string  `json:"log_tee_file_dir,omitempty"       yaml:"log_tee_file_dir,omitempty"       toml:"log_tee_file_dir,omitempty"`
+	Locale                    *string  `json:"locale,omitempty"                 yaml:"locale,omitempty"                 toml:"locale,omitempty"`
+	Network                   *string  `json:"network,omitempty"                yaml:"network,omitempty"                toml:"network,omitempty"`
+	MarketName                *string  `json:"market_name,omitempty"            yaml:"market_name,omitempty"            toml:"market_name,omitempty"`
+	Spread                    *float64 `json:"spread,omitempty"                 yaml:"spread,omitempty"                 toml:"spread,omitempty"`
+	OrderSize                 *float64 `json:"order_size,omitempty"             yaml:"order_size,omitempty"             toml:"order_size,omitempty"`
+	MaxInventory              *float64 `json:"max_inventory,omitempty"          yaml:"max_inventory,omitempty"          toml:"max_inventory,omitempty"`
+	SkewPerUnit               *float64 `json:"skew_per_unit,omitempty"          yaml:"skew_per_unit,omitempty"          toml:"skew_per_unit,omitempty"`
+	MaxMarginUsage            *float64 `json:"max_margin_usage,omitempty"       yaml:"max_margin_usage,omitempty"       toml:"max_margin_usage,omitempty"`
+	RefreshInterval           *float64 `json:"refresh_interval,omitempty"       yaml:"refresh_interval,omitempty"       toml:"refresh_interval,omitempty"`
+	RefreshIntervalJitter     *float64 `json:"refresh_interval_jitter,omitempty" yaml:"refresh_interval_jitter,omitempty" toml:"refresh_interval_jitter,omitempty"`
+	ShutdownCancelTimeout     *float64 `json:"shutdown_cancel_timeout,omitempty" yaml:"shutdown_cancel_timeout,omitempty" toml:"shutdown_cancel_timeout,omitempty"`
+	AutoFlatten               *bool    `json:"auto_flatten,omitempty"           yaml:"auto_flatten,omitempty"           toml:"auto_flatten,omitempty"`
+	FlattenAggression         *float64 `json:"flatten_aggression,omitempty"      yaml:"flatten_aggression,omitempty"      toml:"flatten_aggression,omitempty"`
+	FlattenMaxDeviation       *float64 `json:"flatten_max_deviation,omitempty"           yaml:"flatten_max_deviation,omitempty"           toml:"flatten_max_deviation,omitempty"`
+	FlattenRepriceStallCycles *int     `json:"flatten_reprice_stall_cycles,omitempty"    yaml:"flatten_reprice_stall_cycles,omitempty"    toml:"flatten_reprice_stall_cycles,omitempty"`
+	DryRun                    *bool    `json:"dry_run,omitempty"                         yaml:"dry_run,omitempty"                         toml:"dry_run,omitempty"`
+	AutoSpread                *bool    `json:"auto_spread,omitempty"            yaml:"auto_spread,omitempty"            toml:"auto_spread,omitempty"`
+	SpreadMin                 *float64 `json:"spread_min,omitempty"             yaml:"spread_min,omitempty"             toml:"spread_min,omitempty"`
+	SpreadMax                 *float64 `json:"spread_max,omitempty"             yaml:"spread_max,omitempty"             toml:"spread_max,omitempty"`
+	SpreadNoFillCycles        *int     `json:"spread_no_fill_cycles,omitempty"  yaml:"spread_no_fill_cycles,omitempty"  toml:"spread_no_fill_cycles,omitempty"`
+	SpreadStep                *float64 `json:"spread_step,omitempty"            yaml:"spread_step,omitempty"            toml:"spread_step,omitempty"`
+	BearerToken               *string  `json:"bearer_token,omitempty"           yaml:"bearer_token,omitempty"           toml:"bearer_token,omitempty"`
+	SubaccountAddress         *string  `json:"subaccount_address,omitempty"     yaml:"subaccount_address,omitempty"     toml:"subaccount_address,omitempty"`
+	PrivateKey                *string  `json:"private_key,omitempty"            yaml:"private_key,omitempty"            toml:"private_key,omitempty"`
+	NodeAPIKey                *string  `json:"node_api_key,omitempty"           yaml:"node_api_key,omitempty"           toml:"node_api_key,omitempty"`
+	PackageAddress            *string  `json:"package_address,omitempty"        yaml:"package_address,omitempty"        toml:"package_address,omitempty"`
+	AptosFullnodeURL          *string  `json:"aptos_fullnode_url,omitempty"     yaml:"aptos_fullnode_url,omitempty"     toml:"aptos_fullnode_url,omitempty"`
+	MarketAddr                *string  `json:"market_addr,omitempty"            yaml:"market_addr,omitempty"            toml:"market_addr,omitempty"`
+	RestAPIBase               *string  `json:"rest_api_base,omitempty"          yaml:"rest_api_base,omitempty"          toml:"rest_api_base,omitempty"`
+	TGBotToken                *string  `json:"tg_bot_token,omitempty"           yaml:"tg_bot_token,omitempty"           toml:"tg_bot_token,omitempty"`
+	TGAdminID                 *int64   `json:"tg_admin_id,omitempty"            yaml:"tg_admin_id,omitempty"            toml:"tg_admin_id,omitempty"`
+	TGAlertInventory          *bool    `json:"tg_alert_inventory,omitempty"     yaml:"tg_alert_inventory,omitempty"     toml:"tg_alert_inventory,omitempty"`
+	TGAlertInvIntervalMin     *int     `json:"tg_alert_inventory_interval_min,omitempty" yaml:"tg_alert_inventory_interval_min,omitempty" toml:"tg_alert_inventory_interval_min,omitempty"`
+	TGStrictStart             *bool    `json:"tg_strict_start,omitempty"        yaml:"tg_strict_start,omitempty"        toml:"tg_strict_start,omitempty"`
+	LogLevel                  *string  `json:"log_level,omitempty"              yaml:"log_level,omitempty"              toml:"log_level,omitempty"`
+	LogFormat                 *string  `json:"log_format,omitempty"             yaml:"log_format,omitempty"             toml:"log_format,omitempty"`
+	LogCycleJSON              *bool    `json:"log_cycle_json,omitempty"       yaml:"log_cycle_json,omitempty"       toml:"log_cycle_json,omitempty"`
+	LogVerbose                *bool    `json:"log_verbose,omitempty"            yaml:"log_verbose,omitempty"            toml:"log_verbose,omitempty"`
+	LogTeeFile                *string  `json:"log_tee_file,omitempty"                  yaml:"log_tee_file,omitempty"                  toml:"log_tee_file,omitempty"`
+	LogTeeFileDir             *string  `json:"log_tee_file_dir,omitempty"                yaml:"log_tee_file_dir,omitempty"                toml:"log_tee_file_dir,omitempty"`
+	LogTeeAsyncIntervalMS     *int     `json:"log_tee_async_ms,omitempty"              yaml:"log_tee_async_ms,omitempty"              toml:"log_tee_async_ms,omitempty"`
+	LogTeeFsync               *bool    `json:"log_tee_fsync,omitempty"                 yaml:"log_tee_fsync,omitempty"                 toml:"log_tee_fsync,omitempty"`
 }
 
 func decodeFileConfig(data []byte, ext string) (*FileConfig, error) {
@@ -143,6 +146,10 @@ func applyFileConfig(dst *Config, src *FileConfig, explicitFile map[string]bool)
 	if src.FlattenMaxDeviation != nil {
 		dst.FlattenMaxDeviation = *src.FlattenMaxDeviation
 		set("FLATTEN_MAX_DEVIATION")
+	}
+	if src.FlattenRepriceStallCycles != nil {
+		dst.FlattenRepriceStallCycles = *src.FlattenRepriceStallCycles
+		set("FLATTEN_REPRICE_STALL_CYCLES")
 	}
 	if src.DryRun != nil {
 		dst.DryRun = *src.DryRun
@@ -243,6 +250,14 @@ func applyFileConfig(dst *Config, src *FileConfig, explicitFile map[string]bool)
 	if src.LogTeeFileDir != nil {
 		dst.LogTeeFileDir = strings.TrimSpace(*src.LogTeeFileDir)
 		set("LOG_TEE_FILE_DIR")
+	}
+	if src.LogTeeAsyncIntervalMS != nil {
+		dst.LogTeeAsyncIntervalMS = *src.LogTeeAsyncIntervalMS
+		set("LOG_TEE_ASYNC_MS")
+	}
+	if src.LogTeeFsync != nil {
+		dst.LogTeeFsync = *src.LogTeeFsync
+		set("LOG_TEE_FSYNC")
 	}
 }
 

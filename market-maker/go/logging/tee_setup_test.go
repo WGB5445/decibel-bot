@@ -10,6 +10,7 @@ import (
 )
 
 func TestSetupTeeFileBranchNoANSIInFile(t *testing.T) {
+	resetDefaultSlog(t)
 	var stderr, file bytes.Buffer
 	cfg := &config.Config{LogLevel: "info", LogFormat: "text"}
 	Setup(&stderr, cfg, &file)
@@ -26,6 +27,7 @@ func TestSetupTeeFileBranchNoANSIInFile(t *testing.T) {
 }
 
 func TestSetupTeeJSONBothBranches(t *testing.T) {
+	resetDefaultSlog(t)
 	var stderr, file bytes.Buffer
 	cfg := &config.Config{LogLevel: "info", LogFormat: "json"}
 	Setup(&stderr, cfg, &file)

@@ -14,6 +14,7 @@ refresh_interval: 20
 refresh_interval_jitter: 0 # seconds; uniform in [refresh_interval−jitter, refresh_interval+jitter]; 0 = off
 auto_flatten: false
 flatten_aggression: 0.001
+flatten_reprice_stall_cycles: 0
 dry_run: true
 auto_spread: false
 spread_min: 0.0004

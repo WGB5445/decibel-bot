@@ -70,6 +70,10 @@ type MarketMaker struct {
 	// preventing unbounded accumulation of POST_ONLY flatten orders while inventory stays
 	// at the limit. Reset to "" when inventory recovers below MaxInventory.
 	lastFlattenOrderID string
+
+	// flattenStallCycles counts consecutive cycles where lastFlattenOrderID is still resting
+	// and we skipped placing; used when FlattenRepriceStallCycles > 0 to trigger cancel+re-place.
+	flattenStallCycles int
 }
 
 // New creates a MarketMaker with the given exchange and market config.
@@ -239,6 +243,7 @@ func (m *MarketMaker) runCycle(ctx context.Context, cycle uint64) error {
 			// Inventory has just recovered from the limit — reset both flags so we
 			// re-arm for the next limit event and allow a fresh flatten if needed.
 			m.lastFlattenOrderID = ""
+			m.flattenStallCycles = 0
 		}
 		m.invLimitBulkCancelDone = false
 	}
@@ -254,6 +259,7 @@ func (m *MarketMaker) runCycle(ctx context.Context, cycle uint64) error {
 
 	// ── 2b. Adaptive spread: fill detection ──────────────────────────────────
 	if !m.firstCycle {
+		invAtLimit := math.Abs(state.Inventory) >= m.cfg.MaxInventory
 		invChange := math.Abs(state.Inventory - m.lastInventory)
 		fillDetected := invChange > m.market.LotSize*0.5
 		if fillDetected {
@@ -268,24 +274,30 @@ func (m *MarketMaker) runCycle(ctx context.Context, cycle uint64) error {
 				slog.Info("fill detected", "cycle", cycle, "inv_change", invChange, "spread", m.effectiveSpread)
 			}
 		} else {
-			m.noFillCycles++
-			if m.noFillCycles >= m.cfg.SpreadNoFillCycles {
-				suggested := math.Max(m.effectiveSpread-m.cfg.SpreadStep, m.cfg.SpreadMin)
-				if suggested < m.effectiveSpread {
-					if m.cfg.AutoSpread {
-						m.effectiveSpread = suggested
-						m.noFillCycles = 0
-						slog.Warn("auto-spread narrowed (no fill)",
-							"cycle", cycle,
-							"spread", m.effectiveSpread,
-							"no_fill_cycles", m.cfg.SpreadNoFillCycles)
-					} else {
-						slog.Warn("suggestion: spread may be too wide",
-							"cycle", cycle,
-							"current_spread", m.effectiveSpread,
-							"suggested_spread", suggested,
-							"no_fill_cycles", m.noFillCycles,
-							"tip", "add --auto-spread to automate")
+			// At max inventory we are not placing bulk quotes (ComputeQuotes returns nil);
+			// do not count "no fill" cycles toward auto-spread narrowing.
+			if invAtLimit {
+				m.noFillCycles = 0
+			} else {
+				m.noFillCycles++
+				if m.noFillCycles >= m.cfg.SpreadNoFillCycles {
+					suggested := math.Max(m.effectiveSpread-m.cfg.SpreadStep, m.cfg.SpreadMin)
+					if suggested < m.effectiveSpread {
+						if m.cfg.AutoSpread {
+							m.effectiveSpread = suggested
+							m.noFillCycles = 0
+							slog.Warn("auto-spread narrowed (no fill)",
+								"cycle", cycle,
+								"spread", m.effectiveSpread,
+								"no_fill_cycles", m.cfg.SpreadNoFillCycles)
+						} else {
+							slog.Warn("suggestion: spread may be too wide",
+								"cycle", cycle,
+								"current_spread", m.effectiveSpread,
+								"suggested_spread", suggested,
+								"no_fill_cycles", m.noFillCycles,
+								"tip", "add --auto-spread to automate")
+						}
 					}
 				}
 			}
@@ -356,17 +368,8 @@ func (m *MarketMaker) runCycle(ctx context.Context, cycle uint64) error {
 					"inventory", state.Inventory, "max", m.cfg.MaxInventory)
 			}
 			if m.cfg.AutoFlatten {
-				if m.shouldSkipFlatten(state.OpenOrders) {
-					slog.Info("flatten order already resting, skipping",
-						"cycle", cycle, "order_id", m.lastFlattenOrderID)
-				} else {
-					outcome, err := m.placeFlattenOrder(ctx, state.Inventory, mid)
-					if err != nil && !errors.Is(err, ErrNoPositionToFlatten) {
-						return fmt.Errorf("flatten order: %w", err)
-					}
-					if err == nil {
-						m.lastFlattenOrderID = outcome.OrderID
-					}
+				if err := m.handleAutoFlattenAtLimit(ctx, cycle, mid, state.Inventory, state.OpenOrders); err != nil {
+					return err
 				}
 			} else {
 				slog.Warn("at max inventory; manually flatten or enable --auto-flatten", "cycle", cycle)
@@ -381,17 +384,8 @@ func (m *MarketMaker) runCycle(ctx context.Context, cycle uint64) error {
 			return fmt.Errorf("cancel bulk orders: %w", err)
 		}
 		if m.cfg.AutoFlatten {
-			if m.shouldSkipFlatten(state.OpenOrders) {
-				slog.Info("flatten order already resting, skipping",
-					"cycle", cycle, "order_id", m.lastFlattenOrderID)
-			} else {
-				outcome, err := m.placeFlattenOrder(ctx, state.Inventory, mid)
-				if err != nil && !errors.Is(err, ErrNoPositionToFlatten) {
-					return fmt.Errorf("flatten order: %w", err)
-				}
-				if err == nil {
-					m.lastFlattenOrderID = outcome.OrderID
-				}
+			if err := m.handleAutoFlattenAtLimit(ctx, cycle, mid, state.Inventory, state.OpenOrders); err != nil {
+				return err
 			}
 		}
 		return nil
@@ -506,7 +500,49 @@ func (m *MarketMaker) shouldSkipFlatten(openOrders []exchange.OpenOrder) bool {
 	}
 	// Order is gone — allow re-placement.
 	m.lastFlattenOrderID = ""
+	m.flattenStallCycles = 0
 	return false
+}
+
+// handleAutoFlattenAtLimit maintains a single reduce-only POST_ONLY flatten while at
+// inventory / quoting limits. When FlattenRepriceStallCycles > 0, after that many
+// consecutive cycles with the same order still resting, it cancels and re-places
+// (same FlattenAggression, current mid). N == 0 preserves legacy behavior (never cancel for reprice).
+func (m *MarketMaker) handleAutoFlattenAtLimit(ctx context.Context, cycle uint64, mid, inventory float64, openOrders []exchange.OpenOrder) error {
+	n := m.cfg.FlattenRepriceStallCycles
+	if m.shouldSkipFlatten(openOrders) {
+		if n <= 0 {
+			slog.Info("flatten order already resting, skipping",
+				"cycle", cycle, "order_id", m.lastFlattenOrderID)
+			return nil
+		}
+		m.flattenStallCycles++
+		if m.flattenStallCycles < n {
+			slog.Info("flatten order resting, awaiting stall cycles before reprice",
+				"cycle", cycle, "order_id", m.lastFlattenOrderID,
+				"stall_cycles", m.flattenStallCycles, "stall_limit", n)
+			return nil
+		}
+		slog.Info("flatten reprice: cancel resting order after stall cycles",
+			"cycle", cycle, "order_id", m.lastFlattenOrderID, "stall_limit", n)
+		oid := m.lastFlattenOrderID
+		if err := m.ex.CancelOrder(ctx, oid); err != nil {
+			slog.Warn("flatten reprice: cancel order failed",
+				"cycle", cycle, "order_id", oid, "err", err)
+			return nil
+		}
+		m.lastFlattenOrderID = ""
+		m.flattenStallCycles = 0
+	}
+	outcome, err := m.placeFlattenOrder(ctx, inventory, mid)
+	if err != nil && !errors.Is(err, ErrNoPositionToFlatten) {
+		return fmt.Errorf("flatten order: %w", err)
+	}
+	if err == nil {
+		m.lastFlattenOrderID = outcome.OrderID
+		m.flattenStallCycles = 0
+	}
+	return nil
 }
 
 func (m *MarketMaker) placeFlattenOrder(ctx context.Context, inventory, mid float64) (exchange.PlaceOrderOutcome, error) {

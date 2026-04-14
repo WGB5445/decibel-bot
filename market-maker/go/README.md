@@ -136,6 +136,7 @@ The **GlobalPerpEngine** object address is **not configurable**: it is always de
 | `REFRESH_INTERVAL_JITTER_S` | `-refresh-interval-jitter` | `0` | Half-width in seconds for **uniform** random jitter: each cycle sleeps in `[REFRESH_INTERVAL − jitter, REFRESH_INTERVAL + jitter]`. The lower bound is floored at `0.01` s if `interval − jitter` would be non-positive. `0` disables jitter (fixed interval). |
 | `AUTO_FLATTEN` | `-auto-flatten` | `false` | When `true`, automatically place a reduce-only GTC order to cut inventory when `MAX_INVENTORY` is hit. |
 | `FLATTEN_AGGRESSION` | `-flatten-aggression` | `0.001` | Price offset from mid for the flatten order, as a fraction. `0.001` = 0.1% through mid. |
+| `FLATTEN_REPRICE_STALL_CYCLES` | `-flatten-reprice-stall-cycles` | `0` | When `AUTO_FLATTEN` is on and the same flatten order stays open this many consecutive cycles, cancel it and place again (still POST_ONLY, same aggression, new mid). `0` = never (legacy: one resting flatten until fill or external cancel). |
 | `DRY_RUN` | `-dry-run` | `false` | Log all actions without submitting any on-chain transactions. Use this to verify configuration before going live. |
 
 ---
@@ -146,7 +147,7 @@ When enabled, the bot automatically adjusts spread based on fill activity.
 
 | Env var | CLI flag | Default | Description |
 |---------|----------|---------|-------------|
-| `AUTO_SPREAD` | `-auto-spread` | `false` | When `true`, automatically narrow the spread after `SPREAD_NO_FILL_CYCLES` consecutive cycles with no fill. Also widens slightly (up to the initial `SPREAD`) when a fill is detected. When `false`, only logs a suggestion without changing anything. |
+| `AUTO_SPREAD` | `-auto-spread` | `false` | When `true`, automatically narrow the spread after `SPREAD_NO_FILL_CYCLES` consecutive cycles with no fill. Also widens slightly (up to the initial `SPREAD`) when a fill is detected. When `false`, only logs a suggestion without changing anything. **No-fill cycles are not counted while `abs(position) ≥ MAX_INVENTORY`** (bulk quotes are off; only flatten / pause applies). |
 | `SPREAD_MIN` | `-spread-min` | `0.0004` | Minimum spread the auto-adjuster will narrow down to (fraction). **Do not set below 0.0004 (0.04%) to avoid posting at a loss on volatile markets.** |
 | `SPREAD_MAX` | `-spread-max` | `0.02` | Maximum spread the auto-adjuster will widen up to (fraction). Also used as the reset ceiling on fill. |
 | `SPREAD_NO_FILL_CYCLES` | `-spread-no-fill-cycles` | `3` | Number of consecutive cycles with no detected fill before narrowing spread by one step. |
@@ -190,8 +191,10 @@ These override the values set by `NETWORK`. Leave unset to use the network profi
 | `LOG_VERBOSE` | `-log-verbose` | `false` | When `true` and level is `debug`, log successful REST GET paths. **Failed** REST calls log at `WARN` regardless. |
 | `LOG_TEE_FILE` | `-log-tee-file` | _(empty)_ | Mirror every log line to a file **in addition to** stderr. Empty = disabled. Value `auto` builds `{LOG_TEE_FILE_DIR}/{subaccount8}_{market}.log` after market discovery (uses resolved `market_name`). Any other non-empty value is treated as a **file path** (relative to process cwd if not absolute); `LOG_TEE_FILE_DIR` is ignored in that case. |
 | `LOG_TEE_FILE_DIR` | `-log-tee-file-dir` | `.` | Directory prefix used **only** when `-log-tee-file=auto`. Parent directories are created with `mkdir -p` semantics before opening the file. |
+| `LOG_TEE_ASYNC_MS` | `-log-tee-async-ms` | `0` | Tee file writer: `0` = **synchronous** flush after each log line (good for `tail -f`). `>0` = background writer flushing on this interval in milliseconds (bounded queue; if full, falls back to a synchronous write for that line). Values above `60000` are clamped. |
+| `LOG_TEE_FSYNC` | `-log-tee-fsync` | `false` | After each tee flush, call `fsync` on the log file (slow; can help `tail -f` on NFS or similar). |
 
-When tee is enabled, **stderr** keeps ANSI colors on a TTY; the **file** sink uses the same text layout (or JSON if `LOG_FORMAT=json`) **without** ANSI escape codes.
+When tee is enabled, **stderr** keeps ANSI colors on a TTY; the **file** sink uses the same text layout (or JSON if `LOG_FORMAT=json`) **without** ANSI escape codes. By default (`LOG_TEE_ASYNC_MS=0`) each line is **flushed to the `*os.File`** immediately so viewers see updates without waiting for process exit.
 
 **Greppable `msg` / keys (examples):** `state_snapshot` (`cycle`, `mid_f`, `open_orders`, `order_ids` when few orders), `mm_place_bulk`, `place_bulk_payload`, `flatten_intent`, `dex_place_order`, `dex_cancel_order`, `dex_cancel_order_ok`, `dex_cancel_order_skip`, `cancel_bulk_ok`, `cancel_bulk_skip`, `bulk_orders_ok`. Most Decibel `slog` lines and green **Success** lines (`order placed`, `bulk orders placed`, …) include `cycle` when the request `context` was wrapped with `logctx.WithCycle` in the MM loop. `logging.Cycle` banners pass `cycle` as an explicit log attribute. **Secrets are never logged** (no bearer token or private key in log fields).
 

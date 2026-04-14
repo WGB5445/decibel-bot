@@ -150,22 +150,25 @@ func newConfigFromEnvProfile(profile NetworkProfile, networkEnv string) *Config 
 		LogCycleJSON: envBool("LOG_CYCLE_JSON", false) || envBool("LOG_TRACE", false),
 		LogVerbose:   envBool("LOG_VERBOSE", false),
 
-		LogTeeFile:    strings.TrimSpace(os.Getenv("LOG_TEE_FILE")),
-		LogTeeFileDir: envStr("LOG_TEE_FILE_DIR", "."),
+		LogTeeFile:            strings.TrimSpace(os.Getenv("LOG_TEE_FILE")),
+		LogTeeFileDir:         envStr("LOG_TEE_FILE_DIR", "."),
+		LogTeeAsyncIntervalMS: envInt("LOG_TEE_ASYNC_MS", 0),
+		LogTeeFsync:           envBool("LOG_TEE_FSYNC", false),
 
-		MarketName:             envStr("MARKET_NAME", "BTC/USD"),
-		Spread:                 envFloat("SPREAD", 0.001),
-		OrderSize:              envFloat("ORDER_SIZE", 0.001),
-		MaxInventory:           envFloat("MAX_INVENTORY", 0.005),
-		SkewPerUnit:            envFloat("SKEW_PER_UNIT", 0.0001),
-		MaxMarginUsage:         envFloat("MAX_MARGIN_USAGE", 0.5),
-		RefreshInterval:        envFloat("REFRESH_INTERVAL", 20.0),
-		RefreshIntervalJitterS: envFloat("REFRESH_INTERVAL_JITTER_S", 0),
-		ShutdownCancelTimeoutS: envFloat("SHUTDOWN_CANCEL_TIMEOUT", 60.0),
-		AutoFlatten:            envBool("AUTO_FLATTEN", false),
-		FlattenAggression:      envFloat("FLATTEN_AGGRESSION", 0.001),
-		FlattenMaxDeviation:    envFloat("FLATTEN_MAX_DEVIATION", 0.05),
-		DryRun:                 envBool("DRY_RUN", false),
+		MarketName:                envStr("MARKET_NAME", "BTC/USD"),
+		Spread:                    envFloat("SPREAD", 0.001),
+		OrderSize:                 envFloat("ORDER_SIZE", 0.001),
+		MaxInventory:              envFloat("MAX_INVENTORY", 0.005),
+		SkewPerUnit:               envFloat("SKEW_PER_UNIT", 0.0001),
+		MaxMarginUsage:            envFloat("MAX_MARGIN_USAGE", 0.5),
+		RefreshInterval:           envFloat("REFRESH_INTERVAL", 20.0),
+		RefreshIntervalJitterS:    envFloat("REFRESH_INTERVAL_JITTER_S", 0),
+		ShutdownCancelTimeoutS:    envFloat("SHUTDOWN_CANCEL_TIMEOUT", 60.0),
+		AutoFlatten:               envBool("AUTO_FLATTEN", false),
+		FlattenAggression:         envFloat("FLATTEN_AGGRESSION", 0.001),
+		FlattenMaxDeviation:       envFloat("FLATTEN_MAX_DEVIATION", 0.05),
+		FlattenRepriceStallCycles: envInt("FLATTEN_REPRICE_STALL_CYCLES", 0),
+		DryRun:                    envBool("DRY_RUN", false),
 
 		AutoSpread:         envBool("AUTO_SPREAD", false),
 		SpreadMin:          envFloat("SPREAD_MIN", 0.0004),
@@ -256,6 +259,11 @@ func explicitEnvKeys() map[string]bool {
 	if v := os.Getenv("FLATTEN_AGGRESSION"); v != "" {
 		if _, err := strconv.ParseFloat(v, 64); err == nil {
 			m["FLATTEN_AGGRESSION"] = true
+		}
+	}
+	if v := os.Getenv("FLATTEN_REPRICE_STALL_CYCLES"); v != "" {
+		if _, err := strconv.ParseInt(v, 10, 64); err == nil {
+			m["FLATTEN_REPRICE_STALL_CYCLES"] = true
 		}
 	}
 	if v := os.Getenv("DRY_RUN"); v != "" {
@@ -362,6 +370,16 @@ func explicitEnvKeys() map[string]bool {
 	if strings.TrimSpace(os.Getenv("LOG_TEE_FILE_DIR")) != "" {
 		m["LOG_TEE_FILE_DIR"] = true
 	}
+	if v := os.Getenv("LOG_TEE_ASYNC_MS"); v != "" {
+		if _, err := strconv.ParseInt(v, 10, 64); err == nil {
+			m["LOG_TEE_ASYNC_MS"] = true
+		}
+	}
+	if v := os.Getenv("LOG_TEE_FSYNC"); v != "" {
+		if _, err := strconv.ParseBool(v); err == nil {
+			m["LOG_TEE_FSYNC"] = true
+		}
+	}
 	return m
 }
 
@@ -430,6 +448,8 @@ func registerAllFlags(fs *flag.FlagSet, cfg *Config) {
 	fs.BoolVar(&cfg.AutoFlatten, "auto-flatten", cfg.AutoFlatten, "Auto reduce-only order when inventory hits limit")
 	fs.Float64Var(&cfg.FlattenAggression, "flatten-aggression", cfg.FlattenAggression, "POST_ONLY flatten: fraction above mid (sell) / below mid (buy); mid is API reference")
 	fs.Float64Var(&cfg.FlattenMaxDeviation, "flatten-max-deviation", cfg.FlattenMaxDeviation, "Cap sell / floor buy vs mid for POST_ONLY flatten (0 = no bound)")
+	fs.IntVar(&cfg.FlattenRepriceStallCycles, "flatten-reprice-stall-cycles", cfg.FlattenRepriceStallCycles,
+		"After this many consecutive cycles with the same resting auto-flatten order, cancel and re-place (0 = never; POST_ONLY, same aggression)")
 	fs.BoolVar(&cfg.DryRun, "dry-run", cfg.DryRun, "Log without sending transactions")
 	fs.BoolVar(&cfg.AutoSpread, "auto-spread", cfg.AutoSpread, "Automatically narrow spread after spread-no-fill-cycles cycles with no fill")
 	fs.Float64Var(&cfg.SpreadMin, "spread-min", cfg.SpreadMin, "Minimum spread the auto-adjuster will narrow to")
@@ -446,6 +466,10 @@ func registerAllFlags(fs *flag.FlagSet, cfg *Config) {
 	fs.BoolVar(&cfg.LogVerbose, "log-verbose", cfg.LogVerbose, "Verbose REST GET logs when log-level is debug (overrides LOG_VERBOSE)")
 	fs.StringVar(&cfg.LogTeeFile, "log-tee-file", cfg.LogTeeFile, "Mirror logs to file: empty=off, auto=dir/subaccount_market.log, else path (overrides LOG_TEE_FILE)")
 	fs.StringVar(&cfg.LogTeeFileDir, "log-tee-file-dir", cfg.LogTeeFileDir, "Directory for log-tee-file=auto (overrides LOG_TEE_FILE_DIR)")
+	fs.IntVar(&cfg.LogTeeAsyncIntervalMS, "log-tee-async-ms", cfg.LogTeeAsyncIntervalMS,
+		"Tee async flush interval in ms (0=sync flush each line; >0=background writer; overrides LOG_TEE_ASYNC_MS)")
+	fs.BoolVar(&cfg.LogTeeFsync, "log-tee-fsync", cfg.LogTeeFsync,
+		"Fsync tee file after each flush (overrides LOG_TEE_FSYNC; slow, use if tail -f lags on NFS)")
 
 	fs.StringVar(&cfg.BearerToken, "bearer-token", cfg.BearerToken, "Decibel REST bearer token (overrides BEARER_TOKEN)")
 	fs.StringVar(&cfg.SubaccountAddress, "subaccount", cfg.SubaccountAddress, "Subaccount object address (overrides SUBACCOUNT_ADDRESS)")
