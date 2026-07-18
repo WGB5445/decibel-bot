@@ -2,21 +2,60 @@
 
 A perpetual-futures market-maker bot for the [Decibel DEX](https://decibel.trade) on Aptos.
 
-Requires **Go 1.24+**. Built with a **three-layer pluggable architecture**:
+Requires **Go 1.24+**.
 
 **CI:** [GitHub Actions](../../.github/workflows/market-maker-go.yml) on **Linux** (`ubuntu-latest`) runs `gofmt`, `go vet ./...`, `go test ./...`, and `go build` under `market-maker/go/` when paths match. **Pull requests** into `main` or `master` trigger one run per update; **pushes** to `main`/`master` only (so pushing to a PR branch does not double-fire with the PR event). Add your default branch name to the workflow if it differs.
 
-- **Exchange Layer** — abstraction for different DEX/chains (currently Decibel/Aptos)
-- **Strategy Layer** — market-making logic decoupled from exchange details
-- **Notification Layer** — monitoring/control via Telegram (extensible to Discord, Slack, etc.)
+---
 
-On-chain transactions use [aptos-go-sdk](https://github.com/aptos-labs/aptos-go-sdk) **v1** (`github.com/aptos-labs/aptos-go-sdk`, currently **v1.12.1** in [`go.mod`](go.mod)). Aptos officially recommends v2 for new projects; this bot stays on v1 for a stable path: load module ABI from the node (`EntryFunctionWithArgs`), `BuildTransaction`, sign with `SignedTransaction`, `SubmitTransaction`, then `WaitForTransaction` (poll timeout up to about **60s**, shorter if the request `context` has a deadline).
+## Quick start
 
-**Fullnode connection:** [`aptos.NewNodeClient`](aptos/client.go) takes `(fullnodeURL, apiKey, chainID)`. The API key is sent as `Authorization: Bearer …` when non-empty (from `NODE_API_KEY`, else `BEARER_TOKEN`). **`chainID`** comes from [`aptos.ChainIDForNetwork(cfg.Network)`](aptos/client.go): **testnet = 2**, **mainnet = 1**; any other network name uses **0** and the SDK may fetch chain id from the node.
+You only need **3 credentials + 1 safety flag** to try this. Everything else below has a
+sensible built-in default — skip straight to [Examples](#examples) or the collapsible
+reference sections only when you actually need to change something.
 
-**Signing account:** [`aptos.ParseAccount`](aptos/client.go) accepts raw hex (optional `0x`), **64-byte hex seed‖pubkey** (only the **first 32 bytes** are used as the Ed25519 seed), or AIP-80 `ed25519-priv-…`. **secp256k1** keys are rejected.
+```bash
+cp .env.example .env
+```
 
-## Architecture
+Fill in just these three in `.env`:
+
+```bash
+BEARER_TOKEN=...          # REST API bearer token from the Decibel dashboard
+SUBACCOUNT_ADDRESS=0x...  # your subaccount object address
+PRIVATE_KEY=0x...         # Ed25519 private key (hex or AIP-80)
+```
+
+Then run in **dry-run** first (logs every action, sends no real transactions):
+
+```bash
+go run . -dry-run
+```
+
+Once the logs look right, drop `-dry-run` to go live. That's the whole loop — config,
+dry-run, read the logs, adjust one number, repeat.
+
+### The handful of knobs worth knowing for day-to-day tuning
+
+Everything else is safe to leave on its default. These are the ones you'll actually touch:
+
+| Env var | Default | When to change it |
+|---------|---------|--------------------|
+| `NETWORK` | `testnet` | Switch to `mainnet` when you're ready to go live. |
+| `MARKET_NAME` | `BTC/USD` | Which market to quote (e.g. `ETH/USD`). |
+| `SPREAD` | `0.001` (0.1%) | Wider = safer/less fills, narrower = more fills/more risk. |
+| `ORDER_SIZE` | `0.001` | How much size you quote per side per cycle. |
+| `MAX_INVENTORY` | `0.005` | Position size that stops new quoting — your risk cap. |
+| `AUTO_FLATTEN` | `false` | Turn `true` if you want the bot to auto-close an over-limit position instead of waiting for you. |
+| `DRY_RUN` | `false` | Keep `true` until you've watched a few cycles of logs. |
+
+Everything past this point is **reference material** — click a section open only when you
+need it. Nothing below requires touching for a basic run.
+
+---
+
+<details>
+<summary><b>Architecture</b> (three-layer design, click to expand)</summary>
 
 ```
 ┌─ main.go ────────────────────────────────────────┐
@@ -38,9 +77,22 @@ On-chain transactions use [aptos-go-sdk](https://github.com/aptos-labs/aptos-go-
          └─ Reads state via notify.InfoProvider    │
 ```
 
+- **Exchange Layer** — abstraction for different DEX/chains (currently Decibel/Aptos)
+- **Strategy Layer** — market-making logic decoupled from exchange details
+- **Notification Layer** — monitoring/control via Telegram or the Web UI (extensible to Discord, Slack, etc.)
+
 **Future extensibility**: Adding a new exchange (e.g., Binance) requires only implementing the `Exchange` interface in `exchange/binance/`. Adding Discord notifications requires only implementing `Notifier` in `notify/discord/`. The strategy layer and `main.go` remain unchanged.
 
-## Telegram Notifications (Optional)
+On-chain transactions use [aptos-go-sdk](https://github.com/aptos-labs/aptos-go-sdk) **v1** (`github.com/aptos-labs/aptos-go-sdk`, currently **v1.12.1** in [`go.mod`](go.mod)). Aptos officially recommends v2 for new projects; this bot stays on v1 for a stable path: load module ABI from the node (`EntryFunctionWithArgs`), `BuildTransaction`, sign with `SignedTransaction`, `SubmitTransaction`, then `WaitForTransaction` (poll timeout up to about **60s**, shorter if the request `context` has a deadline).
+
+**Fullnode connection:** [`aptos.NewNodeClient`](aptos/client.go) takes `(fullnodeURL, apiKey, chainID)`. The API key is sent as `Authorization: Bearer …` when non-empty (from `NODE_API_KEY`, else `BEARER_TOKEN`). **`chainID`** comes from [`aptos.ChainIDForNetwork(cfg.Network)`](aptos/client.go): **testnet = 2**, **mainnet = 1**; any other network name uses **0** and the SDK may fetch chain id from the node.
+
+**Signing account:** [`aptos.ParseAccount`](aptos/client.go) accepts raw hex (optional `0x`), **64-byte hex seed‖pubkey** (only the **first 32 bytes** are used as the Ed25519 seed), or AIP-80 `ed25519-priv-…`. **secp256k1** keys are rejected.
+
+</details>
+
+<details>
+<summary><b>Telegram notifications</b> (optional monitoring/control surface, click to expand)</summary>
 
 The bot can run Telegram commands and send inventory-limit alerts. Enable by setting:
 
@@ -66,10 +118,15 @@ Commands (sent by `/...` to the bot in Telegram):
 Alerts:
 - **Inventory limit**: when `abs(inventory) ≥ MAX_INVENTORY`, sends an alert with buttons to refresh or close the position (edited in place; auto-refresh period is configurable via `TG_ALERT_INVENTORY_INTERVAL_MIN`).
 - **Margin usage**: when margin usage exceeds `MAX_MARGIN_USAGE` (mirrors the inventory alert's edit-in-place pattern; always on when Telegram is enabled).
-- **Forced close**: a one-shot alert whenever the flatten-escalation state machine (see `FLATTEN_FORCE_SECONDS` above) force-closes with an IOC order — always on when Telegram is enabled.
+- **Forced close**: a one-shot alert whenever the flatten-escalation state machine (see `FLATTEN_FORCE_SECONDS` below) force-closes with an IOC order — always on when Telegram is enabled.
 - **Periodic summary** (opt-in via `TG_SUMMARY_ENABLED`): pushes the same content as `/status` on a timer (`TG_SUMMARY_INTERVAL_MIN`), so you don't need to watch logs continuously.
 
-## Web Dashboard (Optional)
+Full config reference: see "Telegram notifications" under **Full parameter reference** below.
+
+</details>
+
+<details>
+<summary><b>Web dashboard</b> (optional browser status/control panel, click to expand)</summary>
 
 A local HTTP dashboard (`webui/`) mirrors the Telegram status/control surface — same
 `notify.InfoProvider` backend, same pause/resume/flatten actions — for when you want a
@@ -99,9 +156,10 @@ API endpoints (all except `/` require `?token=...` or `Authorization: Bearer ...
 - `POST /api/resume`
 - `POST /api/flatten` — reduce-only close of the configured target market
 
----
+</details>
 
-## Multi-market mode (optional)
+<details>
+<summary><b>Multi-market mode</b> (run several markets concurrently, click to expand)</summary>
 
 Run the same market-making strategy concurrently across several markets from one
 account, instead of one process per market. Enable by setting `MARKETS` (env var
@@ -132,212 +190,7 @@ show misleading data under one market's name while other markets trade unmonitor
 Trading itself is unaffected — only the notification/control surfaces are off until
 they're redesigned to be market-aware.
 
----
-
-## Quick start
-
-```bash
-cp .env.example .env
-# fill in the required values in .env
-go run .
-```
-
-Or build a binary first:
-
-```bash
-go build -o decibel-mm .
-./decibel-mm
-```
-
----
-
-## Configuration
-
-Parameters are read in this priority order (highest wins):
-
-```
-CLI flag  >  environment variable  >  .env file  >  built-in default
-```
-
-You can mix all three — e.g. keep credentials in `.env` and tweak trading params via flags.
-
----
-
-### Required — must be set before the bot will start
-
-| Env var | CLI flag | Description |
-|---------|----------|-------------|
-| `BEARER_TOKEN` | `-bearer-token` | REST API bearer token from the Decibel dashboard |
-| `SUBACCOUNT_ADDRESS` | `-subaccount` | Your subaccount object address (`0x…`) |
-| `PRIVATE_KEY` | `-private-key` | Ed25519: hex (optional `0x`), 64-byte hex **seed‖pubkey** (first 32 bytes used as seed), or AIP-80 `ed25519-priv-…`. **Avoid passing via CLI in production** (shell history, `ps`). |
-| `NODE_API_KEY` | `-node-api-key` | Fullnode API key; sent as `Authorization: Bearer`. Defaults to `BEARER_TOKEN` when unset. |
-
-The **GlobalPerpEngine** object address is **not configurable**: it is always derived from `PACKAGE_ADDRESS` (including the value set by `-network`) for logging only; it is not passed as a transaction argument.
-
----
-
-### Network
-
-| Env var | CLI flag | Default | Description |
-|---------|----------|---------|-------------|
-| `NETWORK` | `-network` | `testnet` | Network preset: `testnet` or `mainnet`. Sets the REST API base URL, fullnode URL, Move package address, and the **Aptos chain id** used by the SDK client (**2** / **1**). |
-
-**Testnet defaults**
-- REST API: `https://api.testnet.aptoslabs.com/decibel/api/v1`
-- Fullnode: `https://api.testnet.aptoslabs.com/v1`
-- Package: `0xe7da2794b1d8af76532ed95f38bfdf1136abfd8ea3a240189971988a83101b7f`
-
-**Mainnet defaults**
-- REST API: `https://api.mainnet.aptoslabs.com/decibel/api/v1`
-- Fullnode: `https://api.mainnet.aptoslabs.com/v1`
-- Package: `0x50ead22afd6ffd9769e3b3d6e0e64a2a350d68e8b102c4e72e33d0b8cfdfdb06`
-
----
-
-### Trading parameters
-
-| Env var | CLI flag | Default | Description |
-|---------|----------|---------|-------------|
-| `MARKET_NAME` | `-market-name` | `BTC/USD` | Market to trade. Use the symbol shown on the Decibel UI (e.g. `BTC/USD`, `ETH/USD`). Ignored when `MARKETS` is set (see [Multi-market mode](#multi-market-mode-optional) below). |
-| `SPREAD` | `-spread` | `0.001` | Total bid-ask spread as a fraction of mid price. `0.001` = 0.1%. |
-| `ORDER_SIZE` | `-order-size` | `0.001` | Base-asset units to quote on each side per cycle (e.g. 0.001 BTC). |
-| `MAX_INVENTORY` | `-max-inventory` | `0.005` | Stop quoting new orders when `abs(position) ≥ this`. |
-| `SKEW_PER_UNIT` | `-skew-per-unit` | `0.0001` | Extra half-spread added per 1.0 unit of net inventory (inventory skew coefficient). Positive inventory shifts quotes down; negative shifts them up. |
-| `MAX_MARGIN_USAGE` | `-max-margin-usage` | `0.5` | Pause quoting when `cross_margin_ratio > this` (0–1). `0.5` = pause above 50% margin usage. |
-| `REFRESH_INTERVAL` | `-refresh-interval` | `20.0` | Seconds to sleep between full quote cycles. |
-| `REFRESH_INTERVAL_JITTER_S` | `-refresh-interval-jitter` | `0` | Half-width in seconds for **uniform** random jitter: each cycle sleeps in `[REFRESH_INTERVAL − jitter, REFRESH_INTERVAL + jitter]`. The lower bound is floored at `0.01` s if `interval − jitter` would be non-positive. `0` disables jitter (fixed interval). |
-| `AUTO_FLATTEN` | `-auto-flatten` | `false` | When `true`, automatically place a reduce-only POST_ONLY order to cut inventory when `MAX_INVENTORY` is hit. |
-| `FLATTEN_AGGRESSION` | `-flatten-aggression` | `0.001` | Price offset from mid for the flatten order, as a fraction. `0.001` = 0.1% through mid. |
-| `FLATTEN_MAX_DEVIATION` | `-flatten-max-deviation` | `0.05` | Bounds the passive POST_ONLY flatten price vs mid (e.g. `0.05` = 5%). `0` disables the bound. |
-| `FLATTEN_REPRICE_STALL_CYCLES` | `-flatten-reprice-stall-cycles` | `0` | When `AUTO_FLATTEN` is on and the same flatten order stays open this many consecutive cycles, cancel it and place again (POST_ONLY, escalated aggression — see `FLATTEN_FORCE_SECONDS`, new mid). `0` = never (legacy: one resting flatten until fill or external cancel). |
-| `FLATTEN_FORCE_SECONDS` | `-flatten-force-seconds` | `240` | Wall-clock seconds stuck at the inventory limit (since it was first hit, not reset by repricing) before the resting POST_ONLY flatten is cancelled and replaced with a marketable **IOC** reduce-only order to guarantee exit — accepting taker fee + slippage. Between `0` and this deadline, `FLATTEN_AGGRESSION` shrinks linearly toward `0` on each reprice so the resting order creeps closer to mid. `0` disables forced IOC escalation entirely (legacy: may stay stuck indefinitely in a trending market). Logged at `CRITICAL` level when triggered. |
-| `FLATTEN_FORCE_DEVIATION` | `-flatten-force-deviation` | `0.05` | Price offset from mid for the forced IOC close (e.g. `0.05` = 5%), sized to cross available book depth. Falls back to `FLATTEN_MAX_DEVIATION` if `0`. |
-| `DRY_RUN` | `-dry-run` | `false` | Log all actions without submitting any on-chain transactions. Use this to verify configuration before going live. |
-
----
-
-### Adaptive spread (auto-tuning)
-
-When enabled, the bot automatically adjusts spread based on fill activity.
-
-| Env var | CLI flag | Default | Description |
-|---------|----------|---------|-------------|
-| `AUTO_SPREAD` | `-auto-spread` | `false` | When `true`, automatically narrow the spread after `SPREAD_NO_FILL_CYCLES` consecutive cycles with no fill. Also widens slightly (up to the initial `SPREAD`) when a fill is detected. When `false`, only logs a suggestion without changing anything. **No-fill cycles are not counted while `abs(position) ≥ MAX_INVENTORY`** (bulk quotes are off; only flatten / pause applies). |
-| `SPREAD_MIN` | `-spread-min` | `0.0004` | Minimum spread the auto-adjuster will narrow down to (fraction). **Do not set below 0.0004 (0.04%) to avoid posting at a loss on volatile markets.** |
-| `SPREAD_MAX` | `-spread-max` | `0.02` | Maximum spread the auto-adjuster will widen up to (fraction). Also used as the reset ceiling on fill. |
-| `SPREAD_NO_FILL_CYCLES` | `-spread-no-fill-cycles` | `3` | Number of consecutive cycles with no detected fill before narrowing spread by one step. |
-| `SPREAD_STEP` | `-spread-step` | `0.0002` | Amount (fraction) to narrow spread per adjustment step. On fill, widens by `SPREAD_STEP * 0.5`. |
-
----
-
-### Optional overrides
-
-These override the values set by `NETWORK`. Leave unset to use the network profile defaults.
-
-| Env var | CLI flag | Description |
-|---------|----------|-------------|
-| `REST_API_BASE` | `-api-base` | Decibel REST API base URL |
-| `APTOS_FULLNODE_URL` | `-fullnode-url` | Aptos-compatible fullnode URL |
-| `PACKAGE_ADDRESS` | `-package-address` | Move package address |
-| `MARKET_ADDR` | _(env only)_ | Skip market discovery and use this PerpMarket object address directly. |
-
----
-
-### Telegram notifications (optional)
-
-| Env var | CLI flag | Default | Description |
-|---------|----------|---------|-------------|
-| `TG_BOT_TOKEN` | `-tg-token` | _(unset)_ | Telegram bot token. When unset or empty, Telegram is disabled. **Prefer `.env`**; CLI values are visible in `ps`. |
-| `TG_ADMIN_ID` | `-tg-admin-id` | _(unset)_ | Your Telegram user ID (numeric). Telegram is only enabled when **both** `TG_BOT_TOKEN` and `TG_ADMIN_ID` are set. **Prefer `.env`**; CLI values are visible in `ps`. |
-| `TG_ALERT_INVENTORY` | `-tg-alert-inventory` | `false` | Enable automated alerts when `abs(inventory) ≥ MAX_INVENTORY`. |
-| `TG_ALERT_INVENTORY_INTERVAL_MIN` | `-tg-alert-interval` | `30` | Minutes between repeated inventory-limit alerts. |
-| `TG_STRICT_START` | `-tg-strict-start` | `false` | When Telegram is enabled, **exit the process** if bot init, API ready check (`getMe`), or `setMyCommands` fails. Default: log a warning and run the market maker without Telegram. |
-| `TG_SUMMARY_ENABLED` | `-tg-summary-enabled` | `false` | Push a periodic `/status`-equivalent digest so you don't need to watch logs continuously. |
-| `TG_SUMMARY_INTERVAL_MIN` | `-tg-summary-interval` | `60` | Minutes between periodic summary pushes. |
-
-### Web UI (optional)
-
-| Env var | CLI flag | Default | Description |
-|---------|----------|---------|-------------|
-| `WEB_UI_ENABLED` | `-web-ui-enabled` | `false` | Start the local HTTP status/control dashboard. |
-| `WEB_UI_BIND` | `-web-ui-bind` | `127.0.0.1:8090` | Listen address. Non-loopback binds log a loud startup warning — see security note above. |
-| `WEB_UI_TOKEN` | `-web-ui-token` | _(unset)_ | Shared secret required on every request. **Required** when `WEB_UI_ENABLED=true`; the bot refuses to start otherwise. **Prefer `.env`**; CLI values are visible in `ps`. |
-
----
-
-### Logging & debugging (structured `slog`)
-
-| Env var | CLI flag | Default | Description |
-|---------|----------|---------|-------------|
-| `LOG_LEVEL` | `-log-level` | `info` | `debug`, `info`, `warn`, or `error`. `debug` enables verbose paths (e.g. per-request REST OK lines when `LOG_VERBOSE` is on). |
-| `LOG_FORMAT` | `-log-format` | `text` | `text` (default, ANSI on TTY unless `NO_COLOR`) or `json` (one JSON object per line for `jq` / tooling). |
-| `LOG_CYCLE_JSON` | `-log-cycle-json` | `false` | After each **successful** bulk quote cycle, emit one `cycle_trace_json` line with a JSON `payload` (mid, inventory, bid/ask/size, spreads). Same as `LOG_TRACE`. |
-| `LOG_TRACE` | _(env only)_ | `false` | Alias for `LOG_CYCLE_JSON`. |
-| `LOG_VERBOSE` | `-log-verbose` | `false` | When `true` and level is `debug`, log successful REST GET paths. **Failed** REST calls log at `WARN` regardless. |
-| `LOG_TEE_FILE` | `-log-tee-file` | _(empty)_ | Mirror every log line to a file **in addition to** stderr. Empty = disabled. Value `auto` builds `{LOG_TEE_FILE_DIR}/{subaccount8}_{market}.log` after market discovery (uses resolved `market_name`). Any other non-empty value is treated as a **file path** (relative to process cwd if not absolute); `LOG_TEE_FILE_DIR` is ignored in that case. |
-| `LOG_TEE_FILE_DIR` | `-log-tee-file-dir` | `.` | Directory prefix used **only** when `-log-tee-file=auto`. Parent directories are created with `mkdir -p` semantics before opening the file. |
-| `LOG_TEE_ASYNC_MS` | `-log-tee-async-ms` | `0` | Tee file writer: `0` = **synchronous** flush after each log line (good for `tail -f`). `>0` = background writer flushing on this interval in milliseconds (bounded queue; if full, falls back to a synchronous write for that line). Values above `60000` are clamped. |
-| `LOG_TEE_FSYNC` | `-log-tee-fsync` | `false` | After each tee flush, call `fsync` on the log file (slow; can help `tail -f` on NFS or similar). |
-
-When tee is enabled, **stderr** keeps ANSI colors on a TTY; the **file** sink uses the same text layout (or JSON if `LOG_FORMAT=json`) **without** ANSI escape codes. By default (`LOG_TEE_ASYNC_MS=0`) each line is **flushed to the `*os.File`** immediately so viewers see updates without waiting for process exit.
-
-**Greppable `msg` / keys (examples):** `state_snapshot` (`cycle`, `mid_f`, `open_orders`, `order_ids` when few orders), `mm_place_bulk`, `place_bulk_payload`, `flatten_intent`, `dex_place_order`, `dex_cancel_order`, `dex_cancel_order_ok`, `dex_cancel_order_skip`, `cancel_bulk_ok`, `cancel_bulk_skip`, `bulk_orders_ok`. Most Decibel `slog` lines and green **Success** lines (`order placed`, `bulk orders placed`, …) include `cycle` when the request `context` was wrapped with `logctx.WithCycle` in the MM loop. `logging.Cycle` banners pass `cycle` as an explicit log attribute. **Secrets are never logged** (no bearer token or private key in log fields).
-
----
-
-## Ways to pass parameters
-
-### 1. `.env` file (recommended for credentials)
-
-```bash
-cp .env.example .env
-# edit .env
-go run .
-```
-
-### 2. Environment variables
-
-```bash
-export BEARER_TOKEN=xxx
-export PRIVATE_KEY=0xabc...
-go run .
-```
-
-### 3. CLI flags (recommended for one-off overrides)
-
-Changing `-network` after other defaults were loaded updates REST/fullnode/package **from the new preset** unless you already set the matching URL fields via **CLI** or **environment variables** (CLI wins, then env, then preset).
-
-> **Note:** Go's `flag` package uses a single ASCII dash (`-`). For **non-boolean** flags, both `-spread 0.001` and `-spread=0.001` work.
-
-#### Boolean flags
-
-The boolean CLI flags are: `-auto-flatten`, `-dry-run`, `-auto-spread`, `-tg-alert-inventory`, `-tg-strict-start` (same set as `boolCLIFlagNames` in [`config/config.go`](config/config.go)).
-
-| Form | Meaning |
-|------|---------|
-| `-dry-run` | Sets the flag to `true` (flag present) |
-| `-dry-run=true` / `-dry-run=false` | **Recommended** in scripts; safe in any order with other flags |
-| `-auto-flatten false` then more flags | For the flags listed above, `config.Load` rewrites `-name <bool-token>` to `-name=<value>` before `flag.Parse`, so **`-auto-flatten false -spread 0.002` works** when the second token is a boolean literal (`true`, `false`, `0`, `1`, `yes`, `no`, …). |
-
-If the token after a boolean flag is **not** a boolean literal (e.g. `-auto-flatten 0.002`), standard `flag` parsing can still stop early and **skip later flags**. Use the right flag for numbers (e.g. `-flatten-aggression` for flatten price offset).
-
-```bash
-go run . \
-  -network mainnet \
-  -market-name ETH/USD \
-  -spread 0.002 \
-  -order-size 0.01 \
-  -dry-run
-```
-
-### 4. Mix
-
-Credentials in `.env`, trading params as flags:
-
-```bash
-# .env has BEARER_TOKEN, PRIVATE_KEY, SUBACCOUNT_ADDRESS
-go run . -spread 0.002 -order-size 0.01
-```
+</details>
 
 ---
 
@@ -360,3 +213,201 @@ go run . -fullnode-url https://my-node.example.com/v1
 # Explicit booleans (script-friendly) + spread
 go run . -auto-flatten=false -spread 0.0005 -dry-run
 ```
+
+Or build a binary first:
+
+```bash
+go build -o decibel-mm .
+./decibel-mm
+```
+
+---
+
+## Configuration
+
+Parameters are read in this priority order (highest wins):
+
+```
+CLI flag  >  environment variable  >  .env file  >  built-in default
+```
+
+You can mix all three — e.g. keep credentials in `.env` and tweak trading params via flags.
+
+### Ways to pass parameters
+
+<details>
+<summary>1. <code>.env</code> file (recommended for credentials)</summary>
+
+```bash
+cp .env.example .env
+# edit .env
+go run .
+```
+
+</details>
+
+<details>
+<summary>2. Environment variables</summary>
+
+```bash
+export BEARER_TOKEN=xxx
+export PRIVATE_KEY=0xabc...
+go run .
+```
+
+</details>
+
+<details>
+<summary>3. CLI flags (recommended for one-off overrides)</summary>
+
+Changing `-network` after other defaults were loaded updates REST/fullnode/package **from the new preset** unless you already set the matching URL fields via **CLI** or **environment variables** (CLI wins, then env, then preset).
+
+> **Note:** Go's `flag` package uses a single ASCII dash (`-`). For **non-boolean** flags, both `-spread 0.001` and `-spread=0.001` work.
+
+**Boolean flags:** `-auto-flatten`, `-dry-run`, `-auto-spread`, `-tg-alert-inventory`, `-tg-strict-start`, `-tg-summary-enabled`, `-web-ui-enabled` (same set as `boolCLIFlagNames` in [`config/config.go`](config/config.go)).
+
+| Form | Meaning |
+|------|---------|
+| `-dry-run` | Sets the flag to `true` (flag present) |
+| `-dry-run=true` / `-dry-run=false` | **Recommended** in scripts; safe in any order with other flags |
+| `-auto-flatten false` then more flags | For the flags listed above, `config.Load` rewrites `-name <bool-token>` to `-name=<value>` before `flag.Parse`, so **`-auto-flatten false -spread 0.002` works** when the second token is a boolean literal (`true`, `false`, `0`, `1`, `yes`, `no`, …). |
+
+If the token after a boolean flag is **not** a boolean literal (e.g. `-auto-flatten 0.002`), standard `flag` parsing can still stop early and **skip later flags**. Use the right flag for numbers (e.g. `-flatten-aggression` for flatten price offset).
+
+```bash
+go run . \
+  -network mainnet \
+  -market-name ETH/USD \
+  -spread 0.002 \
+  -order-size 0.01 \
+  -dry-run
+```
+
+</details>
+
+<details>
+<summary>4. Mix (credentials in <code>.env</code>, trading params as flags)</summary>
+
+```bash
+# .env has BEARER_TOKEN, PRIVATE_KEY, SUBACCOUNT_ADDRESS
+go run . -spread 0.002 -order-size 0.01
+```
+
+</details>
+
+---
+
+### Required — must be set before the bot will start
+
+| Env var | CLI flag | Description |
+|---------|----------|-------------|
+| `BEARER_TOKEN` | `-bearer-token` | REST API bearer token from the Decibel dashboard |
+| `SUBACCOUNT_ADDRESS` | `-subaccount` | Your subaccount object address (`0x…`) |
+| `PRIVATE_KEY` | `-private-key` | Ed25519: hex (optional `0x`), 64-byte hex **seed‖pubkey** (first 32 bytes used as seed), or AIP-80 `ed25519-priv-…`. **Avoid passing via CLI in production** (shell history, `ps`). |
+| `NODE_API_KEY` | `-node-api-key` | Fullnode API key; sent as `Authorization: Bearer`. Defaults to `BEARER_TOKEN` when unset. |
+
+The **GlobalPerpEngine** object address is **not configurable**: it is always derived from `PACKAGE_ADDRESS` (including the value set by `-network`) for logging only; it is not passed as a transaction argument.
+
+---
+
+<details>
+<summary><b>Full parameter reference</b> (~45 more env vars — all have sensible defaults; click to expand only what you need)</summary>
+
+### Network
+
+| Env var | CLI flag | Default | Description |
+|---------|----------|---------|-------------|
+| `NETWORK` | `-network` | `testnet` | Network preset: `testnet` or `mainnet`. Sets the REST API base URL, fullnode URL, Move package address, and the **Aptos chain id** used by the SDK client (**2** / **1**). |
+
+**Testnet defaults**
+- REST API: `https://api.testnet.aptoslabs.com/decibel/api/v1`
+- Fullnode: `https://api.testnet.aptoslabs.com/v1`
+- Package: `0xe7da2794b1d8af76532ed95f38bfdf1136abfd8ea3a240189971988a83101b7f`
+
+**Mainnet defaults**
+- REST API: `https://api.mainnet.aptoslabs.com/decibel/api/v1`
+- Fullnode: `https://api.mainnet.aptoslabs.com/v1`
+- Package: `0x50ead22afd6ffd9769e3b3d6e0e64a2a350d68e8b102c4e72e33d0b8cfdfdb06`
+
+#### Optional network overrides
+
+These override the values set by `NETWORK`. Leave unset to use the network profile defaults.
+
+| Env var | CLI flag | Description |
+|---------|----------|-------------|
+| `REST_API_BASE` | `-api-base` | Decibel REST API base URL |
+| `APTOS_FULLNODE_URL` | `-fullnode-url` | Aptos-compatible fullnode URL |
+| `PACKAGE_ADDRESS` | `-package-address` | Move package address |
+| `MARKET_ADDR` | _(env only)_ | Skip market discovery and use this PerpMarket object address directly. |
+
+### Trading parameters (full list)
+
+| Env var | CLI flag | Default | Description |
+|---------|----------|---------|-------------|
+| `MARKET_NAME` | `-market-name` | `BTC/USD` | Market to trade. Use the symbol shown on the Decibel UI (e.g. `BTC/USD`, `ETH/USD`). Ignored when `MARKETS` is set (see "Multi-market mode" above). |
+| `SPREAD` | `-spread` | `0.001` | Total bid-ask spread as a fraction of mid price. `0.001` = 0.1%. |
+| `ORDER_SIZE` | `-order-size` | `0.001` | Base-asset units to quote on each side per cycle (e.g. 0.001 BTC). |
+| `MAX_INVENTORY` | `-max-inventory` | `0.005` | Stop quoting new orders when `abs(position) ≥ this`. |
+| `SKEW_PER_UNIT` | `-skew-per-unit` | `0.0001` | Extra half-spread added per 1.0 unit of net inventory (inventory skew coefficient). Positive inventory shifts quotes down; negative shifts them up. |
+| `MAX_MARGIN_USAGE` | `-max-margin-usage` | `0.5` | Pause quoting when `cross_margin_ratio > this` (0–1). `0.5` = pause above 50% margin usage. |
+| `REFRESH_INTERVAL` | `-refresh-interval` | `20.0` | Seconds to sleep between full quote cycles. |
+| `REFRESH_INTERVAL_JITTER_S` | `-refresh-interval-jitter` | `0` | Half-width in seconds for **uniform** random jitter: each cycle sleeps in `[REFRESH_INTERVAL − jitter, REFRESH_INTERVAL + jitter]`. The lower bound is floored at `0.01` s if `interval − jitter` would be non-positive. `0` disables jitter (fixed interval). |
+| `AUTO_FLATTEN` | `-auto-flatten` | `false` | When `true`, automatically place a reduce-only POST_ONLY order to cut inventory when `MAX_INVENTORY` is hit. |
+| `FLATTEN_AGGRESSION` | `-flatten-aggression` | `0.001` | Price offset from mid for the flatten order, as a fraction. `0.001` = 0.1% through mid. |
+| `FLATTEN_MAX_DEVIATION` | `-flatten-max-deviation` | `0.05` | Bounds the passive POST_ONLY flatten price vs mid (e.g. `0.05` = 5%). `0` disables the bound. |
+| `FLATTEN_REPRICE_STALL_CYCLES` | `-flatten-reprice-stall-cycles` | `0` | When `AUTO_FLATTEN` is on and the same flatten order stays open this many consecutive cycles, cancel it and place again (POST_ONLY, escalated aggression — see `FLATTEN_FORCE_SECONDS`, new mid). `0` = never (legacy: one resting flatten until fill or external cancel). |
+| `FLATTEN_FORCE_SECONDS` | `-flatten-force-seconds` | `240` | Wall-clock seconds stuck at the inventory limit (since it was first hit, not reset by repricing) before the resting POST_ONLY flatten is cancelled and replaced with a marketable **IOC** reduce-only order to guarantee exit — accepting taker fee + slippage. Between `0` and this deadline, `FLATTEN_AGGRESSION` shrinks linearly toward `0` on each reprice so the resting order creeps closer to mid. `0` disables forced IOC escalation entirely (legacy: may stay stuck indefinitely in a trending market). Logged at `CRITICAL` level when triggered. |
+| `FLATTEN_FORCE_DEVIATION` | `-flatten-force-deviation` | `0.05` | Price offset from mid for the forced IOC close (e.g. `0.05` = 5%), sized to cross available book depth. Falls back to `FLATTEN_MAX_DEVIATION` if `0`. |
+| `DRY_RUN` | `-dry-run` | `false` | Log all actions without submitting any on-chain transactions. Use this to verify configuration before going live. |
+
+### Adaptive spread (auto-tuning)
+
+When enabled, the bot automatically adjusts spread based on fill activity.
+
+| Env var | CLI flag | Default | Description |
+|---------|----------|---------|-------------|
+| `AUTO_SPREAD` | `-auto-spread` | `false` | When `true`, automatically narrow the spread after `SPREAD_NO_FILL_CYCLES` consecutive cycles with no fill. Also widens slightly (up to the initial `SPREAD`) when a fill is detected. When `false`, only logs a suggestion without changing anything. **No-fill cycles are not counted while `abs(position) ≥ MAX_INVENTORY`** (bulk quotes are off; only flatten / pause applies). |
+| `SPREAD_MIN` | `-spread-min` | `0.0004` | Minimum spread the auto-adjuster will narrow down to (fraction). **Do not set below 0.0004 (0.04%) to avoid posting at a loss on volatile markets.** |
+| `SPREAD_MAX` | `-spread-max` | `0.02` | Maximum spread the auto-adjuster will widen up to (fraction). Also used as the reset ceiling on fill. |
+| `SPREAD_NO_FILL_CYCLES` | `-spread-no-fill-cycles` | `3` | Number of consecutive cycles with no detected fill before narrowing spread by one step. |
+| `SPREAD_STEP` | `-spread-step` | `0.0002` | Amount (fraction) to narrow spread per adjustment step. On fill, widens by `SPREAD_STEP * 0.5`. |
+
+### Telegram notifications (optional)
+
+| Env var | CLI flag | Default | Description |
+|---------|----------|---------|-------------|
+| `TG_BOT_TOKEN` | `-tg-token` | _(unset)_ | Telegram bot token. When unset or empty, Telegram is disabled. **Prefer `.env`**; CLI values are visible in `ps`. |
+| `TG_ADMIN_ID` | `-tg-admin-id` | _(unset)_ | Your Telegram user ID (numeric). Telegram is only enabled when **both** `TG_BOT_TOKEN` and `TG_ADMIN_ID` are set. **Prefer `.env`**; CLI values are visible in `ps`. |
+| `TG_ALERT_INVENTORY` | `-tg-alert-inventory` | `false` | Enable automated alerts when `abs(inventory) ≥ MAX_INVENTORY`. |
+| `TG_ALERT_INVENTORY_INTERVAL_MIN` | `-tg-alert-interval` | `30` | Minutes between repeated inventory-limit alerts. |
+| `TG_STRICT_START` | `-tg-strict-start` | `false` | When Telegram is enabled, **exit the process** if bot init, API ready check (`getMe`), or `setMyCommands` fails. Default: log a warning and run the market maker without Telegram. |
+| `TG_SUMMARY_ENABLED` | `-tg-summary-enabled` | `false` | Push a periodic `/status`-equivalent digest so you don't need to watch logs continuously. |
+| `TG_SUMMARY_INTERVAL_MIN` | `-tg-summary-interval` | `60` | Minutes between periodic summary pushes. |
+
+### Web UI (optional)
+
+| Env var | CLI flag | Default | Description |
+|---------|----------|---------|-------------|
+| `WEB_UI_ENABLED` | `-web-ui-enabled` | `false` | Start the local HTTP status/control dashboard. |
+| `WEB_UI_BIND` | `-web-ui-bind` | `127.0.0.1:8090` | Listen address. Non-loopback binds log a loud startup warning — see security note above. |
+| `WEB_UI_TOKEN` | `-web-ui-token` | _(unset)_ | Shared secret required on every request. **Required** when `WEB_UI_ENABLED=true`; the bot refuses to start otherwise. **Prefer `.env`**; CLI values are visible in `ps`. |
+
+### Logging & debugging (structured `slog`)
+
+| Env var | CLI flag | Default | Description |
+|---------|----------|---------|-------------|
+| `LOG_LEVEL` | `-log-level` | `info` | `debug`, `info`, `warn`, or `error`. `debug` enables verbose paths (e.g. per-request REST OK lines when `LOG_VERBOSE` is on). |
+| `LOG_FORMAT` | `-log-format` | `text` | `text` (default, ANSI on TTY unless `NO_COLOR`) or `json` (one JSON object per line for `jq` / tooling). |
+| `LOG_CYCLE_JSON` | `-log-cycle-json` | `false` | After each **successful** bulk quote cycle, emit one `cycle_trace_json` line with a JSON `payload` (mid, inventory, bid/ask/size, spreads). Same as `LOG_TRACE`. |
+| `LOG_TRACE` | _(env only)_ | `false` | Alias for `LOG_CYCLE_JSON`. |
+| `LOG_VERBOSE` | `-log-verbose` | `false` | When `true` and level is `debug`, log successful REST GET paths. **Failed** REST calls log at `WARN` regardless. |
+| `LOG_TEE_FILE` | `-log-tee-file` | _(empty)_ | Mirror every log line to a file **in addition to** stderr. Empty = disabled. Value `auto` builds `{LOG_TEE_FILE_DIR}/{subaccount8}_{market}.log` after market discovery (uses resolved `market_name`). Any other non-empty value is treated as a **file path** (relative to process cwd if not absolute); `LOG_TEE_FILE_DIR` is ignored in that case. |
+| `LOG_TEE_FILE_DIR` | `-log-tee-file-dir` | `.` | Directory prefix used **only** when `-log-tee-file=auto`. Parent directories are created with `mkdir -p` semantics before opening the file. |
+| `LOG_TEE_ASYNC_MS` | `-log-tee-async-ms` | `0` | Tee file writer: `0` = **synchronous** flush after each log line (good for `tail -f`). `>0` = background writer flushing on this interval in milliseconds (bounded queue; if full, falls back to a synchronous write for that line). Values above `60000` are clamped. |
+| `LOG_TEE_FSYNC` | `-log-tee-fsync` | `false` | After each tee flush, call `fsync` on the log file (slow; can help `tail -f` on NFS or similar). |
+
+When tee is enabled, **stderr** keeps ANSI colors on a TTY; the **file** sink uses the same text layout (or JSON if `LOG_FORMAT=json`) **without** ANSI escape codes. By default (`LOG_TEE_ASYNC_MS=0`) each line is **flushed to the `*os.File`** immediately so viewers see updates without waiting for process exit.
+
+**Greppable `msg` / keys (examples):** `state_snapshot` (`cycle`, `mid_f`, `open_orders`, `order_ids` when few orders), `mm_place_bulk`, `place_bulk_payload`, `flatten_intent`, `dex_place_order`, `dex_cancel_order`, `dex_cancel_order_ok`, `dex_cancel_order_skip`, `cancel_bulk_ok`, `cancel_bulk_skip`, `bulk_orders_ok`. Most Decibel `slog` lines and green **Success** lines (`order placed`, `bulk orders placed`, …) include `cycle` when the request `context` was wrapped with `logctx.WithCycle` in the MM loop. `logging.Cycle` banners pass `cycle` as an explicit log attribute. **Secrets are never logged** (no bearer token or private key in log fields).
+
+</details>
