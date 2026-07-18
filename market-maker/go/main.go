@@ -155,6 +155,8 @@ func main() {
 			AdminID:                cfg.TGAdminID,
 			AlertInventory:         cfg.TGAlertInventory,
 			AlertInventoryInterval: cfg.TGAlertInventoryInterval,
+			SummaryEnabled:         cfg.TGSummaryEnabled,
+			SummaryIntervalMin:     cfg.TGSummaryIntervalMin,
 			Locale:                 cfg.Locale,
 		}
 		info := &infoAdapter{mm: mm, ex: ex, cfg: cfg, apiClient: apiCatalog, marketNames: nameLookup}
@@ -281,6 +283,12 @@ func (a *infoAdapter) FetchLiveSnapshot(ctx context.Context) (botstate.Snapshot,
 		TargetMarketName: base.TargetMarketName,
 		TargetMarketID:   base.TargetMarketID,
 		LastCycleAt:      time.Now(),
+
+		EffectiveSpread:     base.EffectiveSpread,
+		Paused:              base.Paused,
+		PauseCancelResting:  base.PauseCancelResting,
+		FlattenStuckSeconds: base.FlattenStuckSeconds,
+		ForceCloseCount:     base.ForceCloseCount,
 	}, nil
 }
 
@@ -404,6 +412,22 @@ func (a *infoAdapter) WalletAddress() string {
 
 func (a *infoAdapter) MaxInventory() float64 {
 	return a.cfg.MaxInventory
+}
+
+func (a *infoAdapter) FlattenForceSeconds() float64 {
+	return a.cfg.FlattenForceSeconds
+}
+
+func (a *infoAdapter) MaxMarginUsage() float64 {
+	return a.cfg.MaxMarginUsage
+}
+
+func (a *infoAdapter) PauseTrading(ctx context.Context, cancelResting bool) error {
+	return a.mm.Pause(ctx, cancelResting)
+}
+
+func (a *infoAdapter) ResumeTrading() {
+	a.mm.Resume()
 }
 
 func (a *infoAdapter) MarketDisplayName(addr string) string {

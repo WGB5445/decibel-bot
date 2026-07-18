@@ -118,6 +118,12 @@ type Config struct {
 	TGAlertInventory         bool   // TG_ALERT_INVENTORY or -tg-alert-inventory
 	TGAlertInventoryInterval int    // TG_ALERT_INVENTORY_INTERVAL_MIN or -tg-alert-interval
 	TGStrictStart            bool   // TG_STRICT_START or -tg-strict-start
+	// TGSummaryEnabled pushes a periodic /status-equivalent digest so the operator
+	// doesn't need to watch logs. TG_SUMMARY_ENABLED or -tg-summary-enabled.
+	TGSummaryEnabled bool
+	// TGSummaryIntervalMin is the minutes between periodic summary pushes.
+	// TG_SUMMARY_INTERVAL_MIN or -tg-summary-interval.
+	TGSummaryIntervalMin int
 }
 
 // TelegramEnabled reports whether the Telegram bot should be started.
@@ -272,6 +278,7 @@ var boolCLIFlagNames = map[string]struct{}{
 	"log-verbose":        {},
 	"tg-alert-inventory": {},
 	"tg-strict-start":    {},
+	"tg-summary-enabled": {},
 }
 
 // normalizeBoolCLIArgs returns a copy of args with "-boolflag literal" rewritten

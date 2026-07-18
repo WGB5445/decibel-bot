@@ -19,11 +19,44 @@ func (t *TelegramNotifier) handleCommand(ctx context.Context, msg *tgbotapi.Mess
 		t.sendPositions(ctx, msg.Chat.ID)
 	case "trade_history":
 		t.sendRecentTrades(ctx, msg.Chat.ID)
+	case "status":
+		t.sendStatus(ctx, msg.Chat.ID)
+	case "pause":
+		t.sendPauseMenu(msg.Chat.ID)
+	case "resume":
+		t.sendResume(msg.Chat.ID)
 	case "help":
 		t.sendHelp(msg.Chat.ID)
 	default:
 		t.sendHelp(msg.Chat.ID)
 	}
+}
+
+// sendStatus sends the unified status panel (pause state, spread, inventory, margin).
+func (t *TelegramNotifier) sendStatus(ctx context.Context, chatID int64) {
+	snap, err := t.info.FetchLiveSnapshot(ctx)
+	if err != nil {
+		slog.Warn("tgbot: fetch live snapshot for status failed", "err", err)
+		t.send(tgbotapi.NewMessage(chatID, fmt.Sprintf(t.tr.ErrQueryRetryFmt, err)))
+		return
+	}
+	m := tgbotapi.NewMessage(chatID, formatStatus(t.tr, snap, t.info.MaxInventory(), t.info.MaxMarginUsage(), t.info.FlattenForceSeconds()))
+	m.ParseMode = tgbotapi.ModeMarkdown
+	m.ReplyMarkup = t.statusKeyboard()
+	t.send(m)
+}
+
+// sendPauseMenu asks which pause mode to use.
+func (t *TelegramNotifier) sendPauseMenu(chatID int64) {
+	m := tgbotapi.NewMessage(chatID, t.tr.PausePromptTitle)
+	m.ReplyMarkup = t.pauseMenuKeyboard()
+	t.send(m)
+}
+
+// sendResume clears the pause via /resume.
+func (t *TelegramNotifier) sendResume(chatID int64) {
+	t.info.ResumeTrading()
+	t.send(tgbotapi.NewMessage(chatID, t.tr.ResumedMsg))
 }
 
 // sendBalance sends the current account balance message.

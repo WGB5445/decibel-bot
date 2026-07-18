@@ -1393,3 +1393,79 @@ func TestFlattenStuckSinceResetsOnInventoryRecovery(t *testing.T) {
 		t.Error("expected flattenStuckSince to reset after inventory recovered below MaxInventory")
 	}
 }
+
+// ── Tests: Pause / resume ─────────────────────────────────────────────────────
+
+// While paused (without cancelling resting orders), normal bulk quoting must be
+// skipped, but risk controls (auto-flatten at the inventory limit) must still run.
+func TestPauseSkipsBulkPlacementButAllowsFlatten(t *testing.T) {
+	cfg := testConfig()
+	cfg.AutoFlatten = true
+	cfg.MaxInventory = 0.01
+	mid := 100_000.0
+	ex := &mockExchange{state: exchange.StateSnapshot{Inventory: 0.02, Mid: ptr(mid)}}
+	mm := New(cfg, ex, testMarket())
+
+	if err := mm.Pause(context.Background(), false); err != nil {
+		t.Fatalf("Pause: %v", err)
+	}
+
+	if err := mm.runCycle(context.Background(), 1); err != nil {
+		t.Fatalf("runCycle: %v", err)
+	}
+
+	if len(ex.bulkBids) != 0 || len(ex.bulkAsks) != 0 {
+		t.Error("expected no bulk quotes placed while paused (n/a here since inventory is over limit, but guards against regressions)")
+	}
+	if len(ex.placed) != 1 {
+		t.Fatalf("expected auto-flatten to still place a reduce-only order while paused, got %d placed", len(ex.placed))
+	}
+	if !ex.placed[0].ReduceOnly {
+		t.Error("expected the flatten order placed while paused to be reduce-only")
+	}
+}
+
+// Pause must skip normal bulk quote placement when inventory is within limits
+// (the actual "stop new quoting" case), while Resume must re-enable it.
+func TestPauseBlocksNormalQuotingResumeReenables(t *testing.T) {
+	cfg := testConfig()
+	mid := 100_000.0
+	ex := &mockExchange{state: exchange.StateSnapshot{Inventory: 0.0, Mid: ptr(mid)}}
+	mm := New(cfg, ex, testMarket())
+
+	if err := mm.Pause(context.Background(), false); err != nil {
+		t.Fatalf("Pause: %v", err)
+	}
+	if err := mm.runCycle(context.Background(), 1); err != nil {
+		t.Fatalf("runCycle (paused): %v", err)
+	}
+	if len(ex.bulkBids) != 0 {
+		t.Errorf("expected no bulk quotes while paused, got %d", len(ex.bulkBids))
+	}
+
+	mm.Resume()
+	if err := mm.runCycle(context.Background(), 2); err != nil {
+		t.Fatalf("runCycle (resumed): %v", err)
+	}
+	if len(ex.bulkBids) != 1 {
+		t.Errorf("expected bulk quotes placed after resume, got %d", len(ex.bulkBids))
+	}
+}
+
+// Pausing with cancelResting=true must immediately cancel resting bulk quotes.
+func TestPauseWithCancelRestingCancelsBulkOrders(t *testing.T) {
+	cfg := testConfig()
+	ex := &mockExchange{}
+	mm := New(cfg, ex, testMarket())
+
+	if err := mm.Pause(context.Background(), true); err != nil {
+		t.Fatalf("Pause: %v", err)
+	}
+	if ex.bulkCancelCalls != 1 {
+		t.Errorf("expected 1 CancelBulkOrders call when pausing with cancelResting=true, got %d", ex.bulkCancelCalls)
+	}
+	paused, cancelResting := mm.PauseState()
+	if !paused || !cancelResting {
+		t.Errorf("expected PauseState() = (true, true), got (%v, %v)", paused, cancelResting)
+	}
+}

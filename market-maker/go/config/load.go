@@ -193,6 +193,8 @@ func newConfigFromEnvProfile(profile NetworkProfile, networkEnv string) *Config 
 		TGAlertInventory:         envBool("TG_ALERT_INVENTORY", false),
 		TGAlertInventoryInterval: int(envFloat("TG_ALERT_INVENTORY_INTERVAL_MIN", 30)),
 		TGStrictStart:            envBool("TG_STRICT_START", false),
+		TGSummaryEnabled:         envBool("TG_SUMMARY_ENABLED", false),
+		TGSummaryIntervalMin:     int(envFloat("TG_SUMMARY_INTERVAL_MIN", 60)),
 	}
 }
 
@@ -503,6 +505,10 @@ func registerAllFlags(fs *flag.FlagSet, cfg *Config) {
 		"Minutes between repeated inventory-limit Telegram alerts (overrides TG_ALERT_INVENTORY_INTERVAL_MIN)")
 	fs.BoolVar(&cfg.TGStrictStart, "tg-strict-start", cfg.TGStrictStart,
 		"When Telegram is enabled, exit if bot init/ready/setCommands fails (overrides TG_STRICT_START)")
+	fs.BoolVar(&cfg.TGSummaryEnabled, "tg-summary-enabled", cfg.TGSummaryEnabled,
+		"Push a periodic status digest so you don't need to watch logs (overrides TG_SUMMARY_ENABLED)")
+	fs.IntVar(&cfg.TGSummaryIntervalMin, "tg-summary-interval", cfg.TGSummaryIntervalMin,
+		"Minutes between periodic status digest pushes (overrides TG_SUMMARY_INTERVAL_MIN)")
 
 	var configPathDummy string
 	configDefault := strings.TrimSpace(os.Getenv("CONFIG_FILE"))

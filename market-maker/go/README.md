@@ -49,16 +49,25 @@ export TG_BOT_TOKEN="<your-bot-token>"
 export TG_ADMIN_ID="<your-user-id>"
 export TG_ALERT_INVENTORY=true        # optional: true to enable inventory alerts
 export TG_ALERT_INVENTORY_INTERVAL_MIN=30  # optional: minutes between alerts
+export TG_SUMMARY_ENABLED=true        # optional: push a periodic /status digest
+export TG_SUMMARY_INTERVAL_MIN=60     # optional: minutes between summary pushes
 ```
 
 Commands (sent by `/...` to the bot in Telegram):
+- `/status` — Unified panel: pause state, effective spread, inventory vs limit, margin usage, and (if applicable) how long inventory has been stuck at the limit relative to the `FLATTEN_FORCE_SECONDS` deadline
 - `/balance` — Account equity, available balance, margin usage
 - `/gas` — Wallet APT balance
 - `/positions` — Non-zero positions across markets (paged in one message; refresh resets to page 1); chain actions still use market addresses
 - `/trade_history` — Recent fills for the configured market from REST `trade_history` (5 per page, paginated)
+- `/pause` — Prompts for a pause mode: **new quotes only** (risk controls, including auto-flatten escalation, keep running) or **new quotes + cancel resting orders**
+- `/resume` — Clears a pause and resumes normal quoting
 - `/help` — Command list
 
-Alerts: When `abs(inventory) ≥ MAX_INVENTORY`, the bot sends an alert with buttons to refresh or close the position. Auto-refresh period is configurable.
+Alerts:
+- **Inventory limit**: when `abs(inventory) ≥ MAX_INVENTORY`, sends an alert with buttons to refresh or close the position (edited in place; auto-refresh period is configurable via `TG_ALERT_INVENTORY_INTERVAL_MIN`).
+- **Margin usage**: when margin usage exceeds `MAX_MARGIN_USAGE` (mirrors the inventory alert's edit-in-place pattern; always on when Telegram is enabled).
+- **Forced close**: a one-shot alert whenever the flatten-escalation state machine (see `FLATTEN_FORCE_SECONDS` above) force-closes with an IOC order — always on when Telegram is enabled.
+- **Periodic summary** (opt-in via `TG_SUMMARY_ENABLED`): pushes the same content as `/status` on a timer (`TG_SUMMARY_INTERVAL_MIN`), so you don't need to watch logs continuously.
 
 ---
 
@@ -180,6 +189,8 @@ These override the values set by `NETWORK`. Leave unset to use the network profi
 | `TG_ALERT_INVENTORY` | `-tg-alert-inventory` | `false` | Enable automated alerts when `abs(inventory) ≥ MAX_INVENTORY`. |
 | `TG_ALERT_INVENTORY_INTERVAL_MIN` | `-tg-alert-interval` | `30` | Minutes between repeated inventory-limit alerts. |
 | `TG_STRICT_START` | `-tg-strict-start` | `false` | When Telegram is enabled, **exit the process** if bot init, API ready check (`getMe`), or `setMyCommands` fails. Default: log a warning and run the market maker without Telegram. |
+| `TG_SUMMARY_ENABLED` | `-tg-summary-enabled` | `false` | Push a periodic `/status`-equivalent digest so you don't need to watch logs continuously. |
+| `TG_SUMMARY_INTERVAL_MIN` | `-tg-summary-interval` | `60` | Minutes between periodic summary pushes. |
 
 ---
 

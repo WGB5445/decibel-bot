@@ -83,6 +83,17 @@ type MarketMaker struct {
 	// aggression shrinks toward 0 as elapsed approaches the limit, then a marketable IOC
 	// reduce-only order is forced to guarantee exit.
 	flattenStuckSince time.Time
+
+	// forceCloseCount is the cumulative number of forced IOC flatten closes. Only ever
+	// mutated on the runCycle goroutine; safe to read here because it is copied into
+	// botstate.BotState (itself mutex-protected) at the end of each cycle.
+	forceCloseCount int
+
+	// pauseMu guards paused/pauseCancelResting, which are written from a different
+	// goroutine (e.g. the Telegram command handler) and read every cycle.
+	pauseMu            sync.RWMutex
+	paused             bool
+	pauseCancelResting bool
 }
 
 // New creates a MarketMaker with the given exchange and market config.
@@ -123,6 +134,40 @@ func (m *MarketMaker) FlattenPosition(ctx context.Context) (exchange.PlaceOrderO
 	}
 
 	return m.placeFlattenOrder(ctx, inv, *state.Mid, m.cfg.FlattenAggression)
+}
+
+// Pause stops placing new bulk quotes starting from the next cycle. Risk controls
+// (margin guard, inventory-limit auto-flatten and its escalation) keep running
+// regardless of pause state — pause only affects normal two-sided quoting.
+// When cancelResting is true, also cancels any resting bulk quotes immediately.
+func (m *MarketMaker) Pause(ctx context.Context, cancelResting bool) error {
+	m.pauseMu.Lock()
+	m.paused = true
+	m.pauseCancelResting = cancelResting
+	m.pauseMu.Unlock()
+
+	if cancelResting {
+		if err := m.ex.CancelBulkOrders(ctx); err != nil {
+			return fmt.Errorf("pause: cancel bulk orders: %w", err)
+		}
+	}
+	return nil
+}
+
+// Resume clears a previously-set pause, allowing normal quoting to resume next cycle.
+func (m *MarketMaker) Resume() {
+	m.pauseMu.Lock()
+	defer m.pauseMu.Unlock()
+	m.paused = false
+	m.pauseCancelResting = false
+}
+
+// PauseState reports whether trading is currently paused and, if so, whether the
+// pause also cancelled resting bulk quotes.
+func (m *MarketMaker) PauseState() (paused, cancelResting bool) {
+	m.pauseMu.RLock()
+	defer m.pauseMu.RUnlock()
+	return m.paused, m.pauseCancelResting
 }
 
 // Run starts the main market-making loop. Blocks until ctx is cancelled.
@@ -238,13 +283,26 @@ func (m *MarketMaker) runCycle(ctx context.Context, cycle uint64) error {
 	slog.Info("state_snapshot", ss...)
 
 	// Share state with notification layer before lastInventory is updated this cycle.
+	// EffectiveSpread/FlattenStuckSeconds reflect the end of the PREVIOUS cycle (this
+	// cycle's adjustments/escalation happen further below) — an acceptable ~1-cycle lag
+	// for a monitoring display, matching the existing PrevInventory convention above.
+	flattenStuckSeconds := 0.0
+	if !m.flattenStuckSince.IsZero() {
+		flattenStuckSeconds = time.Since(m.flattenStuckSince).Seconds()
+	}
+	paused, pauseCancelResting := m.PauseState()
 	m.state.Update(botstate.StateUpdate{
-		Equity:        state.Equity,
-		MarginUsage:   state.MarginUsage,
-		Inventory:     state.Inventory,
-		Mid:           state.Mid,
-		AllPositions:  exchangePositionsToBotstate(state.AllPositions),
-		PrevInventory: m.lastInventory,
+		Equity:              state.Equity,
+		MarginUsage:         state.MarginUsage,
+		Inventory:           state.Inventory,
+		Mid:                 state.Mid,
+		AllPositions:        exchangePositionsToBotstate(state.AllPositions),
+		PrevInventory:       m.lastInventory,
+		EffectiveSpread:     m.effectiveSpread,
+		Paused:              paused,
+		PauseCancelResting:  pauseCancelResting,
+		FlattenStuckSeconds: flattenStuckSeconds,
+		ForceCloseCount:     m.forceCloseCount,
 	})
 
 	if math.Abs(state.Inventory) < m.cfg.MaxInventory {
@@ -403,6 +461,14 @@ func (m *MarketMaker) runCycle(ctx context.Context, cycle uint64) error {
 
 	slog.Info("computed quotes",
 		"cycle", cycle, "bid", quotes.Bid, "ask", quotes.Ask, "size", quotes.Size)
+
+	// ── 4b. Pause guard: skip new quote placement while paused ────────────────
+	// Risk controls (margin guard above, auto-flatten escalation in the quotes==nil
+	// branch above) are NOT gated by pause — only normal two-sided quoting is.
+	if paused, _ := m.PauseState(); paused {
+		slog.Info("paused: skipping bulk quote placement", "cycle", cycle)
+		return nil
+	}
 
 	// ── 5. Atomically replace bulk quotes (bid + ask in one transaction) ──────
 
@@ -662,6 +728,7 @@ func (m *MarketMaker) forceCloseFlatten(ctx context.Context, cycle uint64, mid, 
 	}
 
 	slog.Warn("forced IOC flatten submitted", "cycle", cycle, "order_id", outcome.OrderID, "tx_hash", outcome.TxHash)
+	m.forceCloseCount++
 	return nil
 }
 
