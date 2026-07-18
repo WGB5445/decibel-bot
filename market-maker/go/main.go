@@ -29,6 +29,7 @@ import (
 	"decibel-mm-bot/notify"
 	"decibel-mm-bot/notify/telegram"
 	"decibel-mm-bot/strategy"
+	"decibel-mm-bot/webui"
 )
 
 func main() {
@@ -149,6 +150,20 @@ func main() {
 	mm := strategy.New(cfg, ex, market)
 
 	// ── 3. Notification layer (optional) ─────────────────────────────────────
+	// Shared by both Telegram and the Web UI so they read one consistent state
+	// and expose the same control actions (pause/resume/flatten).
+	info := &infoAdapter{mm: mm, ex: ex, cfg: cfg, apiClient: apiCatalog, marketNames: nameLookup}
+
+	if cfg.WebUIEnabled {
+		webCfg := webui.Config{Bind: cfg.WebUIBind, Token: cfg.WebUIToken}
+		webSrv := webui.New(webCfg, info)
+		go func() {
+			if err := webSrv.Run(ctx); err != nil && ctx.Err() == nil {
+				slog.Error("webui exited with error", "err", err)
+			}
+		}()
+	}
+
 	if cfg.TelegramEnabled() {
 		tgCfg := telegram.Config{
 			BotToken:               cfg.TGBotToken,
@@ -159,7 +174,6 @@ func main() {
 			SummaryIntervalMin:     cfg.TGSummaryIntervalMin,
 			Locale:                 cfg.Locale,
 		}
-		info := &infoAdapter{mm: mm, ex: ex, cfg: cfg, apiClient: apiCatalog, marketNames: nameLookup}
 		tg, err := telegram.New(tgCfg, info)
 		if err != nil {
 			if cfg.TGStrictStart {

@@ -69,6 +69,36 @@ Alerts:
 - **Forced close**: a one-shot alert whenever the flatten-escalation state machine (see `FLATTEN_FORCE_SECONDS` above) force-closes with an IOC order — always on when Telegram is enabled.
 - **Periodic summary** (opt-in via `TG_SUMMARY_ENABLED`): pushes the same content as `/status` on a timer (`TG_SUMMARY_INTERVAL_MIN`), so you don't need to watch logs continuously.
 
+## Web Dashboard (Optional)
+
+A local HTTP dashboard (`webui/`) mirrors the Telegram status/control surface — same
+`notify.InfoProvider` backend, same pause/resume/flatten actions — for when you want a
+browser view instead of (or alongside) Telegram. Enable by setting:
+
+```bash
+export WEB_UI_ENABLED=true
+export WEB_UI_BIND="127.0.0.1:8090"   # default; keep loopback-only unless firewalled
+export WEB_UI_TOKEN="<a long random secret>"  # required when enabled
+```
+
+Then open `http://127.0.0.1:8090/` and paste the token into the page (stored in the
+browser's `localStorage`, sent as a query param / bearer header on each request — never
+persisted server-side beyond the running process).
+
+**⚠️ Security:** authentication is a single shared token with no rate limiting, sessions,
+or audit log — equivalent to an API key for pause/resume/flatten actions on real funds.
+`WEB_UI_BIND` defaults to `127.0.0.1` (loopback-only); binding to any other address logs a
+loud warning at startup. If you need remote access, put this behind a VPN, SSH tunnel
+(`ssh -L 8090:127.0.0.1:8090 ...`), or an authenticating reverse proxy — do **not** expose
+it directly to the public internet.
+
+API endpoints (all except `/` require `?token=...` or `Authorization: Bearer ...`):
+- `GET /api/status` — same fields as the Telegram `/status` panel, as JSON
+- `GET /api/positions` — non-zero positions across markets, as JSON
+- `POST /api/pause` — body `{"cancel_resting": bool}`
+- `POST /api/resume`
+- `POST /api/flatten` — reduce-only close of the configured target market
+
 ---
 
 ## Quick start
@@ -191,6 +221,14 @@ These override the values set by `NETWORK`. Leave unset to use the network profi
 | `TG_STRICT_START` | `-tg-strict-start` | `false` | When Telegram is enabled, **exit the process** if bot init, API ready check (`getMe`), or `setMyCommands` fails. Default: log a warning and run the market maker without Telegram. |
 | `TG_SUMMARY_ENABLED` | `-tg-summary-enabled` | `false` | Push a periodic `/status`-equivalent digest so you don't need to watch logs continuously. |
 | `TG_SUMMARY_INTERVAL_MIN` | `-tg-summary-interval` | `60` | Minutes between periodic summary pushes. |
+
+### Web UI (optional)
+
+| Env var | CLI flag | Default | Description |
+|---------|----------|---------|-------------|
+| `WEB_UI_ENABLED` | `-web-ui-enabled` | `false` | Start the local HTTP status/control dashboard. |
+| `WEB_UI_BIND` | `-web-ui-bind` | `127.0.0.1:8090` | Listen address. Non-loopback binds log a loud startup warning — see security note above. |
+| `WEB_UI_TOKEN` | `-web-ui-token` | _(unset)_ | Shared secret required on every request. **Required** when `WEB_UI_ENABLED=true`; the bot refuses to start otherwise. **Prefer `.env`**; CLI values are visible in `ps`. |
 
 ---
 

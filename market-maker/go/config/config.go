@@ -124,6 +124,18 @@ type Config struct {
 	// TGSummaryIntervalMin is the minutes between periodic summary pushes.
 	// TG_SUMMARY_INTERVAL_MIN or -tg-summary-interval.
 	TGSummaryIntervalMin int
+
+	// ── Web UI (optional monitoring/control dashboard) ────────────────────────
+	// WebUIEnabled starts a local HTTP server exposing a read-only status page
+	// plus pause/resume/flatten controls, gated by WebUIToken. WEB_UI_ENABLED or -web-ui-enabled.
+	WebUIEnabled bool
+	// WebUIBind is the listen address, e.g. "127.0.0.1:8090". Defaults to loopback-only;
+	// binding to a non-loopback address is logged as a loud warning (no auth beyond the
+	// shared token — do not expose this directly to the public internet). WEB_UI_BIND or -web-ui-bind.
+	WebUIBind string
+	// WebUIToken is a shared secret required on every request (header or query param).
+	// Required when WebUIEnabled is true. WEB_UI_TOKEN or -web-ui-token; visible in process list.
+	WebUIToken string
 }
 
 // TelegramEnabled reports whether the Telegram bot should be started.
@@ -179,6 +191,10 @@ func (c *Config) validate() error {
 	}
 	if c.FlattenForceDeviation < 0 {
 		return fmt.Errorf("FLATTEN_FORCE_DEVIATION (-flatten-force-deviation) must be >= 0, got %v", c.FlattenForceDeviation)
+	}
+
+	if c.WebUIEnabled && strings.TrimSpace(c.WebUIToken) == "" {
+		return fmt.Errorf("WEB_UI_TOKEN (-web-ui-token) is required when WEB_UI_ENABLED is true")
 	}
 
 	if c.ShutdownCancelTimeoutS <= 0 {
@@ -279,6 +295,7 @@ var boolCLIFlagNames = map[string]struct{}{
 	"tg-alert-inventory": {},
 	"tg-strict-start":    {},
 	"tg-summary-enabled": {},
+	"web-ui-enabled":     {},
 }
 
 // normalizeBoolCLIArgs returns a copy of args with "-boolflag literal" rewritten

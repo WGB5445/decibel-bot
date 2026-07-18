@@ -195,6 +195,10 @@ func newConfigFromEnvProfile(profile NetworkProfile, networkEnv string) *Config 
 		TGStrictStart:            envBool("TG_STRICT_START", false),
 		TGSummaryEnabled:         envBool("TG_SUMMARY_ENABLED", false),
 		TGSummaryIntervalMin:     int(envFloat("TG_SUMMARY_INTERVAL_MIN", 60)),
+
+		WebUIEnabled: envBool("WEB_UI_ENABLED", false),
+		WebUIBind:    envStr("WEB_UI_BIND", "127.0.0.1:8090"),
+		WebUIToken:   os.Getenv("WEB_UI_TOKEN"),
 	}
 }
 
@@ -509,6 +513,13 @@ func registerAllFlags(fs *flag.FlagSet, cfg *Config) {
 		"Push a periodic status digest so you don't need to watch logs (overrides TG_SUMMARY_ENABLED)")
 	fs.IntVar(&cfg.TGSummaryIntervalMin, "tg-summary-interval", cfg.TGSummaryIntervalMin,
 		"Minutes between periodic status digest pushes (overrides TG_SUMMARY_INTERVAL_MIN)")
+
+	fs.BoolVar(&cfg.WebUIEnabled, "web-ui-enabled", cfg.WebUIEnabled,
+		"Start a local HTTP status/control dashboard, gated by web-ui-token (overrides WEB_UI_ENABLED)")
+	fs.StringVar(&cfg.WebUIBind, "web-ui-bind", cfg.WebUIBind,
+		"Web UI listen address; keep loopback-only unless firewalled (overrides WEB_UI_BIND)")
+	fs.StringVar(&cfg.WebUIToken, "web-ui-token", cfg.WebUIToken,
+		"Shared secret required on every Web UI request (overrides WEB_UI_TOKEN); visible in process list")
 
 	var configPathDummy string
 	configDefault := strings.TrimSpace(os.Getenv("CONFIG_FILE"))
