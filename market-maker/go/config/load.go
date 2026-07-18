@@ -155,6 +155,7 @@ func newConfigFromEnvProfile(profile NetworkProfile, networkEnv string) *Config 
 		LogTeeAsyncIntervalMS: envInt("LOG_TEE_ASYNC_MS", 0),
 		LogTeeFsync:           envBool("LOG_TEE_FSYNC", false),
 
+		Markets:                   envStringList("MARKETS", nil),
 		MarketName:                envStr("MARKET_NAME", "BTC/USD"),
 		Spread:                    envFloat("SPREAD", 0.001),
 		OrderSize:                 envFloat("ORDER_SIZE", 0.001),

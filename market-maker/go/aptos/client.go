@@ -120,12 +120,31 @@ func ParseAccount(privKeyStr string) (*aptossdk.Account, error) {
 }
 
 // SubmitEntryFunction builds, signs, submits, and waits for an entry function.
+// The sequence number is fetched live from chain on every call (aptos-go-sdk's
+// default) — safe for a single-market bot where only one goroutine ever submits
+// for a given signer. Concurrent multi-market callers sharing one signer should use
+// TxSubmitter instead, which pins a locally-tracked sequence number to avoid racing
+// on the live value.
 func (n *NodeClient) SubmitEntryFunction(
 	ctx context.Context,
 	signer aptossdk.TransactionSigner,
 	function string,
 	typeArgs []string,
 	args []any,
+) (*TxResult, error) {
+	return n.submitEntryFunction(ctx, signer, function, typeArgs, args, nil)
+}
+
+// submitEntryFunction is the shared implementation. When seq is non-nil, the
+// transaction's sequence number is pinned to *seq (via aptossdk.SequenceNumber)
+// instead of letting the SDK fetch the "current" value live from chain.
+func (n *NodeClient) submitEntryFunction(
+	ctx context.Context,
+	signer aptossdk.TransactionSigner,
+	function string,
+	typeArgs []string,
+	args []any,
+	seq *uint64,
 ) (*TxResult, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
@@ -154,11 +173,17 @@ func (n *NodeClient) SubmitEntryFunction(
 	}
 
 	payload := aptossdk.TransactionPayload{Payload: entry}
+	buildOpts := []any{
+		aptossdk.MaxGasAmount(maxGasAmount),
+		aptossdk.GasUnitPrice(100),
+	}
+	if seq != nil {
+		buildOpts = append(buildOpts, aptossdk.SequenceNumber(*seq))
+	}
 	rawTxn, err := n.sdk.BuildTransaction(
 		signer.AccountAddress(),
 		payload,
-		aptossdk.MaxGasAmount(maxGasAmount),
-		aptossdk.GasUnitPrice(100),
+		buildOpts...,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("build transaction: %w", err)

@@ -101,6 +101,39 @@ API endpoints (all except `/` require `?token=...` or `Authorization: Bearer ...
 
 ---
 
+## Multi-market mode (optional)
+
+Run the same market-making strategy concurrently across several markets from one
+account, instead of one process per market. Enable by setting `MARKETS` (env var
+only — no CLI flag or config-file support yet):
+
+```bash
+export MARKETS="BTC/USD,ETH/USD,SOL/USD"   # comma-separated; overrides MARKET_NAME
+```
+
+All markets share the same trading parameters (`SPREAD`, `ORDER_SIZE`, `MAX_INVENTORY`,
+`AUTO_FLATTEN`/`FLATTEN_*`, etc.) — per-market overrides aren't supported yet. Each
+market gets its own `MarketMaker` instance (independent inventory, spread, and
+flatten-escalation state) running in its own goroutine, but all of them submit
+transactions through one shared `aptos.TxSubmitter`.
+
+**Why a shared TxSubmitter matters:** `aptos-go-sdk`'s default `BuildTransaction` fetches
+the account's "current" sequence number live from chain on every call. Two goroutines
+submitting concurrently for the *same* signer/account can read the same pending sequence
+number before either commits, and one submission gets rejected. `aptos.TxSubmitter`
+(`aptos/tx_submitter.go`) fixes this by tracking the sequence number locally behind a
+mutex that fully serializes build→sign→submit→wait for one account — a market's cycle
+may wait briefly behind another market's in-flight submission, which is a fine tradeoff
+at a ~10-30s cycle cadence.
+
+**Known limitation:** Telegram and the Web UI are single-market-target-scoped today and
+are **automatically disabled** in multi-market mode (a warning is logged) rather than
+show misleading data under one market's name while other markets trade unmonitored.
+Trading itself is unaffected — only the notification/control surfaces are off until
+they're redesigned to be market-aware.
+
+---
+
 ## Quick start
 
 ```bash
@@ -165,7 +198,7 @@ The **GlobalPerpEngine** object address is **not configurable**: it is always de
 
 | Env var | CLI flag | Default | Description |
 |---------|----------|---------|-------------|
-| `MARKET_NAME` | `-market-name` | `BTC/USD` | Market to trade. Use the symbol shown on the Decibel UI (e.g. `BTC/USD`, `ETH/USD`). |
+| `MARKET_NAME` | `-market-name` | `BTC/USD` | Market to trade. Use the symbol shown on the Decibel UI (e.g. `BTC/USD`, `ETH/USD`). Ignored when `MARKETS` is set (see [Multi-market mode](#multi-market-mode-optional) below). |
 | `SPREAD` | `-spread` | `0.001` | Total bid-ask spread as a fraction of mid price. `0.001` = 0.1%. |
 | `ORDER_SIZE` | `-order-size` | `0.001` | Base-asset units to quote on each side per cycle (e.g. 0.001 BTC). |
 | `MAX_INVENTORY` | `-max-inventory` | `0.005` | Stop quoting new orders when `abs(position) ≥ this`. |

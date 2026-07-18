@@ -42,6 +42,15 @@ type Config struct {
 	Network string // "testnet" | "mainnet"
 
 	// ── Trading parameters ────────────────────────────────────────────────────
+	// Markets, when non-empty, switches into multi-market mode: one MarketMaker
+	// instance per entry, all trading concurrently from the same account via a shared
+	// aptos.TxSubmitter (so concurrent submissions don't race on the on-chain sequence
+	// number). All entries share the same trading parameters below (Spread, OrderSize,
+	// MaxInventory, etc.) — per-market overrides are not supported yet. Parsed from
+	// MARKETS (comma-separated, e.g. "BTC/USD,ETH/USD,SOL/USD"); env var only, no CLI
+	// flag or config-file support yet. Empty (default) runs the legacy single-market
+	// path using MarketName below.
+	Markets         []string
 	MarketName      string
 	Spread          float64
 	OrderSize       float64
@@ -388,6 +397,27 @@ func envStr(key, def string) string {
 		return v
 	}
 	return def
+}
+
+// envStringList reads a comma-separated env var into a trimmed, non-empty-entry slice.
+// Returns def when the var is unset/empty or contains no non-empty entries.
+func envStringList(key string, def []string) []string {
+	v := strings.TrimSpace(os.Getenv(key))
+	if v == "" {
+		return def
+	}
+	parts := strings.Split(v, ",")
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		p = strings.TrimSpace(p)
+		if p != "" {
+			out = append(out, p)
+		}
+	}
+	if len(out) == 0 {
+		return def
+	}
+	return out
 }
 
 func envFloat(key string, def float64) float64 {
