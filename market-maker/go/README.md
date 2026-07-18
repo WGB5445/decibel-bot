@@ -134,9 +134,12 @@ The **GlobalPerpEngine** object address is **not configurable**: it is always de
 | `MAX_MARGIN_USAGE` | `-max-margin-usage` | `0.5` | Pause quoting when `cross_margin_ratio > this` (0–1). `0.5` = pause above 50% margin usage. |
 | `REFRESH_INTERVAL` | `-refresh-interval` | `20.0` | Seconds to sleep between full quote cycles. |
 | `REFRESH_INTERVAL_JITTER_S` | `-refresh-interval-jitter` | `0` | Half-width in seconds for **uniform** random jitter: each cycle sleeps in `[REFRESH_INTERVAL − jitter, REFRESH_INTERVAL + jitter]`. The lower bound is floored at `0.01` s if `interval − jitter` would be non-positive. `0` disables jitter (fixed interval). |
-| `AUTO_FLATTEN` | `-auto-flatten` | `false` | When `true`, automatically place a reduce-only GTC order to cut inventory when `MAX_INVENTORY` is hit. |
+| `AUTO_FLATTEN` | `-auto-flatten` | `false` | When `true`, automatically place a reduce-only POST_ONLY order to cut inventory when `MAX_INVENTORY` is hit. |
 | `FLATTEN_AGGRESSION` | `-flatten-aggression` | `0.001` | Price offset from mid for the flatten order, as a fraction. `0.001` = 0.1% through mid. |
-| `FLATTEN_REPRICE_STALL_CYCLES` | `-flatten-reprice-stall-cycles` | `0` | When `AUTO_FLATTEN` is on and the same flatten order stays open this many consecutive cycles, cancel it and place again (still POST_ONLY, same aggression, new mid). `0` = never (legacy: one resting flatten until fill or external cancel). |
+| `FLATTEN_MAX_DEVIATION` | `-flatten-max-deviation` | `0.05` | Bounds the passive POST_ONLY flatten price vs mid (e.g. `0.05` = 5%). `0` disables the bound. |
+| `FLATTEN_REPRICE_STALL_CYCLES` | `-flatten-reprice-stall-cycles` | `0` | When `AUTO_FLATTEN` is on and the same flatten order stays open this many consecutive cycles, cancel it and place again (POST_ONLY, escalated aggression — see `FLATTEN_FORCE_SECONDS`, new mid). `0` = never (legacy: one resting flatten until fill or external cancel). |
+| `FLATTEN_FORCE_SECONDS` | `-flatten-force-seconds` | `240` | Wall-clock seconds stuck at the inventory limit (since it was first hit, not reset by repricing) before the resting POST_ONLY flatten is cancelled and replaced with a marketable **IOC** reduce-only order to guarantee exit — accepting taker fee + slippage. Between `0` and this deadline, `FLATTEN_AGGRESSION` shrinks linearly toward `0` on each reprice so the resting order creeps closer to mid. `0` disables forced IOC escalation entirely (legacy: may stay stuck indefinitely in a trending market). Logged at `CRITICAL` level when triggered. |
+| `FLATTEN_FORCE_DEVIATION` | `-flatten-force-deviation` | `0.05` | Price offset from mid for the forced IOC close (e.g. `0.05` = 5%), sized to cross available book depth. Falls back to `FLATTEN_MAX_DEVIATION` if `0`. |
 | `DRY_RUN` | `-dry-run` | `false` | Log all actions without submitting any on-chain transactions. Use this to verify configuration before going live. |
 
 ---

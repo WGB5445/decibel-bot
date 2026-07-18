@@ -168,6 +168,8 @@ func newConfigFromEnvProfile(profile NetworkProfile, networkEnv string) *Config 
 		FlattenAggression:         envFloat("FLATTEN_AGGRESSION", 0.001),
 		FlattenMaxDeviation:       envFloat("FLATTEN_MAX_DEVIATION", 0.05),
 		FlattenRepriceStallCycles: envInt("FLATTEN_REPRICE_STALL_CYCLES", 0),
+		FlattenForceSeconds:       envFloat("FLATTEN_FORCE_SECONDS", 240.0),
+		FlattenForceDeviation:     envFloat("FLATTEN_FORCE_DEVIATION", 0.05),
 		DryRun:                    envBool("DRY_RUN", false),
 
 		AutoSpread:         envBool("AUTO_SPREAD", false),
@@ -264,6 +266,16 @@ func explicitEnvKeys() map[string]bool {
 	if v := os.Getenv("FLATTEN_REPRICE_STALL_CYCLES"); v != "" {
 		if _, err := strconv.ParseInt(v, 10, 64); err == nil {
 			m["FLATTEN_REPRICE_STALL_CYCLES"] = true
+		}
+	}
+	if v := os.Getenv("FLATTEN_FORCE_SECONDS"); v != "" {
+		if _, err := strconv.ParseFloat(v, 64); err == nil {
+			m["FLATTEN_FORCE_SECONDS"] = true
+		}
+	}
+	if v := os.Getenv("FLATTEN_FORCE_DEVIATION"); v != "" {
+		if _, err := strconv.ParseFloat(v, 64); err == nil {
+			m["FLATTEN_FORCE_DEVIATION"] = true
 		}
 	}
 	if v := os.Getenv("DRY_RUN"); v != "" {
@@ -450,6 +462,10 @@ func registerAllFlags(fs *flag.FlagSet, cfg *Config) {
 	fs.Float64Var(&cfg.FlattenMaxDeviation, "flatten-max-deviation", cfg.FlattenMaxDeviation, "Cap sell / floor buy vs mid for POST_ONLY flatten (0 = no bound)")
 	fs.IntVar(&cfg.FlattenRepriceStallCycles, "flatten-reprice-stall-cycles", cfg.FlattenRepriceStallCycles,
 		"After this many consecutive cycles with the same resting auto-flatten order, cancel and re-place (0 = never; POST_ONLY, same aggression)")
+	fs.Float64Var(&cfg.FlattenForceSeconds, "flatten-force-seconds", cfg.FlattenForceSeconds,
+		"Wall-clock seconds stuck at inventory limit before cancelling the resting POST_ONLY flatten and force-closing with a marketable IOC order (0 = never force)")
+	fs.Float64Var(&cfg.FlattenForceDeviation, "flatten-force-deviation", cfg.FlattenForceDeviation,
+		"Price offset from mid for the forced IOC close (e.g. 0.05 = 5%); falls back to flatten-max-deviation if 0")
 	fs.BoolVar(&cfg.DryRun, "dry-run", cfg.DryRun, "Log without sending transactions")
 	fs.BoolVar(&cfg.AutoSpread, "auto-spread", cfg.AutoSpread, "Automatically narrow spread after spread-no-fill-cycles cycles with no fill")
 	fs.Float64Var(&cfg.SpreadMin, "spread-min", cfg.SpreadMin, "Minimum spread the auto-adjuster will narrow to")

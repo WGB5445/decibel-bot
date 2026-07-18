@@ -65,7 +65,14 @@ type Config struct {
 	// for this many consecutive cycles, cancel it and place again (same aggression, new mid).
 	// 0 disables this behavior (legacy: single resting flatten until fill or external cancel).
 	FlattenRepriceStallCycles int
-	DryRun                    bool
+	// FlattenForceSeconds: wall-clock seconds since inventory first hit the limit (not reset
+	// by repricing) after which the resting POST_ONLY flatten is cancelled and replaced with
+	// a marketable IOC reduce-only order to guarantee exit. 0 disables forced IOC escalation.
+	FlattenForceSeconds float64
+	// FlattenForceDeviation: price offset from mid for the forced IOC close (e.g. 0.05 = 5%),
+	// large enough to cross available book depth. Falls back to FlattenMaxDeviation if 0.
+	FlattenForceDeviation float64
+	DryRun                bool
 
 	// ── Adaptive spread ───────────────────────────────────────────────────────
 	AutoSpread         bool
@@ -160,6 +167,12 @@ func (c *Config) validate() error {
 
 	if c.FlattenRepriceStallCycles < 0 {
 		return fmt.Errorf("FLATTEN_REPRICE_STALL_CYCLES (-flatten-reprice-stall-cycles) must be >= 0, got %d", c.FlattenRepriceStallCycles)
+	}
+	if c.FlattenForceSeconds < 0 {
+		return fmt.Errorf("FLATTEN_FORCE_SECONDS (-flatten-force-seconds) must be >= 0, got %v", c.FlattenForceSeconds)
+	}
+	if c.FlattenForceDeviation < 0 {
+		return fmt.Errorf("FLATTEN_FORCE_DEVIATION (-flatten-force-deviation) must be >= 0, got %v", c.FlattenForceDeviation)
 	}
 
 	if c.ShutdownCancelTimeoutS <= 0 {
