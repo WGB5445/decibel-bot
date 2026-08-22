@@ -21,7 +21,7 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Margin, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Cell, Clear, Paragraph, Row, Table, Tabs, Wrap},
+    widgets::{Block, Borders, Cell, Clear, Paragraph, Row, Table, Wrap},
 };
 use rust_decimal::Decimal;
 
@@ -29,41 +29,77 @@ fn paired_price_count(plan: &GridPlan) -> usize {
     plan.bids.len().max(plan.asks.len())
 }
 
-fn grid_cell_height(inner_height: u16, pair_count: usize) -> u16 {
-    if inner_height >= pair_count.saturating_mul(2) as u16 {
-        2
-    } else {
-        1
+#[derive(Clone, Copy)]
+struct GridGeometry {
+    cells: Rect,
+    columns: usize,
+    rows: usize,
+    cell_width: u16,
+    cell_height: u16,
+}
+
+impl GridGeometry {
+    fn cell_rect(self, index: usize) -> Option<Rect> {
+        if index >= self.columns * self.rows {
+            return None;
+        }
+        let col = index % self.columns;
+        let row = index / self.columns;
+        let x = self.cells.x + col as u16 * self.cell_width;
+        let y = self.cells.y + row as u16 * self.cell_height;
+        if x >= self.cells.right() || y >= self.cells.bottom() {
+            return None;
+        }
+        Some(Rect::new(
+            x,
+            y,
+            self.cell_width.min(self.cells.right().saturating_sub(x)),
+            self.cell_height.min(self.cells.bottom().saturating_sub(y)),
+        ))
+    }
+
+    fn hit_test(self, column: u16, row: u16, count: usize) -> Option<usize> {
+        (0..count).find(|&index| {
+            self.cell_rect(index).is_some_and(|cell| {
+                column >= cell.x && column < cell.right() && row >= cell.y && row < cell.bottom()
+            })
+        })
     }
 }
 
-fn grid_visible_capacity(terminal_height: u16, pair_count: usize) -> usize {
-    // Screen: 3-line tab bar + 3-line help bar; inside content: 6-line summary,
-    // 8-line trade history, and a one-cell border around the price grid.
-    let inner_height = terminal_height.saturating_sub(22);
-    usize::from((inner_height / grid_cell_height(inner_height, pair_count)).max(1))
+/// Uses the exact same layout calculations as `render_grid`, so mouse hit testing and drawing
+/// cannot drift apart when the terminal size changes.
+fn price_grid_geometry(grid_area: Rect, pair_count: usize) -> GridGeometry {
+    let board = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(6),
+            Constraint::Min(6),
+            Constraint::Length(8),
+        ])
+        .split(grid_area)[1];
+    let cells = board.inner(Margin {
+        vertical: 1,
+        horizontal: 1,
+    });
+    let columns = pair_count.clamp(1, 8);
+    let rows = pair_count.div_ceil(columns).max(1);
+    GridGeometry {
+        cells,
+        columns,
+        rows,
+        cell_width: (cells.width / columns as u16).max(1),
+        cell_height: (cells.height / rows as u16).max(3),
+    }
 }
 
 fn keep_selected_price_visible(app: &mut App) {
     let Some(snapshot) = app.snapshot.as_ref() else {
         return;
     };
-    let count = paired_price_count(&snapshot.plan);
-    if count == 0 {
-        app.grid_scroll = 0;
-        return;
-    }
-    app.selected_level = app.selected_level.min(count - 1);
-    let height = crossterm::terminal::size()
-        .map(|(_, height)| height)
-        .unwrap_or(24);
-    let visible = grid_visible_capacity(height, count);
-    if app.selected_level < app.grid_scroll {
-        app.grid_scroll = app.selected_level;
-    } else if app.selected_level >= app.grid_scroll + visible {
-        app.grid_scroll = app.selected_level + 1 - visible;
-    }
-    app.grid_scroll = app.grid_scroll.min(count.saturating_sub(visible));
+    app.selected_level = app
+        .selected_level
+        .min(paired_price_count(&snapshot.plan).saturating_sub(1));
 }
 
 const TAB_CONFIG: usize = 0;
@@ -80,6 +116,54 @@ fn tab_titles(language: Language) -> [String; TAB_COUNT] {
         i18n::t(language, TKey::TabPreview).to_owned(),
         i18n::t(language, TKey::TabMonitor).to_owned(),
     ]
+}
+
+/// The exact rectangles of the tab buttons. Rendering and mouse hit-testing both use these
+/// rectangles, rather than relying on undocumented padding in `ratatui::Tabs`.
+fn tab_rects(area: Rect, language: Language) -> [Rect; TAB_COUNT] {
+    let titles = tab_titles(language);
+    let mut x = area.x.saturating_add(1);
+    std::array::from_fn(|index| {
+        let desired_width = ratatui::text::Line::from(titles[index].as_str()).width() as u16;
+        let remaining = area.right().saturating_sub(1).saturating_sub(x);
+        let width = desired_width.min(remaining);
+        let rect = Rect::new(x, area.y.saturating_add(1), width, 1);
+        x = x.saturating_add(width).saturating_add(1); // one column between buttons
+        rect
+    })
+}
+
+fn tab_at_position(area: Rect, language: Language, column: u16, row: u16) -> Option<usize> {
+    tab_rects(area, language).iter().position(|rect| {
+        column >= rect.x && column < rect.right() && row >= rect.y && row < rect.bottom()
+    })
+}
+
+fn render_tabs(area: Rect, frame: &mut ratatui::Frame, app: &App) {
+    let tabs = tab_rects(area, app.settings.language);
+    frame.render_widget(
+        Block::default()
+            .borders(Borders::ALL)
+            .title("Decibel Grid Agent — READ ONLY"),
+        area,
+    );
+    let titles = tab_titles(app.settings.language);
+    for (index, rect) in tabs.into_iter().enumerate() {
+        let style = if index == app.tab {
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Cyan)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::White)
+        };
+        frame.render_widget(
+            Paragraph::new(titles[index].clone())
+                .style(style)
+                .alignment(ratatui::layout::Alignment::Center),
+            rect,
+        );
+    }
 }
 
 #[derive(Parser)]
@@ -547,8 +631,6 @@ struct App {
     field_index: usize,
     /// Index of the selected bid/ask price pair in the vertical grid.
     selected_level: usize,
-    /// First visible paired price cell when the terminal is too short for the full grid.
-    grid_scroll: usize,
     markets: Vec<Market>,
     markets_loaded_for: Option<(String, Product)>,
     market_picker: Option<MarketPicker>,
@@ -570,6 +652,8 @@ struct App {
     form_width: u16,
     /// Actual list rectangle of the market-picker overlay for correct mouse hit testing.
     market_list_area: Rect,
+    /// Exact grid geometry produced during the last render, reused for mouse hit testing.
+    grid_geometry: Option<GridGeometry>,
 }
 impl App {
     fn new(tab: usize, settings: Settings, profile_name: String) -> Self {
@@ -577,7 +661,6 @@ impl App {
             tab,
             field_index: 0,
             selected_level: 0,
-            grid_scroll: 0,
             markets: Vec::new(),
             markets_loaded_for: None,
             market_picker: None,
@@ -595,6 +678,7 @@ impl App {
             price_highlights: Vec::new(),
             form_width: 0,
             market_list_area: Rect::default(),
+            grid_geometry: None,
         }
     }
 
@@ -1218,6 +1302,22 @@ async fn tui_loop(
         app.form_width = terminal_size.width * 58 / 100;
         app.market_list_area =
             market_picker_list_area(Rect::new(0, 0, terminal_size.width, terminal_size.height));
+        let screen = Rect::new(0, 0, terminal_size.width, terminal_size.height);
+        let content = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(3),
+                Constraint::Min(3),
+                Constraint::Length(3),
+            ])
+            .split(screen)[1];
+        app.grid_geometry = if app.tab != TAB_CONFIG {
+            app.snapshot
+                .as_ref()
+                .map(|snapshot| price_grid_geometry(content, paired_price_count(&snapshot.plan)))
+        } else {
+            None
+        };
         terminal.draw(|frame| render(frame.area(), frame, &app, config.as_ref()))?;
         if event::poll(Duration::from_millis(120))? && handle_event(&mut app)? {
             return Ok(());
@@ -1422,8 +1522,10 @@ fn handle_event(app: &mut App) -> Result<bool> {
         }
         Event::Mouse(mouse) if matches!(mouse.kind, MouseEventKind::Down(_)) => {
             if mouse.row == 1 {
-                let index = usize::from(mouse.column) / 18;
-                if index < TAB_COUNT {
+                let tab_area = Rect::new(0, 0, crossterm::terminal::size()?.0, 3);
+                if let Some(index) =
+                    tab_at_position(tab_area, app.settings.language, mouse.column, mouse.row)
+                {
                     app.tab = index;
                     app.refresh_now = true;
                 }
@@ -1442,26 +1544,18 @@ fn handle_event(app: &mut App) -> Result<bool> {
                     }
                 }
             } else if app.tab != TAB_CONFIG {
-                // The grid is an 8-column square-cell matrix. Clicking only selects a pair.
-                let terminal_size = crossterm::terminal::size()?;
+                // Reuse geometry captured during the last draw. This is the only reliable
+                // coordinate space: terminal dimensions alone do not capture all Ratatui splits.
                 let pair_count = app
                     .snapshot
                     .as_ref()
                     .map(|snapshot| paired_price_count(&snapshot.plan))
                     .unwrap_or(0);
-                let columns = pair_count.clamp(1, 8);
-                let rows = pair_count.div_ceil(columns).max(1);
-                let grid_top = 9u16;
-                let board_height = terminal_size.1.saturating_sub(20).max(3);
-                let cell_width = (terminal_size.0.saturating_sub(2) / columns as u16).max(1);
-                let cell_height = (board_height / rows as u16).max(3);
-                if mouse.row >= grid_top && mouse.row < grid_top.saturating_add(board_height) {
-                    let column = usize::from(mouse.column.saturating_sub(1) / cell_width);
-                    let row = usize::from(mouse.row - grid_top) / usize::from(cell_height);
-                    let index = row * columns + column;
-                    if column < columns && index < pair_count {
-                        app.selected_level = index;
-                    }
+                if let Some(index) = app
+                    .grid_geometry
+                    .and_then(|geometry| geometry.hit_test(mouse.column, mouse.row, pair_count))
+                {
+                    app.selected_level = index;
                 }
             }
         }
@@ -1479,20 +1573,7 @@ fn render(area: Rect, frame: &mut ratatui::Frame, app: &App, config: Option<&Gri
             Constraint::Length(3),
         ])
         .split(area);
-    let tabs = Tabs::new(tab_titles(app.settings.language).to_vec())
-        .select(app.tab)
-        .highlight_style(
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        )
-        .divider(" | ")
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title("Decibel Grid Agent — READ ONLY"),
-        );
-    frame.render_widget(tabs, chunks[0]);
+    render_tabs(chunks[0], frame, app);
     match app.tab {
         TAB_CONFIG => render_config(chunks[1], frame, app),
         TAB_PREVIEW | TAB_MONITOR => render_grid(chunks[1], frame, app, config),
@@ -2038,28 +2119,22 @@ fn render_grid(area: Rect, frame: &mut ratatui::Frame, app: &App, config: Option
         ),
         board,
     );
-    let inner = board.inner(Margin {
-        vertical: 1,
-        horizontal: 1,
-    });
     let pairs = paired_levels(&snapshot.plan);
-    let columns = pairs.len().clamp(1, 8);
-    let rows = pairs.len().div_ceil(columns).max(1);
-    let cell_width = (inner.width / columns as u16).max(1);
-    let cell_height = (inner.height / rows as u16).max(3);
+    let geometry = price_grid_geometry(area, pairs.len());
+    let inner = geometry.cells;
     for (index, pair) in pairs.iter().enumerate() {
-        let col = index % columns;
-        let row = index / columns;
-        let x = inner.x + col as u16 * cell_width;
-        let y = inner.y + row as u16 * cell_height;
+        let col = index % geometry.columns;
+        let row = index / geometry.columns;
+        let x = inner.x + col as u16 * geometry.cell_width;
+        let y = inner.y + row as u16 * geometry.cell_height;
         if x >= inner.right() || y >= inner.bottom() {
             continue;
         }
         let cell = Rect::new(
             x,
             y,
-            cell_width.min(inner.right().saturating_sub(x)),
-            cell_height.min(inner.bottom().saturating_sub(y)),
+            geometry.cell_width.min(inner.right().saturating_sub(x)),
+            geometry.cell_height.min(inner.bottom().saturating_sub(y)),
         );
         let filled = pair
             .bid
