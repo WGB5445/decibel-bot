@@ -25,8 +25,10 @@ use ratatui::{
 };
 use rust_decimal::Decimal;
 
-fn paired_price_count(plan: &GridPlan) -> usize {
-    plan.bids.len().max(plan.asks.len())
+/// Every resting order occupies one grid cell. Render them in price order rather than pairing
+/// the bid and ask arrays by index, because they live on opposite sides of the current mid.
+fn grid_price_count(plan: &GridPlan) -> usize {
+    plan.bids.len() + plan.asks.len()
 }
 
 #[derive(Clone, Copy)]
@@ -36,15 +38,18 @@ struct GridGeometry {
     rows: usize,
     cell_width: u16,
     cell_height: u16,
+    /// First ordered price represented by the visible top-left cell.
+    first_index: usize,
 }
 
 impl GridGeometry {
     fn cell_rect(self, index: usize) -> Option<Rect> {
-        if index >= self.columns * self.rows {
+        if index < self.first_index || index >= self.first_index + self.columns * self.rows {
             return None;
         }
-        let col = index % self.columns;
-        let row = index / self.columns;
+        let relative = index - self.first_index;
+        let col = relative % self.columns;
+        let row = relative / self.columns;
         let x = self.cells.x + col as u16 * self.cell_width;
         let y = self.cells.y + row as u16 * self.cell_height;
         if x >= self.cells.right() || y >= self.cells.bottom() {
@@ -59,7 +64,7 @@ impl GridGeometry {
     }
 
     fn hit_test(self, column: u16, row: u16, count: usize) -> Option<usize> {
-        (0..count).find(|&index| {
+        (self.first_index..count).find(|&index| {
             self.cell_rect(index).is_some_and(|cell| {
                 column >= cell.x && column < cell.right() && row >= cell.y && row < cell.bottom()
             })
@@ -69,7 +74,7 @@ impl GridGeometry {
 
 /// Uses the exact same layout calculations as `render_grid`, so mouse hit testing and drawing
 /// cannot drift apart when the terminal size changes.
-fn price_grid_geometry(grid_area: Rect, pair_count: usize) -> GridGeometry {
+fn price_grid_geometry(grid_area: Rect, price_count: usize, scroll: usize) -> GridGeometry {
     let board = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -82,14 +87,19 @@ fn price_grid_geometry(grid_area: Rect, pair_count: usize) -> GridGeometry {
         vertical: 1,
         horizontal: 1,
     });
-    let columns = pair_count.clamp(1, 8);
-    let rows = pair_count.div_ceil(columns).max(1);
+    let columns = price_count.clamp(1, 8);
+    // A bordered tile needs an interior line for both the side and price. Keep its height fixed
+    // and page through rows rather than silently clipping the lower prices.
+    let cell_height = 4;
+    let rows = usize::from((cells.height / cell_height).max(1));
+    let first_index = (scroll / columns) * columns;
     GridGeometry {
         cells,
         columns,
         rows,
         cell_width: (cells.width / columns as u16).max(1),
-        cell_height: (cells.height / rows as u16).max(3),
+        cell_height,
+        first_index,
     }
 }
 
@@ -97,9 +107,36 @@ fn keep_selected_price_visible(app: &mut App) {
     let Some(snapshot) = app.snapshot.as_ref() else {
         return;
     };
-    app.selected_level = app
-        .selected_level
-        .min(paired_price_count(&snapshot.plan).saturating_sub(1));
+    let count = grid_price_count(&snapshot.plan);
+    if count == 0 {
+        app.selected_level = 0;
+        app.grid_scroll = 0;
+        return;
+    }
+    app.selected_level = app.selected_level.min(count - 1);
+    let terminal = crossterm::terminal::size().unwrap_or((80, 24));
+    let screen = Rect::new(0, 0, terminal.0, terminal.1);
+    let content = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(3),
+            Constraint::Min(3),
+            Constraint::Length(3),
+        ])
+        .split(screen)[1];
+    let geometry = price_grid_geometry(content, count, app.grid_scroll);
+    let capacity = geometry.columns * geometry.rows;
+    if app.selected_level < geometry.first_index {
+        app.grid_scroll = (app.selected_level / geometry.columns) * geometry.columns;
+    } else if app.selected_level >= geometry.first_index + capacity {
+        let selected_row = app.selected_level / geometry.columns;
+        app.grid_scroll =
+            selected_row.saturating_add(1).saturating_sub(geometry.rows) * geometry.columns;
+    }
+    let max_scroll = count.saturating_sub(capacity);
+    app.grid_scroll = app
+        .grid_scroll
+        .min(max_scroll / geometry.columns * geometry.columns);
 }
 
 const TAB_CONFIG: usize = 0;
@@ -629,8 +666,10 @@ impl MarketPicker {
 struct App {
     tab: usize,
     field_index: usize,
-    /// Index of the selected bid/ask price pair in the vertical grid.
+    /// Index of the selected price in the low-to-high grid.
     selected_level: usize,
+    /// First price index of the visible grid page; always aligned to a row boundary.
+    grid_scroll: usize,
     markets: Vec<Market>,
     markets_loaded_for: Option<(String, Product)>,
     market_picker: Option<MarketPicker>,
@@ -643,10 +682,16 @@ struct App {
     settings_revision: u64,
     refresh_now: bool,
     snapshot_pending: bool,
+    /// Show a success check for two seconds after a successful snapshot refresh.
+    refresh_success_until: Option<tokio::time::Instant>,
+    /// Start time used to animate the in-progress refresh indicator.
+    refresh_started_at: Option<tokio::time::Instant>,
     error: Option<String>,
     snapshot: Option<MonitorSnapshot>,
-    /// Prices that changed in the latest refresh, retained briefly for visual feedback.
+    /// Prices whose observed execution state changed, retained briefly for visual feedback.
     price_highlights: Vec<(Decimal, tokio::time::Instant)>,
+    /// Human-readable reason for the latest grid update, shown in the monitor summary.
+    grid_change_notice: Option<String>,
     /// Width of the Configure form column, recorded at render time so mouse clicks on the
     /// right-hand explanation panel are not treated as form-field clicks.
     form_width: u16,
@@ -661,6 +706,7 @@ impl App {
             tab,
             field_index: 0,
             selected_level: 0,
+            grid_scroll: 0,
             markets: Vec::new(),
             markets_loaded_for: None,
             market_picker: None,
@@ -673,9 +719,12 @@ impl App {
             settings_revision: 0,
             refresh_now: true,
             snapshot_pending: false,
+            refresh_success_until: None,
+            refresh_started_at: None,
             error: None,
             snapshot: None,
             price_highlights: Vec::new(),
+            grid_change_notice: None,
             form_width: 0,
             market_list_area: Rect::default(),
             grid_geometry: None,
@@ -1156,21 +1205,35 @@ async fn tui_loop(
                     result,
                 } if settings_revision == app.settings_revision => {
                     app.snapshot_pending = false;
+                    app.refresh_started_at = None;
                     match *result {
                         Ok(snapshot) => {
-                            let count = paired_price_count(&snapshot.plan);
+                            let count = grid_price_count(&snapshot.plan);
                             if count > 0 {
                                 app.selected_level = app.selected_level.min(count - 1);
                             }
                             let now = tokio::time::Instant::now();
                             app.price_highlights.retain(|(_, until)| *until > now);
+                            let mut state_changes = 0;
                             if let Some(previous) = app.snapshot.as_ref() {
-                                for price in changed_level_prices(&previous.plan, &snapshot.plan) {
+                                let changed = changed_level_prices(&previous.plan, &snapshot.plan);
+                                state_changes = changed.len();
+                                for price in changed {
                                     app.price_highlights
                                         .push((price, now + Duration::from_secs(3)));
                                 }
                             }
+                            app.grid_change_notice = Some(if state_changes > 0 {
+                                format!(
+                                    "{} order execution state change(s); green means filled",
+                                    state_changes
+                                )
+                            } else {
+                                "Grid refreshed: price moved/recalculated; no execution-state change".to_owned()
+                            });
                             app.snapshot = Some(snapshot);
+                            app.refresh_success_until =
+                                Some(tokio::time::Instant::now() + Duration::from_secs(2));
                             keep_selected_price_visible(&mut app);
                             app.error = None;
                         }
@@ -1257,6 +1320,7 @@ async fn tui_loop(
             match (api.as_ref(), config.as_ref()) {
                 (Some(api), Some(config)) if !app.snapshot_pending => {
                     app.snapshot_pending = true;
+                    app.refresh_started_at = Some(tokio::time::Instant::now());
                     let api = api.clone();
                     let config = config.clone();
                     let subaccount = optional_subaccount(&app.settings).map(str::to_owned);
@@ -1312,9 +1376,9 @@ async fn tui_loop(
             ])
             .split(screen)[1];
         app.grid_geometry = if app.tab != TAB_CONFIG {
-            app.snapshot
-                .as_ref()
-                .map(|snapshot| price_grid_geometry(content, paired_price_count(&snapshot.plan)))
+            app.snapshot.as_ref().map(|snapshot| {
+                price_grid_geometry(content, grid_price_count(&snapshot.plan), app.grid_scroll)
+            })
         } else {
             None
         };
@@ -1504,13 +1568,40 @@ fn handle_event(app: &mut App) -> Result<bool> {
             }
             KeyCode::Char(' ') if app.tab == TAB_CONFIG => app.cycle_field(1),
             KeyCode::Char('[') if app.tab == TAB_CONFIG => app.cycle_field(-1),
-            KeyCode::Char('f') => app.refresh_now = true,
+            KeyCode::Char('f') => {
+                app.refresh_now = true;
+                app.refresh_success_until = None;
+            }
             KeyCode::Up => {
                 app.selected_level = app.selected_level.saturating_sub(1);
                 keep_selected_price_visible(app);
             }
             KeyCode::Down => {
-                app.selected_level += 1;
+                app.selected_level = app.selected_level.saturating_add(1);
+                keep_selected_price_visible(app);
+            }
+            KeyCode::PageUp => {
+                let count = app
+                    .snapshot
+                    .as_ref()
+                    .map(|snapshot| grid_price_count(&snapshot.plan))
+                    .unwrap_or(0);
+                let page = app
+                    .grid_geometry
+                    .map_or(1, |geometry| geometry.columns * geometry.rows);
+                app.selected_level = app.selected_level.saturating_sub(page.min(count));
+                keep_selected_price_visible(app);
+            }
+            KeyCode::PageDown => {
+                let count = app
+                    .snapshot
+                    .as_ref()
+                    .map(|snapshot| grid_price_count(&snapshot.plan))
+                    .unwrap_or(0);
+                let page = app
+                    .grid_geometry
+                    .map_or(1, |geometry| geometry.columns * geometry.rows);
+                app.selected_level = (app.selected_level + page).min(count.saturating_sub(1));
                 keep_selected_price_visible(app);
             }
             _ => {}
@@ -1519,6 +1610,34 @@ fn handle_event(app: &mut App) -> Result<bool> {
             if app.market_picker.is_some() && matches!(mouse.kind, MouseEventKind::Down(_)) =>
         {
             handle_market_picker_mouse(app, mouse.column, mouse.row);
+        }
+        Event::Mouse(mouse)
+            if app.tab != TAB_CONFIG
+                && matches!(
+                    mouse.kind,
+                    MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
+                ) =>
+        {
+            if let Some(geometry) = app.grid_geometry {
+                let step = geometry.columns;
+                match mouse.kind {
+                    MouseEventKind::ScrollUp => {
+                        app.grid_scroll = app.grid_scroll.saturating_sub(step);
+                    }
+                    MouseEventKind::ScrollDown => {
+                        let count = app
+                            .snapshot
+                            .as_ref()
+                            .map(|snapshot| grid_price_count(&snapshot.plan))
+                            .unwrap_or(0);
+                        let capacity = geometry.columns * geometry.rows;
+                        let max_scroll = count.saturating_sub(capacity);
+                        app.grid_scroll = (app.grid_scroll + step)
+                            .min(max_scroll / geometry.columns * geometry.columns);
+                    }
+                    _ => {}
+                }
+            }
         }
         Event::Mouse(mouse) if matches!(mouse.kind, MouseEventKind::Down(_)) => {
             if mouse.row == 1 {
@@ -1546,14 +1665,14 @@ fn handle_event(app: &mut App) -> Result<bool> {
             } else if app.tab != TAB_CONFIG {
                 // Reuse geometry captured during the last draw. This is the only reliable
                 // coordinate space: terminal dimensions alone do not capture all Ratatui splits.
-                let pair_count = app
+                let price_count = app
                     .snapshot
                     .as_ref()
-                    .map(|snapshot| paired_price_count(&snapshot.plan))
+                    .map(|snapshot| grid_price_count(&snapshot.plan))
                     .unwrap_or(0);
                 if let Some(index) = app
                     .grid_geometry
-                    .and_then(|geometry| geometry.hit_test(mouse.column, mouse.row, pair_count))
+                    .and_then(|geometry| geometry.hit_test(mouse.column, mouse.row, price_count))
                 {
                     app.selected_level = index;
                 }
@@ -1562,6 +1681,39 @@ fn handle_event(app: &mut App) -> Result<bool> {
         _ => {}
     }
     Ok(false)
+}
+
+fn render_refresh_indicator(area: Rect, frame: &mut ratatui::Frame, app: &App) {
+    let now = tokio::time::Instant::now();
+    let (label, style) = if app.snapshot_pending {
+        let elapsed = app
+            .refresh_started_at
+            .map(|started| started.elapsed().as_millis() / 120)
+            .unwrap_or(0);
+        let spinner = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+        (
+            format!(
+                " {} Refreshing",
+                spinner[(elapsed as usize) % spinner.len()]
+            ),
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        )
+    } else if app.refresh_success_until.is_some_and(|until| until > now) {
+        (
+            " ✓ Refreshed".to_owned(),
+            Style::default()
+                .fg(Color::Green)
+                .add_modifier(Modifier::BOLD),
+        )
+    } else {
+        return;
+    };
+    let width = (label.chars().count() as u16).saturating_add(2);
+    let x = area.right().saturating_sub(width);
+    let indicator = Rect::new(x, area.y, width, 1);
+    frame.render_widget(Paragraph::new(label).style(style), indicator);
 }
 
 fn render(area: Rect, frame: &mut ratatui::Frame, app: &App, config: Option<&GridConfig>) {
@@ -1574,6 +1726,7 @@ fn render(area: Rect, frame: &mut ratatui::Frame, app: &App, config: Option<&Gri
         ])
         .split(area);
     render_tabs(chunks[0], frame, app);
+    render_refresh_indicator(area, frame, app);
     match app.tab {
         TAB_CONFIG => render_config(chunks[1], frame, app),
         TAB_PREVIEW | TAB_MONITOR => render_grid(chunks[1], frame, app, config),
@@ -2088,8 +2241,12 @@ fn render_grid(area: Rect, frame: &mut ratatui::Frame, app: &App, config: Option
         .available_margin
         .map(|value| format_decimal(value, 4))
         .unwrap_or_else(|| "n/a".to_owned());
+    let change_notice = app
+        .grid_change_notice
+        .as_deref()
+        .unwrap_or("No grid refresh received yet");
     let summary = format!(
-        "{} {:?}  mid {}  range {} – {}\nPairs {}  NET {}  Quote {}  Base {}  Margin {}  Available {}\nPosition {} @ {}",
+        "{} {:?}  mid {}  range {} – {}\nPairs {}  NET {}  Quote {}  Base {}  Margin {}  Available {}\nPosition {} @ {}\n{}",
         snapshot.market.name,
         snapshot.market.product,
         format_decimal(snapshot.plan.mid, 6),
@@ -2102,29 +2259,36 @@ fn render_grid(area: Rect, frame: &mut ratatui::Frame, app: &App, config: Option
         margin,
         available,
         format_decimal(snapshot.account.position.size, 6),
-        format_decimal(snapshot.account.position.entry_price, 6)
+        format_decimal(snapshot.account.position.entry_price, 6),
+        change_notice
     );
     frame.render_widget(
         Paragraph::new(summary).block(Block::default().borders(Borders::ALL).title(title)),
         chunks[0],
     );
 
-    // One square is one bid/ask pair. The board occupies the full available width and uses a
-    // compact 8-column matrix (40 pairs at the maximum 80 orders). Reading proceeds left to
-    // right, then top to bottom: every row below is a higher price range.
+    // One square is one order price. The board uses the current plan's actual number of
+    // orders, sorted from the lowest price to the highest price.
     let board = chunks[1];
     frame.render_widget(
         Block::default().borders(Borders::ALL).title(
-            "Paired price grid — low → high  ·  dark waiting  ·  blue selected  ·  green filled",
+            "Order price grid — low → high  ·  yellow current interval  ·  blue selected  ·  green filled  ·  cyan repriced",
         ),
         board,
     );
-    let pairs = paired_levels(&snapshot.plan);
-    let geometry = price_grid_geometry(area, pairs.len());
+    let levels = ordered_grid_levels(&snapshot.plan);
+    let (current_bid, current_ask) = current_interval_prices(&snapshot.plan);
+    let geometry = price_grid_geometry(area, levels.len(), app.grid_scroll);
     let inner = geometry.cells;
-    for (index, pair) in pairs.iter().enumerate() {
-        let col = index % geometry.columns;
-        let row = index / geometry.columns;
+    for (index, level) in levels
+        .iter()
+        .enumerate()
+        .skip(geometry.first_index)
+        .take(geometry.columns * geometry.rows)
+    {
+        let relative = index - geometry.first_index;
+        let col = relative % geometry.columns;
+        let row = relative / geometry.columns;
         let x = inner.x + col as u16 * geometry.cell_width;
         let y = inner.y + row as u16 * geometry.cell_height;
         if x >= inner.right() || y >= inner.bottom() {
@@ -2136,38 +2300,29 @@ fn render_grid(area: Rect, frame: &mut ratatui::Frame, app: &App, config: Option
             geometry.cell_width.min(inner.right().saturating_sub(x)),
             geometry.cell_height.min(inner.bottom().saturating_sub(y)),
         );
-        let filled = pair
-            .bid
-            .is_some_and(|level| level.state == LevelState::Filled)
-            || pair
-                .ask
-                .is_some_and(|level| level.state == LevelState::Filled);
-        let highlighted = app.price_highlights.iter().any(|(price, until)| {
-            *until > tokio::time::Instant::now()
-                && (pair.bid.is_some_and(|level| level.price == *price)
-                    || pair.ask.is_some_and(|level| level.price == *price))
-        });
-        let style = if highlighted {
-            Style::default().fg(Color::Black).bg(Color::Yellow)
-        } else if index == app.selected_level {
+        let in_current_price_range =
+            Some(level.price) == current_bid || Some(level.price) == current_ask;
+        let changed = app
+            .price_highlights
+            .iter()
+            .any(|(price, until)| *until > tokio::time::Instant::now() && level.price == *price);
+        // Green is reserved for an observed trade at this level. A newly repriced level is cyan,
+        // so routine plan refreshes cannot be mistaken for a fill. Explicit selection wins.
+        let style = if index == app.selected_level {
             Style::default().fg(Color::White).bg(Color::Blue)
-        } else if filled {
+        } else if level.state == LevelState::Filled {
             Style::default().fg(Color::Black).bg(Color::Green)
+        } else if changed {
+            Style::default().fg(Color::Black).bg(Color::Cyan)
+        } else if in_current_price_range {
+            Style::default().fg(Color::Black).bg(Color::Yellow)
         } else {
             Style::default().fg(Color::Gray).bg(Color::Rgb(24, 24, 24))
         };
-        let bid = pair
-            .bid
-            .map(|level| format_decimal(level.price, 5))
-            .unwrap_or_else(|| "—".to_owned());
-        let ask = pair
-            .ask
-            .map(|level| format_decimal(level.price, 5))
-            .unwrap_or_else(|| "—".to_owned());
         frame.render_widget(
             Paragraph::new(vec![
-                Line::from(format!("B {bid}")),
-                Line::from(format!("A {ask}")),
+                Line::from(level.side.as_str()),
+                Line::from(format_decimal(level.price, 5)),
             ])
             .style(style)
             .alignment(ratatui::layout::Alignment::Center)
@@ -2183,37 +2338,42 @@ fn render_grid(area: Rect, frame: &mut ratatui::Frame, app: &App, config: Option
     render_trade_history(chunks[2], frame, snapshot);
 }
 
-struct PricePair<'a> {
-    bid: Option<&'a GridLevel>,
-    ask: Option<&'a GridLevel>,
+fn ordered_grid_levels(plan: &GridPlan) -> Vec<&GridLevel> {
+    let mut levels: Vec<_> = plan.bids.iter().chain(&plan.asks).collect();
+    levels.sort_by_key(|level| level.price);
+    levels
 }
 
-fn paired_levels(plan: &GridPlan) -> Vec<PricePair<'_>> {
-    let count = paired_price_count(plan);
-    (0..count)
-        .map(|index| PricePair {
-            // Bids are built closest-to-mid first; reverse them so the first cell is lowest.
-            bid: plan.bids.iter().rev().nth(index),
-            // Asks are built low-to-high already.
-            ask: plan.asks.get(index),
-        })
-        .collect()
+/// The current mid lies between the highest bid and lowest ask. Highlight these two boundary
+/// cells to show the current price interval without colouring every bid-side cell.
+fn current_interval_prices(plan: &GridPlan) -> (Option<Decimal>, Option<Decimal>) {
+    let bid = plan
+        .bids
+        .iter()
+        .filter(|level| level.price <= plan.mid)
+        .map(|level| level.price)
+        .max();
+    let ask = plan
+        .asks
+        .iter()
+        .filter(|level| level.price >= plan.mid)
+        .map(|level| level.price)
+        .min();
+    (bid, ask)
 }
 
 fn changed_level_prices(previous: &GridPlan, current: &GridPlan) -> Vec<Decimal> {
-    let old = paired_levels(previous);
-    paired_levels(current)
+    let old = ordered_grid_levels(previous);
+    // A price disappearing/reappearing is a normal consequence of rebuilding the theoretical
+    // grid around a new mid. Do not call that a fill or flash the whole board cyan. Only retain
+    // a highlight when the same side/price was observed and its execution state changed.
+    ordered_grid_levels(current)
         .into_iter()
-        .enumerate()
-        .filter_map(|(index, pair)| {
-            let before = old.get(index)?;
-            let changed = before.bid.map(|level| level.price) != pair.bid.map(|level| level.price)
-                || before.ask.map(|level| level.price) != pair.ask.map(|level| level.price)
-                || before.bid.map(|level| level.state) != pair.bid.map(|level| level.state)
-                || before.ask.map(|level| level.state) != pair.ask.map(|level| level.state);
-            changed
-                .then(|| pair.bid.or(pair.ask).map(|level| level.price))
-                .flatten()
+        .filter_map(|level| {
+            old.iter()
+                .find(|previous| previous.price == level.price && previous.side == level.side)
+                .filter(|previous| previous.state != level.state)
+                .map(|_| level.price)
         })
         .collect()
 }
