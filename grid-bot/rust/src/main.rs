@@ -6,7 +6,8 @@ use anyhow::{Context, Result};
 use clap::{Args as ClapArgs, Parser, Subcommand};
 use crossterm::{
     event::{
-        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyModifiers, MouseEventKind,
+        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers,
+        MouseEventKind,
     },
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
@@ -1478,6 +1479,9 @@ fn handle_market_picker_mouse(app: &mut App, column: u16, row: u16) {
 /// Returns true when the user requested exit.
 fn handle_event(app: &mut App) -> Result<bool> {
     match event::read()? {
+        // Windows terminals can emit both Press and Release events. State changes must happen
+        // only once, on the press event; otherwise one key/button appears to activate twice.
+        Event::Key(key) if key.kind != KeyEventKind::Press => {}
         // Handle this before modal/editing guards so Ctrl+C always exits immediately.
         Event::Key(key)
             if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) =>
