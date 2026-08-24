@@ -148,6 +148,14 @@ const TAB_COUNT: usize = 3;
 /// so a failing setup does not retry on every render frame.
 const RETRY_INTERVAL: Duration = Duration::from_secs(2);
 
+fn ui(language: Language, english: &'static str, chinese: &'static str) -> &'static str {
+    if language == Language::Chinese {
+        chinese
+    } else {
+        english
+    }
+}
+
 fn tab_titles(language: Language) -> [String; TAB_COUNT] {
     [
         i18n::t(language, TKey::TabConfigure).to_owned(),
@@ -180,9 +188,15 @@ fn tab_at_position(area: Rect, language: Language, column: u16, row: u16) -> Opt
 fn render_tabs(area: Rect, frame: &mut ratatui::Frame, app: &App) {
     let tabs = tab_rects(area, app.settings.language);
     frame.render_widget(
-        Block::default()
-            .borders(Borders::ALL)
-            .title("Decibel Grid Agent — READ ONLY"),
+        Block::default().borders(Borders::ALL).title(format!(
+            "{} — {}",
+            app.settings.tr(TKey::AppTitle),
+            ui(
+                app.settings.language,
+                "execute only from Preview",
+                "仅可从预览页执行",
+            )
+        )),
         area,
     );
     let titles = tab_titles(app.settings.language);
@@ -232,6 +246,9 @@ struct Args {
     network: String,
     #[arg(long, global = true, env = "DECIBEL_API_KEY")]
     decibel_api_key: Option<String>,
+    /// Aptos Ed25519 private key. Prefer entering it in the TUI so Ctrl+S encrypts it in the profile.
+    #[arg(long, global = true, env = "APTOS_PRIVATE_KEY")]
+    aptos_private_key: Option<String>,
     #[arg(long, global = true, env = "GRID_PROFILE", default_value = "default")]
     profile: String,
     #[arg(
@@ -299,6 +316,8 @@ enum AllocationKind {
 #[derive(Clone)]
 struct Settings {
     api_key: String,
+    /// Aptos Ed25519 key used only after explicit Preview execution confirmation.
+    aptos_private_key: String,
     language: Language,
     network: String,
     product: Product,
@@ -339,6 +358,7 @@ impl From<&Args> for Settings {
         };
         Self {
             api_key: args.decibel_api_key.clone().unwrap_or_default(),
+            aptos_private_key: args.aptos_private_key.clone().unwrap_or_default(),
             language: Language::default(),
             network: args.network.clone(),
             product: args.product,
@@ -365,6 +385,7 @@ impl Settings {
     fn defaults() -> Self {
         Self {
             api_key: String::new(),
+            aptos_private_key: String::new(),
             language: Language::default(),
             network: "testnet".to_owned(),
             product: Product::Perp,
@@ -417,6 +438,7 @@ impl Settings {
             refresh_seconds: self.refresh_seconds.clone(),
             price_source: format!("{:?}", self.price_source).to_lowercase(),
             encrypted_api_key: None,
+            encrypted_aptos_private_key: None,
         }
     }
 
@@ -515,18 +537,30 @@ impl Settings {
         DecibelClient::new(&self.network, &self.api_key)
     }
     fn masked_key(&self) -> String {
-        if self.api_key.is_empty() {
-            return "not configured".to_owned();
-        }
-        let chars: Vec<char> = self.api_key.chars().collect();
-        let suffix: String = chars.iter().skip(chars.len().saturating_sub(4)).collect();
-        format!("••••••••{suffix}")
+        masked_secret(&self.api_key, true)
     }
+
+    fn masked_private_key(&self) -> String {
+        masked_secret(&self.aptos_private_key, false)
+    }
+}
+
+fn masked_secret(secret: &str, show_suffix: bool) -> String {
+    if secret.is_empty() {
+        return "not configured".to_owned();
+    }
+    if !show_suffix {
+        return "••••••••".to_owned();
+    }
+    let chars: Vec<char> = secret.chars().collect();
+    let suffix: String = chars.iter().skip(chars.len().saturating_sub(4)).collect();
+    format!("••••••••{suffix}")
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Field {
     ApiKey,
+    AptosPrivateKey,
     Language,
     Network,
     Product,
@@ -544,8 +578,9 @@ enum Field {
     RefreshSeconds,
     PriceSource,
 }
-const FIELDS: [Field; 17] = [
+const FIELDS: [Field; 18] = [
     Field::ApiKey,
+    Field::AptosPrivateKey,
     Field::Language,
     Field::Network,
     Field::Product,
@@ -570,6 +605,7 @@ impl Field {
             language,
             match self {
                 Self::ApiKey => TKey::FieldApiKey,
+                Self::AptosPrivateKey => TKey::FieldAptosPrivateKey,
                 Self::Language => TKey::FieldLanguage,
                 Self::Network => TKey::FieldNetwork,
                 Self::Product => TKey::FieldProduct,
@@ -593,6 +629,7 @@ impl Field {
         matches!(
             self,
             Self::ApiKey
+                | Self::AptosPrivateKey
                 | Self::Market
                 | Self::Subaccount
                 | Self::RangeValue
@@ -633,6 +670,10 @@ enum MarketFetch {
     Snapshot {
         settings_revision: u64,
         result: Box<Result<MonitorSnapshot>>,
+    },
+    Execution {
+        settings_revision: u64,
+        result: Box<Result<ExecutionResult>>,
     },
 }
 
@@ -683,6 +724,8 @@ struct App {
     settings_revision: u64,
     refresh_now: bool,
     snapshot_pending: bool,
+    execution_pending: bool,
+    execute_requested: bool,
     /// Show a success check for two seconds after a successful snapshot refresh.
     refresh_success_until: Option<tokio::time::Instant>,
     /// Start time used to animate the in-progress refresh indicator.
@@ -720,6 +763,8 @@ impl App {
             settings_revision: 0,
             refresh_now: true,
             snapshot_pending: false,
+            execution_pending: false,
+            execute_requested: false,
             refresh_success_until: None,
             refresh_started_at: None,
             error: None,
@@ -739,6 +784,12 @@ impl App {
         if !self.settings.api_key.trim().is_empty() {
             data.encrypted_api_key =
                 Some(profile::encrypt_secret(password, &self.settings.api_key)?);
+        }
+        if !self.settings.aptos_private_key.trim().is_empty() {
+            data.encrypted_aptos_private_key = Some(profile::encrypt_secret(
+                password,
+                &self.settings.aptos_private_key,
+            )?);
         }
         store.put(&self.profile_name, data);
         store.save()
@@ -766,14 +817,24 @@ impl App {
         }
     }
 
-    /// Decrypts the stored API key. Only called when a saved profile has one.
+    /// Decrypts every credential stored in the profile with the supplied password.
     fn load_encrypted_key(&mut self, password: &str) -> Result<()> {
         let store = ProfileStore::load()?;
-        let secret = store
-            .get(&self.profile_name)
-            .and_then(|data| data.encrypted_api_key.clone())
-            .ok_or_else(|| anyhow::anyhow!("no encrypted API key is stored in this profile"))?;
-        self.settings.api_key = profile::decrypt_secret(password, &secret)?;
+        let data = store.get(&self.profile_name).ok_or_else(|| {
+            anyhow::anyhow!("no encrypted credentials are stored in this profile")
+        })?;
+        let mut loaded = false;
+        if let Some(api_key) = data.encrypted_api_key.as_ref() {
+            self.settings.api_key = profile::decrypt_secret(password, api_key)?;
+            loaded = true;
+        }
+        if let Some(private_key) = data.encrypted_aptos_private_key.as_ref() {
+            self.settings.aptos_private_key = profile::decrypt_secret(password, private_key)?;
+            loaded = true;
+        }
+        if !loaded {
+            anyhow::bail!("no encrypted credentials are stored in this profile")
+        }
         self.settings_revision += 1;
         self.snapshot = None;
         self.markets.clear();
@@ -862,6 +923,7 @@ impl App {
     fn field_value(&self, field: Field) -> String {
         match field {
             Field::ApiKey => self.settings.masked_key(),
+            Field::AptosPrivateKey => self.settings.masked_private_key(),
             Field::Language => self.settings.language.name().to_owned(),
             Field::Network => self.settings.network.clone(),
             Field::Product => format!("{:?}", self.settings.product),
@@ -902,6 +964,7 @@ impl App {
     fn editable_value_mut(&mut self, field: Field) -> Option<&mut String> {
         match field {
             Field::ApiKey => Some(&mut self.settings.api_key),
+            Field::AptosPrivateKey => Some(&mut self.settings.aptos_private_key),
             Field::Market => Some(&mut self.settings.market),
             Field::Subaccount => Some(&mut self.settings.subaccount),
             Field::RangeValue => Some(&mut self.settings.range_value),
@@ -1146,7 +1209,10 @@ async fn tui_loop(
         app.settings.apply_profile(&data);
         app.settings_revision += 1;
         // The API key is encrypted, so it needs the password before it can be used.
-        if data.encrypted_api_key.is_some() && app.settings.api_key.trim().is_empty() {
+        if (data.encrypted_api_key.is_some() && app.settings.api_key.trim().is_empty())
+            || (data.encrypted_aptos_private_key.is_some()
+                && app.settings.aptos_private_key.trim().is_empty())
+        {
             app.password_purpose = Some(PasswordPurpose::LoadProfile);
             app.tab = TAB_CONFIG;
         }
@@ -1242,6 +1308,78 @@ async fn tui_loop(
                     }
                 }
                 MarketFetch::Snapshot { .. } => {}
+                MarketFetch::Execution {
+                    settings_revision,
+                    result,
+                } if settings_revision == app.settings_revision => {
+                    app.execution_pending = false;
+                    match *result {
+                        Ok(execution) => {
+                            app.tab = TAB_MONITOR;
+                            app.error = Some(format!(
+                                "Execution submitted: {} bid(s), {} ask(s), tx {}",
+                                execution.bid_count,
+                                execution.ask_count,
+                                execution.transaction_hash
+                            ));
+                            app.refresh_now = true;
+                        }
+                        Err(error) => app.error = Some(error.to_string()),
+                    }
+                }
+                MarketFetch::Execution { .. } => {}
+            }
+        }
+
+        // Execute only the exact plan currently visible in Preview, after the explicit `e`
+        // confirmation. The task runs off the UI thread; Monitor then observes the submitted
+        // orders and never re-submits them during ordinary refreshes.
+        if app.execute_requested && !app.execution_pending {
+            app.execute_requested = false;
+            let execution = app.snapshot.as_ref().map(|snapshot| {
+                (
+                    app.settings.network.clone(),
+                    app.settings.api_key.clone(),
+                    app.settings.aptos_private_key.clone(),
+                    app.settings.subaccount.clone(),
+                    snapshot.market.clone(),
+                    snapshot.plan.clone(),
+                    app.settings_revision,
+                )
+            });
+            match execution {
+                Some((network, api_key, private_key, subaccount, market, plan, revision))
+                    if !api_key.trim().is_empty()
+                        && !private_key.trim().is_empty()
+                        && !subaccount.trim().is_empty() =>
+                {
+                    app.execution_pending = true;
+                    let tx = fetch_tx.clone();
+                    tokio::spawn(async move {
+                        let result = execute_bulk_grid(
+                            &network,
+                            &api_key,
+                            &private_key,
+                            &subaccount,
+                            &market,
+                            &plan,
+                        )
+                        .await;
+                        let _ = tx.send(MarketFetch::Execution {
+                            settings_revision: revision,
+                            result: Box::new(result),
+                        });
+                    });
+                }
+                Some(_) => {
+                    app.error = Some(
+                        "Execution requires an Aptos private key and subaccount address in Configure."
+                            .to_owned(),
+                    );
+                }
+                None => {
+                    app.error = Some("Load a valid Preview plan before execution.".to_owned());
+                }
             }
         }
 
@@ -1495,17 +1633,17 @@ fn handle_event(app: &mut App) -> Result<bool> {
             }
             KeyCode::Esc => app.finish_edit(false),
             KeyCode::Backspace => {
-                if let Some(field) = app.editing {
-                    if let Some(value) = app.editable_value_mut(field) {
-                        value.pop();
-                    }
+                if let Some(field) = app.editing
+                    && let Some(value) = app.editable_value_mut(field)
+                {
+                    value.pop();
                 }
             }
             KeyCode::Char(character) => {
-                if let Some(field) = app.editing {
-                    if let Some(value) = app.editable_value_mut(field) {
-                        value.push(character);
-                    }
+                if let Some(field) = app.editing
+                    && let Some(value) = app.editable_value_mut(field)
+                {
+                    value.push(character);
                 }
             }
             _ => {}
@@ -1575,6 +1713,12 @@ fn handle_event(app: &mut App) -> Result<bool> {
             KeyCode::Char('f') => {
                 app.refresh_now = true;
                 app.refresh_success_until = None;
+            }
+            KeyCode::Char('e') if app.tab == TAB_PREVIEW => {
+                // One explicit key press on the Preview page starts the live execution request.
+                // The plan is not submitted from Monitor or from a mouse click on a config row.
+                app.execute_requested = true;
+                app.error = None;
             }
             KeyCode::Up => {
                 app.selected_level = app.selected_level.saturating_sub(1);
@@ -1660,26 +1804,36 @@ fn handle_event(app: &mut App) -> Result<bool> {
                         .iter()
                         .position(|field| *field == visible[index])
                         .unwrap_or(0);
-                    if app.active_field().editable() {
-                        app.start_edit();
-                    } else {
-                        app.cycle_field(1);
-                    }
+                    // Mouse clicks only select a configuration row. Editing or cycling is
+                    // deliberately keyboard-confirmed with Enter/Space to prevent accidental
+                    // changes when a user is merely inspecting the form.
                 }
-            } else if app.tab != TAB_CONFIG {
-                // Reuse geometry captured during the last draw. This is the only reliable
-                // coordinate space: terminal dimensions alone do not capture all Ratatui splits.
-                let price_count = app
-                    .snapshot
-                    .as_ref()
-                    .map(|snapshot| grid_price_count(&snapshot.plan))
-                    .unwrap_or(0);
-                if let Some(index) = app
-                    .grid_geometry
-                    .and_then(|geometry| geometry.hit_test(mouse.column, mouse.row, price_count))
+            } else if app.tab == TAB_PREVIEW {
+                let (width, height) = crossterm::terminal::size()?;
+                let screen = Rect::new(0, 0, width, height);
+                let content = Layout::default()
+                    .direction(Direction::Vertical)
+                    .constraints([
+                        Constraint::Length(3),
+                        Constraint::Min(3),
+                        Constraint::Length(3),
+                    ])
+                    .split(screen)[1];
+                let button = preview_execute_button(content);
+                if mouse.column >= button.x
+                    && mouse.column < button.right()
+                    && mouse.row >= button.y
+                    && mouse.row < button.bottom()
                 {
-                    app.selected_level = index;
+                    // A mouse click is equivalent to the explicit [E] confirmation key. It only
+                    // works on Preview; Monitor never submits transactions.
+                    app.execute_requested = true;
+                    app.error = None;
+                } else {
+                    select_grid_cell_from_mouse(app, mouse.column, mouse.row);
                 }
+            } else if app.tab == TAB_MONITOR {
+                select_grid_cell_from_mouse(app, mouse.column, mouse.row);
             }
         }
         _ => {}
@@ -1687,9 +1841,57 @@ fn handle_event(app: &mut App) -> Result<bool> {
     Ok(false)
 }
 
+fn preview_execute_button(content: Rect) -> Rect {
+    let summary = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(6),
+            Constraint::Min(6),
+            Constraint::Length(8),
+        ])
+        .split(content)[0];
+    Rect::new(
+        summary.right().saturating_sub(22),
+        summary.bottom().saturating_sub(2),
+        20.min(summary.width),
+        1,
+    )
+}
+
+fn select_grid_cell_from_mouse(app: &mut App, column: u16, row: u16) {
+    let price_count = app
+        .snapshot
+        .as_ref()
+        .map(|snapshot| grid_price_count(&snapshot.plan))
+        .unwrap_or(0);
+    if let Some(index) = app
+        .grid_geometry
+        .and_then(|geometry| geometry.hit_test(column, row, price_count))
+    {
+        app.selected_level = index;
+    }
+}
+
+/// Render transient refresh feedback or the current error as a compact header status. Keeping
+/// it in the title bar avoids a modal-style status panel obscuring the grid or configuration.
 fn render_refresh_indicator(area: Rect, frame: &mut ratatui::Frame, app: &App) {
     let now = tokio::time::Instant::now();
-    let (label, style) = if app.snapshot_pending {
+    let (label, style) = if let Some(error) = app.error.as_deref() {
+        let max_message_width = usize::from(area.width.saturating_sub(20));
+        let message: String = error.chars().take(max_message_width).collect();
+        let suffix = if error.chars().count() > max_message_width {
+            "…"
+        } else {
+            ""
+        };
+        (
+            format!(
+                " {}: {message}{suffix} ",
+                app.settings.tr(TKey::StatusTitle)
+            ),
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+        )
+    } else if app.snapshot_pending {
         let elapsed = app
             .refresh_started_at
             .map(|started| started.elapsed().as_millis() / 120)
@@ -1697,8 +1899,9 @@ fn render_refresh_indicator(area: Rect, frame: &mut ratatui::Frame, app: &App) {
         let spinner = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
         (
             format!(
-                " {} Refreshing",
-                spinner[(elapsed as usize) % spinner.len()]
+                " {} {}",
+                spinner[(elapsed as usize) % spinner.len()],
+                ui(app.settings.language, "Refreshing", "正在刷新")
             ),
             Style::default()
                 .fg(Color::Yellow)
@@ -1706,7 +1909,7 @@ fn render_refresh_indicator(area: Rect, frame: &mut ratatui::Frame, app: &App) {
         )
     } else if app.refresh_success_until.is_some_and(|until| until > now) {
         (
-            " ✓ Refreshed".to_owned(),
+            format!(" ✓ {}", ui(app.settings.language, "Refreshed", "刷新成功")),
             Style::default()
                 .fg(Color::Green)
                 .add_modifier(Modifier::BOLD),
@@ -1714,9 +1917,11 @@ fn render_refresh_indicator(area: Rect, frame: &mut ratatui::Frame, app: &App) {
     } else {
         return;
     };
-    let width = (label.chars().count() as u16).saturating_add(2);
-    let x = area.right().saturating_sub(width);
-    let indicator = Rect::new(x, area.y, width, 1);
+    let width = (label.chars().count() as u16)
+        .saturating_add(2)
+        .min(area.width.saturating_sub(2));
+    let x = area.right().saturating_sub(width).saturating_sub(1);
+    let indicator = Rect::new(x, area.y.saturating_add(1), width, 1);
     frame.render_widget(Paragraph::new(label).style(style), indicator);
 }
 
@@ -2141,6 +2346,9 @@ fn field_explanation(app: &App, field: Field) -> String {
         Field::ApiKey => {
             "Decibel API key for market/account reads. It is masked and can be encrypted in the profile with Ctrl+S."
         }
+        Field::AptosPrivateKey => {
+            "Aptos Ed25519 private key used only after explicit execution confirmation; it is encrypted in the profile."
+        }
         Field::Subaccount => {
             "Optional address used to read positions, open orders, balances, and trade history."
         }
@@ -2172,8 +2380,11 @@ fn field_explanation(app: &App, field: Field) -> String {
         Field::PreviewLeverage => "仅用于 Perp 模拟，不会修改链上杠杆。Spot 隐藏此项。",
         Field::RefreshSeconds => "预览/监控重新读取市场和账户数据的间隔。",
         Field::PriceSource => "Prices 使用 mid_px；Depth 使用最优买卖价，更适合执行。",
-        Field::ApiKey => "用于读取 Decibel 市场和账户数据。会被遮蔽，并可在 Ctrl+S 时加密保存。",
-        Field::Subaccount => "可选地址，用于读取仓位、挂单、余额和成交历史。",
+        Field::ApiKey => "用于读取 Decibel 市场和账户数据。会被遮蔽,并可在 Ctrl+S 时加密保存。",
+        Field::AptosPrivateKey => {
+            "用于真实下单的 Aptos Ed25519 私钥。只有确认执行计划后才会使用,并会加密保存。"
+        }
+        Field::Subaccount => "可选地址,用于读取仓位、挂单、余额和成交历史。",
     };
     let mut text = if language == Language::Chinese {
         chinese
@@ -2212,9 +2423,17 @@ fn render_grid(area: Rect, frame: &mut ratatui::Frame, app: &App, config: Option
         ])
         .split(area);
     let title = if app.tab == TAB_PREVIEW {
-        "Profit Preview — theoretical maker scenario; no execution"
+        ui(
+            app.settings.language,
+            "Profit Preview — review then explicitly execute this plan",
+            "利润预览 — 审核后明确执行当前计划",
+        )
     } else {
-        "Live Monitor — updates data; no execution in this Rust version"
+        ui(
+            app.settings.language,
+            "Live Monitor — tracks submitted plan; does not auto-replace orders",
+            "实时监控 — 跟踪已提交计划；不会自动撤单重挂",
+        )
     };
     let Some(snapshot) = app.snapshot.as_ref() else {
         frame.render_widget(
@@ -2234,6 +2453,22 @@ fn render_grid(area: Rect, frame: &mut ratatui::Frame, app: &App, config: Option
         );
         return;
     };
+    let execute_button = preview_execute_button(area);
+    let execute_label = if app.execution_pending {
+        "  EXECUTING...  "
+    } else {
+        "  [E] EXECUTE PLAN  "
+    };
+    frame.render_widget(
+        Paragraph::new(execute_label)
+            .style(if app.execution_pending {
+                Style::default().fg(Color::Yellow)
+            } else {
+                Style::default().fg(Color::Black).bg(Color::Green)
+            })
+            .alignment(ratatui::layout::Alignment::Center),
+        execute_button,
+    );
     let profit = snapshot.plan.profit_preview(config.maker_fee_rate);
     let margin = snapshot
         .plan

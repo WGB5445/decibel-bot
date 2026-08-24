@@ -41,8 +41,9 @@ pub struct ProfileData {
     pub preview_leverage: String,
     pub refresh_seconds: String,
     pub price_source: String,
-    /// Argon2id + XChaCha20-Poly1305 envelope. `None` when no key has been saved.
+    /// Argon2id + XChaCha20-Poly1305 envelopes. `None` when a credential has not been saved.
     pub encrypted_api_key: Option<EncryptedSecret>,
+    pub encrypted_aptos_private_key: Option<EncryptedSecret>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

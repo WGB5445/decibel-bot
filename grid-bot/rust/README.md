@@ -16,11 +16,13 @@ grid-bot/rust
 
 > ## 当前版本的执行范围
 >
-> 这是一个安全的第一版 Rust 实现：它会读取 Decibel 市场、账户、仓位、订单与成交历史，计算网格并实时监控，**但不会签名或提交 Aptos 交易**。
+> Rust TUI 支持 **Preview → Execute Plan → Monitor** 流程。Preview 页面展示当前计划，按 `E` 或点击右上角 `EXECUTE PLAN` 后，会使用 Aptos Ed25519 私钥把当前 Perp 网格作为**一笔 bulk order 交易**签名、提交并等待确认；成功后自动进入 Monitor。
 >
-> 因此 `run` 目前是持续监控/规划模式，TUI 也是只读模式。界面和 CLI 会明确显示 `READ-ONLY EXECUTOR`。这样在尚未完成 Rust 原生 Aptos 签名和 bulk-order 提交的端到端测试前，不会因为误运行而在主网下单。
+> Monitor 只跟踪已提交订单、行情、账户和成交，不会在每次刷新时自动撤单重挂。当前执行需要 Aptos 私钥、Trading Account（Subaccount）地址和足够的 APT gas。Spot / Perp 使用官方对应的 `place_*_order_to_subaccount` ABI。
 >
-> Python 版本仍是当前仓库的可执行网格版本：`../python`。
+> `run` 子命令仍是监控/规划输出，不执行交易。真实执行只从 TUI Preview 页面触发。请先在 testnet 验证，再考虑 mainnet。
+>
+> Python 版本仍可用于需要 bulk-order 自动替换的网格策略:`../python`。
 
 ## 功能
 
@@ -42,7 +44,7 @@ grid-bot/rust
 
 ## 安装与构建
 
-需要 Rust 1.85+：
+需要 Rust 1.95+（Aptos Rust SDK 0.6 要求）：
 
 ```bash
 cd /Users/logan/code/github/wgb5445/decibel-bot/grid-bot/rust

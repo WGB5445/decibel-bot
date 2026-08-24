@@ -1,18 +1,19 @@
-//! Read-only Decibel grid planner and monitor.
-//!
-//! This first Rust version intentionally does not sign or submit Aptos transactions. It plans
-//! the exact bulk grid, monitors market/account data, and marks levels observed in trade history.
-//! The executor boundary is isolated so a native Aptos bulk-order submitter can be added without
-//! changing the CLI, TUI, or pricing model.
+//! Decibel grid planner, monitor, and explicitly confirmed Aptos executor.
 
 use std::{str::FromStr, time::Duration};
 
 use anyhow::{Context, Result, anyhow, bail};
+use aptos_sdk::{
+    Aptos, AptosConfig,
+    account::Ed25519Account,
+    transaction::{InputEntryFunctionData, move_none},
+    types::AccountAddress,
+};
 use chrono::{DateTime, Utc};
 use clap::ValueEnum;
 use futures_util::{SinkExt, StreamExt};
 use reqwest::{Client as HttpClient, header};
-use rust_decimal::{Decimal, RoundingStrategy};
+use rust_decimal::{Decimal, RoundingStrategy, prelude::ToPrimitive};
 use serde_json::Value;
 use tokio_tungstenite::{
     connect_async,
@@ -166,6 +167,172 @@ pub struct Trade {
     pub price: Decimal,
     pub size: Decimal,
     pub timestamp_ms: i64,
+}
+
+/// Result of a confirmed on-chain bulk grid submission.
+#[derive(Clone, Debug)]
+pub struct ExecutionResult {
+    pub transaction_hash: String,
+    pub product: Product,
+    pub bid_count: usize,
+    pub ask_count: usize,
+}
+
+const MAINNET_PACKAGE: &str = "0x50ead22afd6ffd9769e3b3d6e0e64a2a350d68e8b102c4e72e33d0b8cfdfdb06";
+const TESTNET_PACKAGE: &str = "0xe7da2794b1d8af76532ed95f38bfdf1136abfd8ea3a240189971988a83101b7f";
+
+/// Build, sign, submit, and wait for one atomic Perp bulk-order replacement transaction.
+///
+/// Decibel's documented bulk API atomically replaces all resting liquidity for this market. The
+/// venue sequence is read from `/bulk_orders` and incremented exactly once before submission;
+/// this is distinct from the Aptos account sequence managed by the SDK.
+pub async fn execute_bulk_grid(
+    network: &str,
+    api_key: &str,
+    private_key: &str,
+    subaccount: &str,
+    market: &Market,
+    plan: &GridPlan,
+) -> Result<ExecutionResult> {
+    if market.product != Product::Perp {
+        bail!(
+            "Spot bulk execution is not enabled: its bulk ABI has not been verified. Refusing to fall back to per-order submissions"
+        )
+    }
+    if subaccount.trim().is_empty() {
+        bail!("subaccount address is required for live execution")
+    }
+    let client = DecibelClient::new(network, api_key)?;
+    let next_bulk_sequence = client
+        .next_bulk_sequence(subaccount, &market.address)
+        .await?;
+    let key = normalize_private_key(private_key)?;
+    let signer =
+        Ed25519Account::from_private_key_hex(&key).context("invalid Aptos Ed25519 private key")?;
+    let subaccount: AccountAddress = subaccount.parse().context("invalid subaccount address")?;
+    let market_address: AccountAddress =
+        market.address.parse().context("invalid market address")?;
+    let package = match network.trim().to_ascii_lowercase().as_str() {
+        "mainnet" => MAINNET_PACKAGE,
+        "testnet" => TESTNET_PACKAGE,
+        other => bail!("unsupported execution network {other}; expected mainnet or testnet"),
+    };
+    let aptos = Aptos::new(match network.trim().to_ascii_lowercase().as_str() {
+        "mainnet" => AptosConfig::mainnet(),
+        _ => AptosConfig::testnet(),
+    })?;
+    let bids = plan
+        .bids
+        .iter()
+        .filter(|level| level.state != LevelState::Filled)
+        .collect::<Vec<_>>();
+    let asks = plan
+        .asks
+        .iter()
+        .filter(|level| level.state != LevelState::Filled)
+        .collect::<Vec<_>>();
+    if bids.len() > MAX_LEVELS_PER_SIDE || asks.len() > MAX_LEVELS_PER_SIDE {
+        bail!("bulk order limit exceeded: at most {MAX_LEVELS_PER_SIDE} orders per side")
+    }
+    if bids.is_empty() && asks.is_empty() {
+        bail!("refusing to submit an empty bulk order; use an explicit bulk-cancel action")
+    }
+    let bid_prices = scale_level_field(&bids, market.px_decimals, |level| level.price)?;
+    let bid_sizes = scale_level_field(&bids, market.sz_decimals, |level| level.size)?;
+    let ask_prices = scale_level_field(&asks, market.px_decimals, |level| level.price)?;
+    let ask_sizes = scale_level_field(&asks, market.sz_decimals, |level| level.size)?;
+    if bid_prices.len() != bid_sizes.len() || ask_prices.len() != ask_sizes.len() {
+        bail!("bulk order price/size vector length mismatch")
+    }
+    let payload = InputEntryFunctionData::new(&format!(
+        "{package}::dex_accounts_entry::place_bulk_orders_to_subaccount"
+    ))
+    .arg(subaccount)
+    .arg(market_address)
+    .arg(next_bulk_sequence)
+    .arg(bid_prices)
+    .arg(bid_sizes)
+    .arg(ask_prices)
+    .arg(ask_sizes)
+    .arg(move_none()) // builder_address
+    .arg(move_none()) // builder_fees
+    .build()
+    .context("build Decibel bulk-order transaction")?;
+    let response = aptos
+        .sign_submit_and_wait(&signer, payload, Some(Duration::from_secs(60)))
+        .await
+        .context("submit Decibel bulk-order transaction")?;
+    let success = response
+        .data
+        .get("success")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    if !success {
+        bail!(
+            "Decibel bulk-order transaction failed: {}",
+            response
+                .data
+                .get("vm_status")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown VM status")
+        )
+    }
+    let hash = response
+        .data
+        .get("hash")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_owned();
+    Ok(ExecutionResult {
+        transaction_hash: hash,
+        product: market.product,
+        bid_count: bids.len(),
+        ask_count: asks.len(),
+    })
+}
+
+fn normalize_private_key(private_key: &str) -> Result<String> {
+    let key = private_key.trim();
+    if key.is_empty() {
+        bail!("Aptos private key is required")
+    }
+    let body = key
+        .split_once("-priv-")
+        .map(|(_, value)| value)
+        .unwrap_or(key)
+        .trim_start_matches("0x");
+    let bytes = hex::decode(body).context("private key is not hexadecimal")?;
+    if bytes.len() != 32 {
+        bail!("Aptos Ed25519 private key must be exactly 32 bytes")
+    }
+    Ok(format!("0x{}", hex::encode(bytes)))
+}
+
+fn scale_level_field<F>(levels: &[&GridLevel], decimals: u32, value: F) -> Result<Vec<u64>>
+where
+    F: Fn(&GridLevel) -> Decimal,
+{
+    levels
+        .iter()
+        .map(|level| scale_chain_amount(value(level), decimals))
+        .collect()
+}
+
+fn scale_chain_amount(value: Decimal, decimals: u32) -> Result<u64> {
+    if value <= Decimal::ZERO {
+        bail!("chain amount must be positive, got {value}")
+    }
+    let factor = Decimal::from(
+        10u64
+            .checked_pow(decimals)
+            .ok_or_else(|| anyhow!("decimal scale {decimals} exceeds u64 precision"))?,
+    );
+    let raw = (value * factor).floor();
+    if raw <= Decimal::ZERO {
+        bail!("amount {value} rounds to zero in chain units")
+    }
+    raw.to_u64()
+        .ok_or_else(|| anyhow!("amount {value} cannot be represented as u64 chain units"))
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -555,6 +722,39 @@ impl DecibelClient {
         serde_json::from_str(&body).with_context(|| format!("invalid JSON from Decibel {path}"))
     }
 
+    /// Read the latest venue bulk sequence for this subaccount/market, then return the strictly
+    /// greater sequence required by `place_bulk_orders_to_subaccount`.
+    async fn next_bulk_sequence(&self, subaccount: &str, market: &str) -> Result<u64> {
+        let data = self
+            .get(
+                "bulk_orders",
+                &[
+                    ("account", subaccount.to_owned()),
+                    ("market", market.to_owned()),
+                ],
+            )
+            .await?;
+        let rows = data
+            .as_array()
+            .ok_or_else(|| anyhow!("/bulk_orders did not return an array"))?;
+        let max_sequence = rows
+            .iter()
+            .filter_map(|row| {
+                row.get("sequence_number")
+                    .and_then(Value::as_u64)
+                    .or_else(|| {
+                        row.get("sequence_number")
+                            .and_then(Value::as_str)
+                            .and_then(|value| value.parse::<u64>().ok())
+                    })
+            })
+            .max()
+            .unwrap_or(0);
+        max_sequence
+            .checked_add(1)
+            .ok_or_else(|| anyhow!("bulk sequence number overflow"))
+    }
+
     /// Check that the bearer key is accepted by both documented API transports without exposing
     /// the key or response body: REST (`/markets`) and WebSocket (`all_market_prices`).
     pub async fn verify_api_key(&self) -> Result<()> {
@@ -860,7 +1060,7 @@ pub async fn fetch_snapshot(
         plan,
         account,
         trades,
-        status: "LIVE DATA — READ-ONLY EXECUTOR".to_owned(),
+        status: "LIVE DATA — EXECUTION PLAN MONITOR".to_owned(),
     })
 }
 

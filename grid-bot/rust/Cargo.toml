@@ -2,11 +2,12 @@
 name = "decibel-grid-tui"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.95"
 description = "Decibel grid monitor and dry-run bot with CLI and mouse/keyboard TUI"
 
 [dependencies]
 anyhow = "1.0"
+aptos-sdk = { version = "0.6", default-features = false, features = ["ed25519"] }
 argon2 = "0.5"
 base64 = "0.22"
 chacha20poly1305 = "0.10"
@@ -16,6 +17,7 @@ crossterm = "0.28"
 dirs = "5"
 dotenvy = "0.15"
 futures-util = "0.3"
+hex = "0.4"
 rand = "0.8"
 ratatui = "0.29"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }

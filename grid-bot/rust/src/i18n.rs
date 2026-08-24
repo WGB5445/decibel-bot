@@ -36,6 +36,7 @@ pub enum Key {
     TabPreview,
     TabMonitor,
     FieldApiKey,
+    FieldAptosPrivateKey,
     FieldLanguage,
     FieldNetwork,
     FieldProduct,
@@ -121,6 +122,8 @@ pub fn t(language: Language, key: Key) -> &'static str {
         (Chinese, TabMonitor) => "3 监控",
         (English, FieldApiKey) => "API Key",
         (Chinese, FieldApiKey) => "API 密钥",
+        (English, FieldAptosPrivateKey) => "Aptos Private Key",
+        (Chinese, FieldAptosPrivateKey) => "Aptos 私钥",
         (English, FieldLanguage) => "Language",
         (Chinese, FieldLanguage) => "语言",
         (English, FieldNetwork) => "Network",
@@ -220,10 +223,10 @@ pub fn t(language: Language, key: Key) -> &'static str {
             "↑↓/点击 选择 · Enter 使用该市场 · f 刷新 · Tab 切换页签 · q 退出"
         }
         (English, HelpGrid) => {
-            "1/2/3/4 or Tab switch tabs · ↑↓/click select cell · f refresh · Esc config · q quit"
+            "1/2/3 or Tab switch tabs · ↑↓/click select cell · E execute Preview plan · f refresh · q quit"
         }
         (Chinese, HelpGrid) => {
-            "1/2/3/4 或 Tab 切换页签 · ↑↓/点击 选择格子 · f 刷新 · Esc 返回配置 · q 退出"
+            "1/2/3 或 Tab 切换页签 · ↑↓/点击选择格子 · E 执行预览计划 · f 刷新 · q 退出"
         }
         (English, HelpEditing) => "Type or paste · Enter save · Esc cancel",
         (Chinese, HelpEditing) => "输入或粘贴 · Enter 保存 · Esc 取消",
@@ -273,8 +276,8 @@ pub fn t(language: Language, key: Key) -> &'static str {
         (Chinese, AllocationBudgetLabel) => "总预算",
         (English, AllocationSizeLabel) => "Fixed order size",
         (Chinese, AllocationSizeLabel) => "固定每格数量",
-        (English, ReadOnlyBanner) => "READ ONLY — no transactions are submitted",
-        (Chinese, ReadOnlyBanner) => "只读模式 — 不会提交任何交易",
+        (English, ReadOnlyBanner) => "Preview-confirmed execution",
+        (Chinese, ReadOnlyBanner) => "仅执行预览中明确确认的计划",
         (English, ApiKeyRequired) => {
             "An API key is required. Select API Key on the Configure tab and press Enter."
         }
