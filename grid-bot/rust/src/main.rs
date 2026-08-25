@@ -87,7 +87,7 @@ fn price_grid_geometry(grid_area: Rect, price_count: usize, scroll: usize) -> Gr
     let board = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(6),
+            Constraint::Length(7),
             Constraint::Min(6),
             Constraint::Length(8),
         ])
@@ -97,9 +97,9 @@ fn price_grid_geometry(grid_area: Rect, price_count: usize, scroll: usize) -> Gr
         horizontal: 1,
     });
     let columns = price_count.clamp(1, 8);
-    // A bordered tile needs an interior line for both the side and price. Keep its height fixed
-    // and page through rows rather than silently clipping the lower prices.
-    let cell_height = 4;
+    // A bordered tile needs interior lines for the side, price, and notional/P&L. Keep its
+    // height fixed and page through rows rather than silently clipping lower prices.
+    let cell_height = 5;
     let rows = usize::from((cells.height / cell_height).max(1));
     let first_index = (scroll / columns) * columns;
     GridGeometry {
@@ -1926,7 +1926,7 @@ fn preview_execute_button(content: Rect) -> Rect {
     let summary = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(6),
+            Constraint::Length(7),
             Constraint::Min(6),
             Constraint::Length(8),
         ])
@@ -2553,7 +2553,7 @@ fn render_grid(area: Rect, frame: &mut ratatui::Frame, app: &App, config: Option
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(6),
+            Constraint::Length(7),
             Constraint::Min(6),
             Constraint::Length(8),
         ])
@@ -2606,37 +2606,115 @@ fn render_grid(area: Rect, frame: &mut ratatui::Frame, app: &App, config: Option
         execute_button,
     );
     let profit = snapshot.plan.profit_preview(config.maker_fee_rate);
-    let margin = snapshot
-        .plan
-        .estimated_margin
-        .map(|value| format_decimal(value, 4))
-        .unwrap_or_else(|| "n/a".to_owned());
-    let available = snapshot
-        .account
-        .available_margin
-        .map(|value| format_decimal(value, 4))
-        .unwrap_or_else(|| "n/a".to_owned());
-    let change_notice = app
-        .grid_change_notice
-        .as_deref()
-        .unwrap_or("No grid refresh received yet");
-    let summary = format!(
-        "{} {:?}  mid {}  range {} – {}\nPairs {}  NET {}  Quote {}  Base {}  Margin {}  Available {}\nPosition {} @ {}\n{}",
-        snapshot.market.name,
-        snapshot.market.product,
-        format_decimal(snapshot.plan.mid, 6),
-        format_decimal(snapshot.plan.lower, 6),
-        format_decimal(snapshot.plan.upper, 6),
-        profit.matched_pairs,
-        format_decimal(profit.net_capture, 6),
-        format_decimal(snapshot.plan.quote_required, 6),
-        format_decimal(snapshot.plan.base_required, 6),
-        margin,
-        available,
-        format_decimal(snapshot.account.position.size, 6),
-        format_decimal(snapshot.account.position.entry_price, 6),
-        change_notice
-    );
+    let order_count = grid_price_count(&snapshot.plan);
+    let total_notional: Decimal = snapshot.plan.all_levels().map(|level| level.notional).sum();
+    let average_order_notional = if order_count == 0 {
+        Decimal::ZERO
+    } else {
+        total_notional / Decimal::from(order_count)
+    };
+    let average_pair_profit = if profit.matched_pairs == 0 {
+        None
+    } else {
+        Some(profit.net_capture / Decimal::from(profit.matched_pairs))
+    };
+    // Perp collateral and Spot inventory are materially different. Do not present a Perp
+    // position as though it were a spot wallet balance: that would make the funding panel look
+    // polished but be economically wrong. The REST overview currently supplies Perp margin,
+    // while Spot wallet balances need a separate account-assets endpoint.
+    let capital_line = match snapshot.market.product {
+        Product::Perp => {
+            let margin_required = snapshot.plan.estimated_margin.unwrap_or(Decimal::ZERO);
+            let available_margin = snapshot.account.available_margin;
+            let margin_shortfall =
+                available_margin.map(|balance| (margin_required - balance).max(Decimal::ZERO));
+            format!(
+                "{}  {} {}  ·  {} {}  ·  {} {}",
+                ui(app.settings.language, "COLLATERAL", "保证金"),
+                ui(app.settings.language, "Required", "需求"),
+                format_decimal(margin_required, 6),
+                ui(app.settings.language, "Available", "可用"),
+                available_margin
+                    .map(|value| format_decimal(value, 6))
+                    .unwrap_or_else(|| "—".to_owned()),
+                ui(app.settings.language, "Shortfall", "缺口"),
+                margin_shortfall
+                    .map(|value| format_decimal(value, 6))
+                    .unwrap_or_else(|| "—".to_owned()),
+            )
+        }
+        Product::Spot => format!(
+            "{}  {} {}  ·  {} {}",
+            ui(app.settings.language, "INVENTORY", "库存需求"),
+            ui(app.settings.language, "Quote required", "报价资产需求"),
+            format_decimal(snapshot.plan.quote_required, 6),
+            ui(app.settings.language, "Base required", "基础资产需求"),
+            format_decimal(snapshot.plan.base_required, 6),
+        ),
+    };
+    let exposure_line = match snapshot.market.product {
+        Product::Perp => format!(
+            "{}  {} {}  ·  {} {}",
+            ui(app.settings.language, "GRID EXPOSURE", "网格敞口"),
+            ui(app.settings.language, "Buy-side", "买入侧"),
+            format_decimal(snapshot.plan.quote_required, 6),
+            ui(app.settings.language, "Sell-side", "卖出侧"),
+            format_decimal(
+                snapshot.plan.asks.iter().map(|level| level.notional).sum(),
+                6,
+            ),
+        ),
+        Product::Spot => format!(
+            "{}  {} {}  ·  {} {}",
+            ui(app.settings.language, "ORDER INVENTORY", "挂单库存"),
+            ui(app.settings.language, "Buy orders", "买单资金"),
+            format_decimal(snapshot.plan.quote_required, 6),
+            ui(app.settings.language, "Sell orders", "卖单数量"),
+            format_decimal(snapshot.plan.base_required, 6),
+        ),
+    };
+    let average_pair_profit_display = average_pair_profit
+        .map(|value| format_decimal(value, 6))
+        .unwrap_or_else(|| ui(app.settings.language, "n/a", "不适用").to_owned());
+    let change_notice = app.grid_change_notice.as_deref().unwrap_or_else(|| {
+        ui(
+            app.settings.language,
+            "No grid refresh received yet",
+            "尚未收到网格刷新",
+        )
+    });
+    let summary = [
+        format!(
+            "{} {:?}  {} {}  {} {} – {}",
+            snapshot.market.name,
+            snapshot.market.product,
+            ui(app.settings.language, "Mid", "中间价"),
+            format_decimal(snapshot.plan.mid, 6),
+            ui(app.settings.language, "Range", "区间"),
+            format_decimal(snapshot.plan.lower, 6),
+            format_decimal(snapshot.plan.upper, 6),
+        ),
+        format!(
+            "{} {}  {} {}  {} {}",
+            ui(app.settings.language, "Orders", "订单数"),
+            order_count,
+            ui(app.settings.language, "Avg order amount", "每格下单金额"),
+            format_decimal(average_order_notional, 6),
+            ui(app.settings.language, "Total order amount", "总下单金额"),
+            format_decimal(total_notional, 6),
+        ),
+        format!(
+            "{} {}  {} {}",
+            ui(app.settings.language, "Net profit", "净利润"),
+            format_decimal(profit.net_capture, 6),
+            ui(app.settings.language, "Avg profit/trade", "单次平均利润"),
+            average_pair_profit_display,
+        ),
+        capital_line,
+        exposure_line,
+        change_notice.to_owned(),
+    ]
+    .join("\n");
     frame.render_widget(
         Paragraph::new(summary).block(Block::default().borders(Borders::ALL).title(title)),
         chunks[0],
@@ -2681,6 +2759,9 @@ fn render_grid(area: Rect, frame: &mut ratatui::Frame, app: &App, config: Option
             .price_highlights
             .iter()
             .any(|(price, until)| *until > tokio::time::Instant::now() && level.price == *price);
+        let level_profit = level_pair_profit(&snapshot.plan, level, config.maker_fee_rate)
+            .map(|profit| format_decimal(profit, 4))
+            .unwrap_or_else(|| ui(app.settings.language, "n/a", "不适用").to_owned());
         // Green is reserved for an observed trade at this level. A newly repriced level is cyan,
         // so routine plan refreshes cannot be mistaken for a fill. Explicit selection wins.
         let style = if index == app.selected_level {
@@ -2698,6 +2779,13 @@ fn render_grid(area: Rect, frame: &mut ratatui::Frame, app: &App, config: Option
             Paragraph::new(vec![
                 Line::from(level.side.as_str()),
                 Line::from(format_decimal(level.price, 5)),
+                Line::from(format!(
+                    "{} {} · {} {}",
+                    ui(app.settings.language, "Order", "下单金额"),
+                    format_decimal(level.notional, 4),
+                    ui(app.settings.language, "P&L", "预估利润"),
+                    level_profit,
+                )),
             ])
             .style(style)
             .alignment(ratatui::layout::Alignment::Center)
@@ -2711,6 +2799,31 @@ fn render_grid(area: Rect, frame: &mut ratatui::Frame, app: &App, config: Option
         );
     }
     render_trade_history(chunks[2], frame, snapshot);
+}
+
+fn level_pair_profit(
+    plan: &GridPlan,
+    level: &GridLevel,
+    maker_fee_rate: Decimal,
+) -> Option<Decimal> {
+    let pair = match level.side {
+        Side::Bid => plan.asks.get(
+            plan.bids
+                .iter()
+                .position(|candidate| std::ptr::eq(candidate, level))?,
+        ),
+        Side::Ask => plan.bids.get(
+            plan.asks
+                .iter()
+                .position(|candidate| std::ptr::eq(candidate, level))?,
+        ),
+    }?;
+    let size = level.size.min(pair.size);
+    let gross = match level.side {
+        Side::Bid => (pair.price - level.price) * size,
+        Side::Ask => (level.price - pair.price) * size,
+    };
+    Some(gross - (level.price + pair.price) * size * maker_fee_rate)
 }
 
 fn ordered_grid_levels(plan: &GridPlan) -> Vec<&GridLevel> {
