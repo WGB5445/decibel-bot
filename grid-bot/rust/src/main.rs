@@ -1,4 +1,12 @@
-use std::{io, str::FromStr, time::Duration};
+use std::{
+    backtrace::Backtrace,
+    fs,
+    io::{self, Write},
+    panic::{self, PanicHookInfo},
+    path::PathBuf,
+    str::FromStr,
+    time::Duration,
+};
 
 use tokio::sync::mpsc;
 
@@ -731,6 +739,8 @@ struct App {
     /// Start time used to animate the in-progress refresh indicator.
     refresh_started_at: Option<tokio::time::Instant>,
     error: Option<String>,
+    /// Full error inspector, opened with F2 so the compact header never blocks the UI.
+    error_dialog: bool,
     snapshot: Option<MonitorSnapshot>,
     /// Prices whose observed execution state changed, retained briefly for visual feedback.
     price_highlights: Vec<(Decimal, tokio::time::Instant)>,
@@ -768,6 +778,7 @@ impl App {
             refresh_success_until: None,
             refresh_started_at: None,
             error: None,
+            error_dialog: false,
             snapshot: None,
             price_highlights: Vec::new(),
             grid_change_notice: None,
@@ -1105,8 +1116,59 @@ fn print_snapshot(snapshot: &MonitorSnapshot, config: &GridConfig) {
     }
 }
 
+fn install_panic_reporter() {
+    let previous = panic::take_hook();
+    panic::set_hook(Box::new(move |info: &PanicHookInfo<'_>| {
+        let backtrace = Backtrace::force_capture();
+        let location = info
+            .location()
+            .map(|location| {
+                format!(
+                    "{}:{}:{}",
+                    location.file(),
+                    location.line(),
+                    location.column()
+                )
+            })
+            .unwrap_or_else(|| "unknown location".to_owned());
+        let payload = info
+            .payload()
+            .downcast_ref::<&str>()
+            .copied()
+            .or_else(|| info.payload().downcast_ref::<String>().map(String::as_str))
+            .unwrap_or("non-string panic payload");
+        let report = format!(
+            "Rust panic\n\nmessage: {payload}\nlocation: {location}\n\nbacktrace:\n{backtrace}\n"
+        );
+        let path = save_error_report(&report).ok();
+
+        // Panic can happen while crossterm is in raw/alternate-screen mode. Restore the
+        // terminal before printing, otherwise the panic text remains trapped in the TUI.
+        let mut stdout = io::stdout();
+        let _ = disable_raw_mode();
+        let _ = execute!(stdout, DisableMouseCapture, LeaveAlternateScreen);
+        let _ = writeln!(
+            stdout,
+            "\nDecibel Grid TUI panicked: {payload}\nLocation: {location}"
+        );
+        if let Some(path) = path {
+            let _ = writeln!(stdout, "Full panic report: {}", path.display());
+        }
+        let _ = stdout.flush();
+        previous(info);
+    }));
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
+    // reqwest 0.13's `rustls` feature hard-selects aws-lc-rs, and aptos-sdk pulls it in with
+    // default features, so aws-lc-rs is the only provider in the tree. Install it explicitly
+    // before any TLS handshake: rustls refuses to guess, and tokio-tungstenite builds its
+    // ClientConfig lazily on first connect, which is where the panic surfaced.
+    rustls::crypto::aws_lc_rs::default_provider()
+        .install_default()
+        .map_err(|_| anyhow::anyhow!("failed to install rustls aws-lc-rs CryptoProvider"))?;
+    install_panic_reporter();
     dotenv().ok();
     let cli = Cli::parse();
     match cli.command {
@@ -1626,6 +1688,22 @@ fn handle_event(app: &mut App) -> Result<bool> {
         {
             return Ok(true);
         }
+        Event::Key(key) if app.error_dialog => match key.code {
+            KeyCode::Esc | KeyCode::F(2) => app.error_dialog = false,
+            // F2 already copies and saves the error automatically. Keep these as explicit
+            // retries for terminals whose clipboard provider was temporarily unavailable.
+            KeyCode::Char('c') | KeyCode::Char('y') => {
+                if let Some(error) = app.error.as_deref() {
+                    let _ = copy_error_to_clipboard(error);
+                }
+            }
+            KeyCode::Char('s') => {
+                if let Some(error) = app.error.as_deref() {
+                    let _ = save_error_report(error);
+                }
+            }
+            _ => {}
+        },
         Event::Key(key) if app.market_picker.is_some() => handle_market_picker_key(app, key.code),
         Event::Key(key) if app.editing.is_some() => match key.code {
             KeyCode::Enter => {
@@ -1672,6 +1750,9 @@ fn handle_event(app: &mut App) -> Result<bool> {
                     Ok(()) => app.error = Some(app.settings.tr(TKey::ProfileReset).to_owned()),
                     Err(error) => app.error = Some(error.to_string()),
                 }
+            }
+            KeyCode::F(2) if app.error.is_some() => {
+                app.error_dialog = true;
             }
             KeyCode::Char('q') => return Ok(true),
             KeyCode::Esc => {
@@ -1965,6 +2046,11 @@ fn render(area: Rect, frame: &mut ratatui::Frame, app: &App, config: Option<&Gri
     if app.market_picker.is_some() {
         render_market_picker(area, frame, app);
     }
+    // Keep the compact header status visible by default. The full inspector is explicitly opened
+    // with F2, and Esc/F2 can then reliably close it without immediately being rendered again.
+    if app.error_dialog && app.error.is_some() {
+        render_error_dialog(area, frame, app);
+    }
 }
 
 /// Searchable market terminal. Unlike the previous Markets Tab it is an overlay: the user can
@@ -2188,6 +2274,67 @@ fn render_password_modal(area: Rect, frame: &mut ratatui::Frame, app: &App) {
     );
 }
 
+fn copy_error_to_clipboard(error: &str) -> Result<()> {
+    let mut clipboard = arboard::Clipboard::new().context("initialize system clipboard")?;
+    clipboard
+        .set_text(error.to_owned())
+        .context("copy error to system clipboard")?;
+    Ok(())
+}
+
+fn save_error_report(error: &str) -> Result<PathBuf> {
+    let base = dirs::data_local_dir()
+        .or_else(dirs::cache_dir)
+        .or_else(dirs::home_dir)
+        .ok_or_else(|| anyhow::anyhow!("could not determine a writable data directory"))?;
+    let dir = base.join("decibel-grid");
+    fs::create_dir_all(&dir).context("create error report directory")?;
+    let path = dir.join("last-error.txt");
+    fs::write(&path, error).context("write error report")?;
+    Ok(path)
+}
+
+fn render_error_dialog(area: Rect, frame: &mut ratatui::Frame, app: &App) {
+    let Some(error) = app.error.as_deref() else {
+        return;
+    };
+    let popup = centered_rect(90, 70, area);
+    frame.render_widget(Clear, popup);
+    let inner = popup.inner(Margin {
+        vertical: 1,
+        horizontal: 1,
+    });
+    let text = format!(
+        "{}\n\n{}\n\n{}",
+        ui(app.settings.language, "Error details", "错误详情"),
+        error,
+        ui(
+            app.settings.language,
+            "C/Y copy to clipboard · S save file · Esc/F2 close",
+            "C/Y 复制到剪贴板 · S 保存文件 · Esc/F2 关闭"
+        )
+    );
+    frame.render_widget(
+        Paragraph::new(text)
+            .wrap(Wrap { trim: false })
+            .scroll((0, 0))
+            .block(Block::default().borders(Borders::ALL).title(ui(
+                app.settings.language,
+                "Error report",
+                "错误报告",
+            ))),
+        inner,
+    );
+    frame.render_widget(
+        Block::default().borders(Borders::ALL).title(ui(
+            app.settings.language,
+            "Error report",
+            "错误报告",
+        )),
+        popup,
+    );
+}
+
 fn render_config(area: Rect, frame: &mut ratatui::Frame, app: &App) {
     // Web-like two-column layout: editable form on the left, contextual help/simulation on
     // the right. The selected field drives the explanation so the unit is never ambiguous.
@@ -2254,17 +2401,6 @@ fn render_config(area: Rect, frame: &mut ratatui::Frame, app: &App) {
         ),
         columns[1],
     );
-    if let Some(error) = &app.error {
-        let popup = centered_rect(85, 5, area);
-        frame.render_widget(Clear, popup);
-        frame.render_widget(
-            Paragraph::new(error.clone())
-                .style(Style::default().fg(Color::Red))
-                .wrap(Wrap { trim: true })
-                .block(Block::default().borders(Borders::ALL).title("Status")),
-            popup,
-        );
-    }
 }
 
 fn field_display_label(app: &App, field: Field) -> String {

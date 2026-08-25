@@ -8,6 +8,7 @@ description = "Decibel grid monitor and dry-run bot with CLI and mouse/keyboard 
 [dependencies]
 anyhow = "1.0"
 aptos-sdk = { version = "0.6", default-features = false, features = ["ed25519"] }
+arboard = "3.4"
 argon2 = "0.5"
 base64 = "0.22"
 chacha20poly1305 = "0.10"
@@ -20,7 +21,19 @@ futures-util = "0.3"
 hex = "0.4"
 rand = "0.8"
 ratatui = "0.29"
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+# Match the reqwest major version aptos-sdk already pulls in. Keeping a second reqwest 0.12 here
+# would also drag in a second rustls provider (ring), which is what made rustls refuse to choose.
+reqwest = { version = "0.13", default-features = false, features = [
+    "json",
+    "query",
+    "http2",
+    "charset",
+    "system-proxy",
+    "rustls",
+] }
+# rustls picks a provider automatically only when exactly one is enabled. Depend on it directly so
+# the choice is pinned in code and a future dependency cannot silently reintroduce the ambiguity.
+rustls = { version = "0.23", default-features = false, features = ["aws-lc-rs", "std", "tls12", "logging"] }
 rust_decimal = { version = "1.36", features = ["serde-with-str"] }
 rust_decimal_macros = "1.36"
 serde = { version = "1.0", features = ["derive"] }
