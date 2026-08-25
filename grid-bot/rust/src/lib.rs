@@ -181,11 +181,11 @@ pub struct ExecutionResult {
 const MAINNET_PACKAGE: &str = "0x50ead22afd6ffd9769e3b3d6e0e64a2a350d68e8b102c4e72e33d0b8cfdfdb06";
 const TESTNET_PACKAGE: &str = "0xe7da2794b1d8af76532ed95f38bfdf1136abfd8ea3a240189971988a83101b7f";
 
-/// Build, sign, submit, and wait for one atomic Perp bulk-order replacement transaction.
+/// Build, sign, submit, and wait for the official Perp bulk order transaction.
 ///
-/// Decibel's documented bulk API atomically replaces all resting liquidity for this market. The
-/// venue sequence is read from `/bulk_orders` and incremented exactly once before submission;
-/// this is distinct from the Aptos account sequence managed by the SDK.
+/// The ABI and argument order are sourced from etna's `dex_accounts_entry.move` and generated
+/// SDK ABI. `sequence_number` is a venue-side sequence and must be strictly increasing per
+/// (subaccount, market), unlike the Aptos account sequence handled by the SDK.
 pub async fn execute_bulk_grid(
     network: &str,
     api_key: &str,
@@ -194,82 +194,81 @@ pub async fn execute_bulk_grid(
     market: &Market,
     plan: &GridPlan,
 ) -> Result<ExecutionResult> {
-    if market.product != Product::Perp {
-        bail!(
-            "Spot bulk execution is not enabled: its bulk ABI has not been verified. Refusing to fall back to per-order submissions"
-        )
-    }
-    if subaccount.trim().is_empty() {
+    let subaccount_str = subaccount.trim();
+    if subaccount_str.is_empty() {
         bail!("subaccount address is required for live execution")
     }
     let client = DecibelClient::new(network, api_key)?;
-    let next_bulk_sequence = client
-        .next_bulk_sequence(subaccount, &market.address)
+    let sequence = client
+        .next_bulk_sequence(subaccount_str, &market.address, market.product)
         .await?;
     let key = normalize_private_key(private_key)?;
     let signer =
         Ed25519Account::from_private_key_hex(&key).context("invalid Aptos Ed25519 private key")?;
-    let subaccount: AccountAddress = subaccount.parse().context("invalid subaccount address")?;
-    let market_address: AccountAddress =
-        market.address.parse().context("invalid market address")?;
-    let package = match network.trim().to_ascii_lowercase().as_str() {
+    let subaccount_addr: AccountAddress = subaccount_str
+        .parse()
+        .context("invalid subaccount address")?;
+    let market_addr: AccountAddress = market.address.parse().context("invalid market address")?;
+    let network_name = network.trim().to_ascii_lowercase();
+    let package = match network_name.as_str() {
         "mainnet" => MAINNET_PACKAGE,
         "testnet" => TESTNET_PACKAGE,
         other => bail!("unsupported execution network {other}; expected mainnet or testnet"),
     };
-    let aptos = Aptos::new(match network.trim().to_ascii_lowercase().as_str() {
+    let aptos = Aptos::new(match network_name.as_str() {
         "mainnet" => AptosConfig::mainnet(),
         _ => AptosConfig::testnet(),
     })?;
-    let bids = plan
+    let bids: Vec<&GridLevel> = plan
         .bids
         .iter()
         .filter(|level| level.state != LevelState::Filled)
-        .collect::<Vec<_>>();
-    let asks = plan
+        .collect();
+    let asks: Vec<&GridLevel> = plan
         .asks
         .iter()
         .filter(|level| level.state != LevelState::Filled)
-        .collect::<Vec<_>>();
+        .collect();
+    if bids.is_empty() && asks.is_empty() {
+        bail!("refusing to submit empty bulk order")
+    }
     if bids.len() > MAX_LEVELS_PER_SIDE || asks.len() > MAX_LEVELS_PER_SIDE {
         bail!("bulk order limit exceeded: at most {MAX_LEVELS_PER_SIDE} orders per side")
     }
-    if bids.is_empty() && asks.is_empty() {
-        bail!("refusing to submit an empty bulk order; use an explicit bulk-cancel action")
-    }
-    let bid_prices = scale_level_field(&bids, market.px_decimals, |level| level.price)?;
-    let bid_sizes = scale_level_field(&bids, market.sz_decimals, |level| level.size)?;
-    let ask_prices = scale_level_field(&asks, market.px_decimals, |level| level.price)?;
-    let ask_sizes = scale_level_field(&asks, market.sz_decimals, |level| level.size)?;
-    if bid_prices.len() != bid_sizes.len() || ask_prices.len() != ask_sizes.len() {
-        bail!("bulk order price/size vector length mismatch")
-    }
-    let payload = InputEntryFunctionData::new(&format!(
-        "{package}::dex_accounts_entry::place_bulk_orders_to_subaccount"
-    ))
-    .arg(subaccount)
-    .arg(market_address)
-    .arg(next_bulk_sequence)
-    .arg(bid_prices)
-    .arg(bid_sizes)
-    .arg(ask_prices)
-    .arg(ask_sizes)
-    .arg(move_none()) // builder_address
-    .arg(move_none()) // builder_fees
-    .build()
-    .context("build Decibel bulk-order transaction")?;
+    let bid_prices = scale_levels(&bids, market.px_decimals, |level| level.price)?;
+    let bid_sizes = scale_levels(&bids, market.sz_decimals, |level| level.size)?;
+    let ask_prices = scale_levels(&asks, market.px_decimals, |level| level.price)?;
+    let ask_sizes = scale_levels(&asks, market.sz_decimals, |level| level.size)?;
+    let entry_function = match market.product {
+        Product::Perp => format!("{package}::dex_accounts_entry::place_bulk_orders_to_subaccount"),
+        Product::Spot => {
+            format!("{package}::dex_accounts_spot_entry::place_spot_bulk_order_to_subaccount")
+        }
+    };
+    let payload = InputEntryFunctionData::new(&entry_function)
+        .arg(subaccount_addr)
+        .arg(market_addr)
+        .arg(sequence)
+        .arg(bid_prices)
+        .arg(bid_sizes)
+        .arg(ask_prices)
+        .arg(ask_sizes)
+        .arg(move_none()) // builder_address: Option<address>
+        .arg(move_none()) // builder_fees: Option<u64>
+        .build()
+        .context("build Perp bulk-order transaction")?;
     let response = aptos
         .sign_submit_and_wait(&signer, payload, Some(Duration::from_secs(60)))
         .await
-        .context("submit Decibel bulk-order transaction")?;
-    let success = response
+        .context("submit Perp bulk-order transaction")?;
+    if !response
         .data
         .get("success")
         .and_then(Value::as_bool)
-        .unwrap_or(false);
-    if !success {
+        .unwrap_or(false)
+    {
         bail!(
-            "Decibel bulk-order transaction failed: {}",
+            "Perp bulk-order transaction failed: {}",
             response
                 .data
                 .get("vm_status")
@@ -277,14 +276,13 @@ pub async fn execute_bulk_grid(
                 .unwrap_or("unknown VM status")
         )
     }
-    let hash = response
-        .data
-        .get("hash")
-        .and_then(Value::as_str)
-        .unwrap_or_default()
-        .to_owned();
     Ok(ExecutionResult {
-        transaction_hash: hash,
+        transaction_hash: response
+            .data
+            .get("hash")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned(),
         product: market.product,
         bid_count: bids.len(),
         ask_count: asks.len(),
@@ -308,7 +306,7 @@ fn normalize_private_key(private_key: &str) -> Result<String> {
     Ok(format!("0x{}", hex::encode(bytes)))
 }
 
-fn scale_level_field<F>(levels: &[&GridLevel], decimals: u32, value: F) -> Result<Vec<u64>>
+fn scale_levels<F>(levels: &[&GridLevel], decimals: u32, value: F) -> Result<Vec<u64>>
 where
     F: Fn(&GridLevel) -> Decimal,
 {
@@ -325,7 +323,7 @@ fn scale_chain_amount(value: Decimal, decimals: u32) -> Result<u64> {
     let factor = Decimal::from(
         10u64
             .checked_pow(decimals)
-            .ok_or_else(|| anyhow!("decimal scale {decimals} exceeds u64 precision"))?,
+            .ok_or_else(|| anyhow!("decimal scale overflow"))?,
     );
     let raw = (value * factor).floor();
     if raw <= Decimal::ZERO {
@@ -722,35 +720,44 @@ impl DecibelClient {
         serde_json::from_str(&body).with_context(|| format!("invalid JSON from Decibel {path}"))
     }
 
-    /// Read the latest venue bulk sequence for this subaccount/market, then return the strictly
-    /// greater sequence required by `place_bulk_orders_to_subaccount`.
-    async fn next_bulk_sequence(&self, subaccount: &str, market: &str) -> Result<u64> {
+    /// Bulk sequence is a venue-side monotonically increasing value. The API's bulk-orders reader
+    /// accepts the active account and market filters; the latest row's `sequence_number` is the
+    /// predecessor for the next transaction.
+    async fn next_bulk_sequence(
+        &self,
+        subaccount: &str,
+        market: &str,
+        product: Product,
+    ) -> Result<u64> {
+        let asset_type = match product {
+            Product::Perp => "perp",
+            Product::Spot => "spot",
+        };
         let data = self
             .get(
                 "bulk_orders",
                 &[
                     ("account", subaccount.to_owned()),
                     ("market", market.to_owned()),
+                    ("asset_type", asset_type.to_owned()),
                 ],
             )
             .await?;
         let rows = data
             .as_array()
             .ok_or_else(|| anyhow!("/bulk_orders did not return an array"))?;
-        let max_sequence = rows
-            .iter()
+        rows.iter()
             .filter_map(|row| {
                 row.get("sequence_number")
                     .and_then(Value::as_u64)
                     .or_else(|| {
                         row.get("sequence_number")
-                            .and_then(Value::as_str)
-                            .and_then(|value| value.parse::<u64>().ok())
+                            .and_then(Value::as_i64)
+                            .map(|value| value as u64)
                     })
             })
             .max()
-            .unwrap_or(0);
-        max_sequence
+            .unwrap_or(0)
             .checked_add(1)
             .ok_or_else(|| anyhow!("bulk sequence number overflow"))
     }
