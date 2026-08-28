@@ -11,6 +11,7 @@ use std::{
 use tokio::sync::mpsc;
 
 use anyhow::{Context, Result};
+use chrono::Utc;
 use clap::{Args as ClapArgs, Parser, Subcommand};
 use crossterm::{
     event::{
@@ -87,7 +88,7 @@ fn price_grid_geometry(grid_area: Rect, price_count: usize, scroll: usize) -> Gr
     let board = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(7),
+            Constraint::Length(8),
             Constraint::Min(6),
             Constraint::Length(8),
         ])
@@ -244,7 +245,17 @@ enum Cmd {
     /// Validate the key locally, then verify it against the selected network.
     CheckKey,
     Preview,
+    /// Read the exchange and report desired-vs-actual grid drift. Never changes orders.
+    Reconcile,
+    /// Print a one-time account and grid snapshot. Never changes orders.
+    Status,
+    /// Verify API access, market rules, a generated plan, balances, and order drift. Never changes orders.
+    Doctor,
+    /// Monitor a grid; with -e it submits a fresh bulk ladder after every successful refresh.
     Run,
+    /// Continuous shadow mode: reconcile every cycle, journal events, but never sign or submit.
+    /// With --cycles N, exit after N successful reconciliation cycles (exit 0).
+    Shadow,
     Tui,
 }
 
@@ -252,11 +263,20 @@ enum Cmd {
 struct Args {
     #[arg(long, global = true, env = "NETWORK", default_value = "testnet")]
     network: String,
-    #[arg(long, global = true, env = "DECIBEL_API_KEY")]
+    #[arg(long, global = true, env = "DECIBEL_API_KEY", hide_env_values = true)]
     decibel_api_key: Option<String>,
     /// Aptos Ed25519 private key. Prefer entering it in the TUI so Ctrl+S encrypts it in the profile.
-    #[arg(long, global = true, env = "APTOS_PRIVATE_KEY")]
+    #[arg(long, global = true, env = "APTOS_PRIVATE_KEY", hide_env_values = true)]
     aptos_private_key: Option<String>,
+    /// Execute the configured grid. Only meaningful with the `run` command.
+    #[arg(short = 'e', long = "execute", global = true, default_value_t = false)]
+    execute: bool,
+    /// Exit Shadow after this many successful reconciliation cycles; Shadow only.
+    #[arg(long, global = true, env = "SHADOW_CYCLES")]
+    shadow_cycles: Option<usize>,
+    /// Required exact acknowledgement for any Mainnet execution: MAINNET.
+    #[arg(long, global = true, env = "CONFIRM_MAINNET")]
+    confirm_mainnet: Option<String>,
     #[arg(long, global = true, env = "GRID_PROFILE", default_value = "default")]
     profile: String,
     #[arg(
@@ -269,7 +289,12 @@ struct Args {
     product: Product,
     #[arg(long, global = true, env = "MARKET", default_value = "BTC/USD")]
     market: String,
-    #[arg(long, global = true, env = "SUBACCOUNT_ADDRESS")]
+    #[arg(
+        long,
+        global = true,
+        env = "SUBACCOUNT_ADDRESS",
+        hide_env_values = true
+    )]
     subaccount: Option<String>,
     #[arg(
         long,
@@ -738,7 +763,11 @@ struct App {
     refresh_success_until: Option<tokio::time::Instant>,
     /// Start time used to animate the in-progress refresh indicator.
     refresh_started_at: Option<tokio::time::Instant>,
+    /// Compact status text for the header. This may be replaced by later refreshes.
     error: Option<String>,
+    /// Immutable full diagnostic of the latest failure. It is never cleared by a successful
+    /// refresh, so the F2 inspector remains useful while the monitor keeps updating.
+    error_report: Option<String>,
     /// Full error inspector, opened with F2 so the compact header never blocks the UI.
     error_dialog: bool,
     snapshot: Option<MonitorSnapshot>,
@@ -755,6 +784,16 @@ struct App {
     grid_geometry: Option<GridGeometry>,
 }
 impl App {
+    /// Preserve the complete anyhow error chain separately from the compact header status.
+    fn set_error(&mut self, error: impl std::fmt::Display) {
+        let message = format!("{error:#}");
+        self.error = Some(message.clone());
+        self.error_report = Some(message);
+        // Open the diagnostic automatically for failures. Esc/F2 closes it; the persistent
+        // error_report means the next F2 can reopen it even after background refreshes.
+        self.error_dialog = true;
+    }
+
     fn new(tab: usize, settings: Settings, profile_name: String) -> Self {
         Self {
             tab,
@@ -778,6 +817,7 @@ impl App {
             refresh_success_until: None,
             refresh_started_at: None,
             error: None,
+            error_report: None,
             error_dialog: false,
             snapshot: None,
             price_highlights: Vec::new(),
@@ -1173,7 +1213,18 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Some(Cmd::CheckKey) => check_api_key(Settings::from(&cli.args)).await,
-        Some(Cmd::Run) => run_cli(Settings::from(&cli.args)).await,
+        Some(Cmd::Reconcile) => reconcile_cli(Settings::from(&cli.args)).await,
+        Some(Cmd::Status) => status_cli(Settings::from(&cli.args)).await,
+        Some(Cmd::Doctor) => doctor_cli(Settings::from(&cli.args)).await,
+        Some(Cmd::Shadow) => shadow_cli(Settings::from(&cli.args), cli.args.shadow_cycles).await,
+        Some(Cmd::Run) => {
+            run_cli(
+                Settings::from(&cli.args),
+                cli.args.execute,
+                cli.args.confirm_mainnet.as_deref(),
+            )
+            .await
+        }
         Some(Cmd::Preview) => {
             run_tui(
                 Settings::from(&cli.args),
@@ -1220,13 +1271,477 @@ async fn check_api_key(settings: Settings) -> Result<()> {
     Ok(())
 }
 
-async fn run_cli(settings: Settings) -> Result<()> {
+/// Fetch and print one monitor snapshot without changing exchange state.
+async fn status_cli(settings: Settings) -> Result<()> {
+    validate_api_key_format(&settings.api_key).context("API key format check failed")?;
     let config = settings.to_grid_config()?;
     let api = settings.api_client()?;
+    let snapshot = fetch_snapshot(&api, &config, optional_subaccount(&settings)).await?;
+    print_snapshot(&snapshot, &config);
+    Ok(())
+}
+
+/// Verify the prerequisites for a safe Testnet/Mainnet run without modifying Decibel state.
+async fn doctor_cli(settings: Settings) -> Result<()> {
+    validate_api_key_format(&settings.api_key).context("API key format check failed")?;
+    if settings.subaccount.trim().is_empty() {
+        anyhow::bail!("doctor requires SUBACCOUNT_ADDRESS")
+    }
+    let config = settings.to_grid_config()?;
+    let api = settings.api_client()?;
+    api.verify_api_key()
+        .await
+        .context("API key verification failed")?;
+    let (snapshot, result) = reconcile_snapshot(&api, &config, &settings.subaccount).await?;
+    println!(
+        "DOCTOR OK — {} {} on {}",
+        snapshot.market.name,
+        match config.product {
+            Product::Spot => "Spot",
+            Product::Perp => "Perp",
+        },
+        settings.network
+    );
+    println!(
+        "  rules: tick={} lot={} min_size={}",
+        snapshot.market.tick_size, snapshot.market.lot_size, snapshot.market.min_size
+    );
+    println!(
+        "  plan: {} bid(s), {} ask(s), quote={}, base={}",
+        snapshot.plan.bids.len(),
+        snapshot.plan.asks.len(),
+        snapshot.plan.quote_required,
+        snapshot.plan.base_required
+    );
+    match config.product {
+        Product::Spot => {
+            let funds = snapshot.account.spot_funds.as_ref().ok_or_else(|| {
+                anyhow::anyhow!("spot PFS balances unavailable in account overview")
+            })?;
+            println!(
+                "  PFS: {} {} available, {} {} available",
+                funds.available_base(),
+                funds.base_symbol,
+                funds.available_quote(),
+                funds.quote_symbol
+            );
+            if funds.available_base() < snapshot.plan.base_required
+                || funds.available_quote() < snapshot.plan.quote_required
+            {
+                println!(
+                    "  note: Spot execution will shrink to the currently available PFS balances."
+                );
+            }
+        }
+        Product::Perp => {
+            let margin = snapshot.account.available_margin.ok_or_else(|| {
+                anyhow::anyhow!("available Perp margin unavailable in account overview")
+            })?;
+            let required = snapshot.plan.estimated_margin.unwrap_or(Decimal::ZERO);
+            println!("  margin: available={} estimated={}", margin, required);
+            if margin < required {
+                anyhow::bail!(
+                    "estimated Perp margin {} exceeds available {}",
+                    required,
+                    margin
+                )
+            }
+        }
+    }
+    println!("  reconciliation: {}", result.summary());
+    if !result.unmanaged.is_empty() {
+        println!("  warning: existing unmanaged orders will block live bulk replacement.");
+    }
+    println!("  result: read-only checks passed; no exchange state changed.");
+    Ok(())
+}
+
+/// Compare the current desired grid with open orders. This is intentionally read-only: any order
+/// not exactly covered by the current plan remains unmanaged until a future client-ID-backed
+/// execution ledger can establish ownership safely.
+async fn reconcile_cli(settings: Settings) -> Result<()> {
+    validate_api_key_format(&settings.api_key).context("API key format check failed")?;
+    if settings.subaccount.trim().is_empty() {
+        anyhow::bail!("reconcile requires SUBACCOUNT_ADDRESS")
+    }
+    let config = settings.to_grid_config()?;
+    let api = settings.api_client()?;
+    let (snapshot, result) = reconcile_snapshot(&api, &config, &settings.subaccount).await?;
+    print_snapshot(&snapshot, &config);
+    println!("RECONCILE-ONLY — {}", result.summary());
+    for order in &result.missing {
+        println!(
+            "  MISSING {} {} @ {}",
+            order.side.as_str(),
+            format_decimal(order.size, 8),
+            format_decimal(order.price, 8)
+        );
+    }
+    for order in &result.unmanaged {
+        println!(
+            "  UNMANAGED {} {} @ {} (order {})",
+            order.side.as_str(),
+            format_decimal(order.remaining_size, 8),
+            format_decimal(order.price, 8),
+            order.order_id
+        );
+    }
+    if result.is_converged() {
+        println!("Grid and exchange snapshot converge; no changes were made.");
+    } else {
+        println!("No changes were made. Unmanaged orders are never cancelled automatically.");
+    }
+    Ok(())
+}
+
+/// Continuous shadow reconciliation: the same loop as `run -e` but never signs or submits.
+/// Every cycle fetches a snapshot, reconciles, journals events, and reports drift — without
+/// sending any Aptos transaction. Use this as a long-lived dry-run monitor that produces a
+/// complete audit trail.
+async fn shadow_cli(settings: Settings, max_cycles: Option<usize>) -> Result<()> {
+    validate_api_key_format(&settings.api_key).context("API key format check failed")?;
+    if settings.subaccount.trim().is_empty() {
+        anyhow::bail!("shadow requires SUBACCOUNT_ADDRESS")
+    }
+    if max_cycles == Some(0) {
+        anyhow::bail!("shadow --cycles must be at least 1")
+    }
+    let config = settings.to_grid_config()?;
+    let api = settings.api_client()?;
+    let run_id = journal::generate_run_id();
+    let journal = journal::Journal::new(&run_id)
+        .context("shadow reconciliation requires a writable run journal")?;
+    let mut metadata = journal::RunMetadata {
+        run_id: run_id.clone(),
+        started_at: Utc::now(),
+        network: settings.network.clone(),
+        subaccount: settings.subaccount.clone(),
+        market: config.market_name.clone(),
+        product: format!("{:?}", config.product).to_lowercase(),
+        config_hash: {
+            use sha3::{Digest, Sha3_256};
+            hex::encode(Sha3_256::digest(format!("{config:?}")))
+        },
+        program_version: env!("CARGO_PKG_VERSION").to_owned(),
+    };
+    metadata.fingerprint_subaccount();
+    let _ = journal.append(&journal::JournalEvent::RunStart(metadata));
+    println!("Shadow reconciliation run {run_id}. No orders will be placed or cancelled.");
+    if config.product == Product::Spot {
+        println!("Spot: only PFS balances will be used. No automatic Cross→PFS transfer.");
+    }
+    let mut remaining_cycles = max_cycles.unwrap_or(usize::MAX);
     loop {
-        let snapshot = fetch_snapshot(&api, &config, optional_subaccount(&settings)).await?;
+        let cycle_start = tokio::time::Instant::now();
+        let snapshot = match fetch_snapshot(&api, &config, optional_subaccount(&settings)).await {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("shadow refresh failed: {e:#}");
+                tokio::time::sleep(config.refresh).await;
+                continue;
+            }
+        };
+        let mut snapshot = snapshot;
+        snapshot.plan = build_plan(&config, &snapshot.market, snapshot.plan.mid)?;
+        if let Some(adjustment) = fit_spot_snapshot_to_pfs(&mut snapshot)? {
+            println!("Spot PFS limited the grid: {adjustment}");
+        }
         print_snapshot(&snapshot, &config);
-        tokio::time::sleep(config.refresh).await;
+        let event = journal::JournalEvent::PlanGenerated {
+            at: Utc::now(),
+            mid: snapshot.plan.mid.normalize().to_string(),
+            bid_levels: snapshot.plan.bids.len(),
+            ask_levels: snapshot.plan.asks.len(),
+            quote_required: snapshot.plan.quote_required.normalize().to_string(),
+            base_required: snapshot.plan.base_required.normalize().to_string(),
+        };
+        journal.append(&event)?;
+        if let Ok(actual) = api
+            .open_orders(&settings.subaccount, &snapshot.market)
+            .await
+        {
+            let desired = decibel_grid_tui::reconcile::desired_orders(
+                &snapshot.plan,
+                snapshot.market.tick_size,
+                snapshot.market.lot_size,
+            );
+            let result = decibel_grid_tui::reconcile::reconcile(
+                &desired,
+                &actual,
+                snapshot.market.tick_size,
+                snapshot.market.lot_size,
+            );
+            println!("SHADOW RECONCILE — {}", result.summary());
+            let event = journal::JournalEvent::ReconciliationResult {
+                at: Utc::now(),
+                matched: result.matched.len(),
+                missing: result.missing.len(),
+                unmanaged: result.unmanaged.clone(),
+                is_converged: result.is_converged(),
+            };
+            journal.append(&event)?;
+            if !result.unmanaged.is_empty() {
+                println!(
+                    "  {} unmanaged order(s) detected. Bulk replacement would be blocked until operator review.",
+                    result.unmanaged.len()
+                );
+            }
+            remaining_cycles = remaining_cycles.saturating_sub(1);
+            if remaining_cycles == 0 {
+                journal.append(&journal::JournalEvent::Shutdown {
+                    at: Utc::now(),
+                    reason: "requested shadow cycle limit reached".to_owned(),
+                })?;
+                println!("Shadow cycle limit reached. No orders were placed or cancelled.");
+                return Ok(());
+            }
+        }
+        let elapsed = cycle_start.elapsed();
+        let wait = config.refresh.saturating_sub(elapsed);
+        tokio::time::sleep(wait).await;
+    }
+}
+
+/// Run the grid from a non-interactive terminal.
+///
+/// Modes:
+/// - default: dry-run monitor (fetch + print, no exchange mutations)
+/// - `-e` / `--execute`: reconciliation-based live execution. Each cycle:
+///   1. Fetch snapshot + open orders
+///   2. Reconcile desired vs actual
+///   3. If any open orders exist (no client-order ID), halt new submissions
+///   4. If market is empty and desired levels exist, submit the **full** desired plan
+///   5. Persist every step to an append-only event journal
+async fn run_cli(settings: Settings, execute: bool, confirm_mainnet: Option<&str>) -> Result<()> {
+    if execute
+        && (settings.api_key.trim().is_empty()
+            || settings.aptos_private_key.trim().is_empty()
+            || settings.subaccount.trim().is_empty())
+    {
+        anyhow::bail!("-e requires DECIBEL_API_KEY, APTOS_PRIVATE_KEY, and SUBACCOUNT_ADDRESS")
+    }
+    if execute
+        && settings.network.eq_ignore_ascii_case("mainnet")
+        && confirm_mainnet != Some("MAINNET")
+    {
+        anyhow::bail!(
+            "Mainnet execution requires --confirm-mainnet MAINNET (or CONFIRM_MAINNET=MAINNET)"
+        )
+    }
+    let config = settings.to_grid_config()?;
+    let api = settings.api_client()?;
+    let run_id = journal::generate_run_id();
+    let journal = if execute {
+        Some(
+            journal::Journal::new(&run_id)
+                .context("live execution requires a writable run journal")?,
+        )
+    } else {
+        journal::Journal::new(&run_id).ok()
+    };
+    let config_hash = {
+        use sha3::{Digest, Sha3_256};
+        hex::encode(Sha3_256::digest(format!("{config:?}")))
+    };
+    let mut metadata = journal::RunMetadata {
+        run_id: run_id.clone(),
+        started_at: Utc::now(),
+        network: settings.network.clone(),
+        subaccount: settings.subaccount.clone(),
+        market: config.market_name.clone(),
+        product: format!("{:?}", config.product).to_lowercase(),
+        config_hash,
+        program_version: env!("CARGO_PKG_VERSION").to_owned(),
+    };
+    metadata.fingerprint_subaccount();
+    let mut run_state = journal::RunState::new(metadata.clone());
+    if let Some(journal) = &journal {
+        journal.append(&journal::JournalEvent::RunStart(metadata))?;
+        journal.save_state(&run_state)?;
+    }
+    println!(
+        "{}",
+        if execute {
+            format!(
+                "Live grid execution, run {run_id}. Full ladder replacement is guarded by reconciliation."
+            )
+        } else {
+            format!("Grid monitor, run {run_id}. Pass -e to submit bulk orders.")
+        }
+    );
+    if config.product == Product::Spot {
+        println!("Spot: only PFS balances will be used. No automatic Cross→PFS transfer.");
+    }
+
+    loop {
+        let cycle_start = tokio::time::Instant::now();
+        let snapshot = match fetch_snapshot(&api, &config, optional_subaccount(&settings)).await {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("grid refresh failed: {e:#}");
+                tokio::time::sleep(config.refresh).await;
+                continue;
+            }
+        };
+        // Rebuild the plan without trade-history markers. Historical fills are a UI hint and
+        // must not suppress a future desired order during reconciliation or execution.
+        let mut snapshot = snapshot;
+        snapshot.plan = build_plan(&config, &snapshot.market, snapshot.plan.mid)?;
+        if let Some(adjustment) = fit_spot_snapshot_to_pfs(&mut snapshot)? {
+            println!("Spot PFS limited the grid: {adjustment}");
+        }
+        print_snapshot(&snapshot, &config);
+        if let Some(journal) = &journal {
+            let event = journal::JournalEvent::PlanGenerated {
+                at: Utc::now(),
+                mid: snapshot.plan.mid.normalize().to_string(),
+                bid_levels: snapshot.plan.bids.len(),
+                ask_levels: snapshot.plan.asks.len(),
+                quote_required: snapshot.plan.quote_required.normalize().to_string(),
+                base_required: snapshot.plan.base_required.normalize().to_string(),
+            };
+            journal.append(&event)?;
+            run_state.apply(&event);
+            journal.save_state(&run_state)?;
+        }
+
+        if execute {
+            // 1. Reconcile desired plan with actual open orders
+            let actual = match api
+                .open_orders(&settings.subaccount, &snapshot.market)
+                .await
+            {
+                Ok(orders) => orders,
+                Err(e) => {
+                    eprintln!("reconciliation failed (open_orders): {e:#}; skipping cycle");
+                    tokio::time::sleep(config.refresh).await;
+                    continue;
+                }
+            };
+            let desired = decibel_grid_tui::reconcile::desired_orders(
+                &snapshot.plan,
+                snapshot.market.tick_size,
+                snapshot.market.lot_size,
+            );
+            let reconcile_result = decibel_grid_tui::reconcile::reconcile(
+                &desired,
+                &actual,
+                snapshot.market.tick_size,
+                snapshot.market.lot_size,
+            );
+
+            println!("RECONCILE CYCLE — {}", reconcile_result.summary());
+            if let Some(journal) = &journal {
+                let event = journal::JournalEvent::ReconciliationResult {
+                    at: Utc::now(),
+                    matched: reconcile_result.matched.len(),
+                    missing: reconcile_result.missing.len(),
+                    unmanaged: reconcile_result.unmanaged.clone(),
+                    is_converged: reconcile_result.is_converged(),
+                };
+                journal.append(&event)?;
+                run_state.apply(&event);
+                journal.save_state(&run_state)?;
+            }
+
+            // 2. Decibel's bulk API does not expose a client-order ID. Even an exact price/size
+            // match cannot prove ownership, so any pre-existing order makes this market
+            // reconcile-only. A bulk submission could otherwise replace a manual order.
+            if !actual.is_empty() {
+                let reason = format!(
+                    "{} existing open order(s); live replacement halted until operator review",
+                    actual.len()
+                );
+                println!("  {reason}");
+                if let Some(journal) = &journal {
+                    let event = journal::JournalEvent::RiskRejected {
+                        at: Utc::now(),
+                        reason,
+                    };
+                    journal.append(&event)?;
+                    run_state.apply(&event);
+                    journal.save_state(&run_state)?;
+                }
+            } else if !reconcile_result.missing.is_empty() {
+                // 3. Submit the FULL desired plan. The Decibel bulk ABI atomically replaces the
+                // entire order ladder for this (subaccount, market) pair — it does not merge.
+
+                let mut exec_plan = snapshot.plan.clone();
+
+                // Spot: shrink to available PFS if needed
+                if snapshot.market.product == Product::Spot
+                    && let Some(funds) = &snapshot.account.spot_funds
+                    && (funds.available_quote() < exec_plan.quote_required
+                        || funds.available_base() < exec_plan.base_required)
+                {
+                    let account = api
+                        .account(Some(&settings.subaccount), &snapshot.market)
+                        .await
+                        .ok();
+                    let fresh_funds = account
+                        .and_then(|a| a.spot_funds)
+                        .unwrap_or_else(|| funds.clone());
+                    if let Ok(adjustment) = decibel_grid_tui::shrink_spot_to_available(
+                        &mut exec_plan,
+                        fresh_funds.available_quote(),
+                        fresh_funds.available_base(),
+                        &snapshot.market,
+                    ) {
+                        println!("Spot PFS limited the grid: {adjustment}");
+                    }
+                }
+
+                if exec_plan.bids.is_empty() && exec_plan.asks.is_empty() {
+                    println!("  No levels can be placed (budget exhausted).");
+                } else {
+                    match execute_bulk_grid(
+                        &settings.network,
+                        &settings.api_key,
+                        &settings.aptos_private_key,
+                        &settings.subaccount,
+                        &snapshot.market,
+                        &exec_plan,
+                    )
+                    .await
+                    {
+                        Ok(execution) => {
+                            println!(
+                                "  FULL ladder replaced: {} bid(s), {} ask(s) in tx {}",
+                                execution.bid_count,
+                                execution.ask_count,
+                                execution.transaction_hash
+                            );
+                            if let Some(journal) = &journal {
+                                let event = journal::JournalEvent::BulkOrderSubmitted {
+                                    at: Utc::now(),
+                                    transaction_hash: execution.transaction_hash,
+                                    bid_count: execution.bid_count,
+                                    ask_count: execution.ask_count,
+                                };
+                                journal.append(&event)?;
+                                run_state.apply(&event);
+                                journal.save_state(&run_state)?;
+                            }
+                        }
+                        Err(error) => {
+                            eprintln!("  bulk order failed: {error:#}");
+                            if let Some(journal) = &journal {
+                                let event = journal::JournalEvent::BulkOrderFailed {
+                                    at: Utc::now(),
+                                    error: format!("{error:#}"),
+                                };
+                                journal.append(&event)?;
+                                run_state.apply(&event);
+                                journal.save_state(&run_state)?;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        let elapsed = cycle_start.elapsed();
+        let wait = config.refresh.saturating_sub(elapsed);
+        tokio::time::sleep(wait).await;
     }
 }
 
@@ -1313,7 +1828,7 @@ async fn tui_loop(
                             }
                             Err(error) => {
                                 app.markets.clear();
-                                app.error = Some(error.to_string());
+                                app.set_error(error);
                             }
                         }
                     }
@@ -1364,9 +1879,11 @@ async fn tui_loop(
                             app.refresh_success_until =
                                 Some(tokio::time::Instant::now() + Duration::from_secs(2));
                             keep_selected_price_visible(&mut app);
+                            // A successful background refresh must not erase the full diagnostic
+                            // from a preceding failed execution; F2 keeps that report available.
                             app.error = None;
                         }
-                        Err(error) => app.error = Some(error.to_string()),
+                        Err(error) => app.set_error(error),
                     }
                 }
                 MarketFetch::Snapshot { .. } => {}
@@ -1378,7 +1895,10 @@ async fn tui_loop(
                     match *result {
                         Ok(execution) => {
                             app.tab = TAB_MONITOR;
-                            app.error = Some(format!(
+                            // A submitted transaction is status, not an error. Keep any previous
+                            // failure report available until a new failure explicitly replaces it.
+                            app.error = None;
+                            app.grid_change_notice = Some(format!(
                                 "Execution submitted: {} bid(s), {} ask(s), tx {}",
                                 execution.bid_count,
                                 execution.ask_count,
@@ -1386,7 +1906,7 @@ async fn tui_loop(
                             ));
                             app.refresh_now = true;
                         }
-                        Err(error) => app.error = Some(error.to_string()),
+                        Err(error) => app.set_error(error),
                     }
                 }
                 MarketFetch::Execution { .. } => {}
@@ -1433,15 +1953,10 @@ async fn tui_loop(
                         });
                     });
                 }
-                Some(_) => {
-                    app.error = Some(
-                        "Execution requires an Aptos private key and subaccount address in Configure."
-                            .to_owned(),
-                    );
-                }
-                None => {
-                    app.error = Some("Load a valid Preview plan before execution.".to_owned());
-                }
+                Some(_) => app.set_error(
+                    "Execution was not started: configure API key, Aptos private key, and subaccount address.",
+                ),
+                None => app.set_error("Execution was not started: load a valid Preview plan first."),
             }
         }
 
@@ -1461,7 +1976,7 @@ async fn tui_loop(
                         let _ = tx.send(MarketFetch::Markets(client.markets(product).await));
                     });
                 }
-                Err(error) => app.error = Some(error.to_string()),
+                Err(error) => app.set_error(error),
             }
         }
         if app.market_picker.is_some() && !app.markets.is_empty() {
@@ -1528,7 +2043,35 @@ async fn tui_loop(
                     let revision = app.settings_revision;
                     let tx = fetch_tx.clone();
                     tokio::spawn(async move {
-                        let result = fetch_snapshot(&api, &config, subaccount.as_deref()).await;
+                        let mut result = fetch_snapshot(&api, &config, subaccount.as_deref()).await;
+                        // Rebuild an executable plan and compute desired-vs-actual drift.
+                        if let Ok(snapshot) = result.as_mut() {
+                            let has_account = snapshot.account.spot_funds.is_some()
+                                || snapshot.account.equity.is_some();
+                            if has_account
+                                && let Some(ref sub) = subaccount
+                                && !sub.trim().is_empty()
+                            {
+                                snapshot.plan =
+                                    build_plan(&config, &snapshot.market, snapshot.plan.mid)
+                                        .unwrap_or_else(|_| snapshot.plan.clone());
+                                let _ = fit_spot_snapshot_to_pfs(snapshot);
+                                if let Ok(actual) = api.open_orders(sub, &snapshot.market).await {
+                                    let desired = decibel_grid_tui::reconcile::desired_orders(
+                                        &snapshot.plan,
+                                        snapshot.market.tick_size,
+                                        snapshot.market.lot_size,
+                                    );
+                                    let rec = decibel_grid_tui::reconcile::reconcile(
+                                        &desired,
+                                        &actual,
+                                        snapshot.market.tick_size,
+                                        snapshot.market.lot_size,
+                                    );
+                                    snapshot.reconciliation = Some(rec);
+                                }
+                            }
+                        }
                         let _ = tx.send(MarketFetch::Snapshot {
                             settings_revision: revision,
                             result: Box::new(result),
@@ -1549,7 +2092,7 @@ async fn tui_loop(
                         continue;
                     }
                     Err(error) => {
-                        app.error = Some(error.to_string());
+                        app.set_error(error);
                     }
                 },
             }
@@ -1693,12 +2236,12 @@ fn handle_event(app: &mut App) -> Result<bool> {
             // F2 already copies and saves the error automatically. Keep these as explicit
             // retries for terminals whose clipboard provider was temporarily unavailable.
             KeyCode::Char('c') | KeyCode::Char('y') => {
-                if let Some(error) = app.error.as_deref() {
+                if let Some(error) = app.error_report.as_deref() {
                     let _ = copy_error_to_clipboard(error);
                 }
             }
             KeyCode::Char('s') => {
-                if let Some(error) = app.error.as_deref() {
+                if let Some(error) = app.error_report.as_deref() {
                     let _ = save_error_report(error);
                 }
             }
@@ -1748,10 +2291,10 @@ fn handle_event(app: &mut App) -> Result<bool> {
             KeyCode::Char('r') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 match app.reset_profile() {
                     Ok(()) => app.error = Some(app.settings.tr(TKey::ProfileReset).to_owned()),
-                    Err(error) => app.error = Some(error.to_string()),
+                    Err(error) => app.set_error(error),
                 }
             }
-            KeyCode::F(2) if app.error.is_some() => {
+            KeyCode::F(2) if app.error_report.is_some() => {
                 app.error_dialog = true;
             }
             KeyCode::Char('q') => return Ok(true),
@@ -1926,7 +2469,7 @@ fn preview_execute_button(content: Rect) -> Rect {
     let summary = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(7),
+            Constraint::Length(8),
             Constraint::Min(6),
             Constraint::Length(8),
         ])
@@ -2048,7 +2591,7 @@ fn render(area: Rect, frame: &mut ratatui::Frame, app: &App, config: Option<&Gri
     }
     // Keep the compact header status visible by default. The full inspector is explicitly opened
     // with F2, and Esc/F2 can then reliably close it without immediately being rendered again.
-    if app.error_dialog && app.error.is_some() {
+    if app.error_dialog && app.error_report.is_some() {
         render_error_dialog(area, frame, app);
     }
 }
@@ -2295,7 +2838,7 @@ fn save_error_report(error: &str) -> Result<PathBuf> {
 }
 
 fn render_error_dialog(area: Rect, frame: &mut ratatui::Frame, app: &App) {
-    let Some(error) = app.error.as_deref() else {
+    let Some(error) = app.error_report.as_deref() else {
         return;
     };
     let popup = centered_rect(90, 70, area);
@@ -2553,7 +3096,7 @@ fn render_grid(area: Rect, frame: &mut ratatui::Frame, app: &App, config: Option
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(7),
+            Constraint::Length(8),
             Constraint::Min(6),
             Constraint::Length(8),
         ])
@@ -2683,6 +3226,44 @@ fn render_grid(area: Rect, frame: &mut ratatui::Frame, app: &App, config: Option
             "尚未收到网格刷新",
         )
     });
+    let reconciliation_line = match snapshot.reconciliation.as_ref() {
+        Some(result) if result.unmanaged.is_empty() => format!(
+            "{}  {} {}  {} {}  {} {}  ·  {}",
+            ui(app.settings.language, "RECONCILE", "对账"),
+            ui(app.settings.language, "Matched", "匹配"),
+            result.matched.len(),
+            ui(app.settings.language, "Missing", "缺失"),
+            result.missing.len(),
+            ui(app.settings.language, "Unmanaged", "未知"),
+            result.unmanaged.len(),
+            ui(
+                app.settings.language,
+                "no existing-order block",
+                "无现存订单阻断",
+            ),
+        ),
+        Some(result) => format!(
+            "{}  {} {}  {} {}  {} {}  ·  {}",
+            ui(app.settings.language, "RECONCILE", "对账"),
+            ui(app.settings.language, "Matched", "匹配"),
+            result.matched.len(),
+            ui(app.settings.language, "Missing", "缺失"),
+            result.missing.len(),
+            ui(app.settings.language, "Unmanaged", "未知"),
+            result.unmanaged.len(),
+            ui(
+                app.settings.language,
+                "BULK BLOCKED: existing orders",
+                "批量下单阻断：存在订单",
+            ),
+        ),
+        None => ui(
+            app.settings.language,
+            "RECONCILE  unavailable (set subaccount)",
+            "对账不可用（请设置子账户）",
+        )
+        .to_owned(),
+    };
     let summary = [
         format!(
             "{} {:?}  {} {}  {} {} – {}",
@@ -2713,6 +3294,7 @@ fn render_grid(area: Rect, frame: &mut ratatui::Frame, app: &App, config: Option
         capital_line,
         exposure_line,
         change_notice.to_owned(),
+        reconciliation_line,
     ]
     .join("\n");
     frame.render_widget(

@@ -422,6 +422,7 @@ dependencies = [
  "iana-time-zone",
  "js-sys",
  "num-traits",
+ "serde",
  "wasm-bindgen",
  "windows-link",
 ]
@@ -732,6 +733,7 @@ dependencies = [
  "rustls",
  "serde",
  "serde_json",
+ "sha3",
  "tokio",
  "tokio-tungstenite",
 ]

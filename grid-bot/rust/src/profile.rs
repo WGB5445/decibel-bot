@@ -20,6 +20,86 @@ use crate::i18n::Language;
 
 pub const DEFAULT_PROFILE: &str = "default";
 
+/// A locally recorded POST_ONLY order created solely to acquire Spot base before a grid starts.
+/// This is deliberately separate from a user profile: it lets a future process identify *only*
+/// this bot's prior funding order without touching manually created orders.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct FundingOrderRecord {
+    pub network: String,
+    pub subaccount: String,
+    pub market: String,
+    pub price: String,
+    pub quantity: String,
+    pub order_id: Option<String>,
+    pub transaction_hash: String,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct FundingOrderStore {
+    pub orders: Vec<FundingOrderRecord>,
+}
+
+impl FundingOrderStore {
+    pub fn path() -> Result<PathBuf> {
+        let base = dirs::data_local_dir()
+            .or_else(dirs::data_dir)
+            .ok_or_else(|| anyhow!("could not determine the local data directory"))?;
+        Ok(base.join("decibel-grid").join("spot-funding-orders.json"))
+    }
+
+    pub fn load() -> Result<Self> {
+        let path = Self::path()?;
+        if !path.exists() {
+            return Ok(Self::default());
+        }
+        let raw = fs::read_to_string(&path)
+            .with_context(|| format!("could not read {}", path.display()))?;
+        Ok(serde_json::from_str(&raw).unwrap_or_default())
+    }
+
+    pub fn save(&self) -> Result<()> {
+        let path = Self::path()?;
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)
+                .with_context(|| format!("could not create {}", parent.display()))?;
+        }
+        let body = serde_json::to_string_pretty(self)?;
+        write_private(&path, body.as_bytes())
+            .with_context(|| format!("could not write {}", path.display()))
+    }
+
+    pub fn matching(
+        &self,
+        network: &str,
+        subaccount: &str,
+        market: &str,
+    ) -> Option<&FundingOrderRecord> {
+        self.orders.iter().find(|order| {
+            order.network.eq_ignore_ascii_case(network)
+                && order.subaccount.eq_ignore_ascii_case(subaccount)
+                && order.market.eq_ignore_ascii_case(market)
+        })
+    }
+
+    pub fn replace(&mut self, record: FundingOrderRecord) {
+        self.orders.retain(|order| {
+            !(order.network.eq_ignore_ascii_case(&record.network)
+                && order.subaccount.eq_ignore_ascii_case(&record.subaccount)
+                && order.market.eq_ignore_ascii_case(&record.market))
+        });
+        self.orders.push(record);
+    }
+
+    pub fn remove(&mut self, network: &str, subaccount: &str, market: &str) {
+        self.orders.retain(|order| {
+            !(order.network.eq_ignore_ascii_case(network)
+                && order.subaccount.eq_ignore_ascii_case(subaccount)
+                && order.market.eq_ignore_ascii_case(market))
+        });
+    }
+}
+
 /// Everything the TUI remembers between runs. Values are stored as strings so a profile written
 /// by a newer build cannot panic an older one on a changed numeric type.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]

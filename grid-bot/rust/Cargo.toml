@@ -12,7 +12,7 @@ arboard = "3.4"
 argon2 = "0.5"
 base64 = "0.22"
 chacha20poly1305 = "0.10"
-chrono = { version = "0.4", features = ["clock"] }
+chrono = { version = "0.4", features = ["clock", "serde"] }
 clap = { version = "4.5", features = ["derive", "env"] }
 crossterm = "0.28"
 dirs = "5"
@@ -21,6 +21,7 @@ futures-util = "0.3"
 hex = "0.4"
 rand = "0.8"
 ratatui = "0.29"
+sha3 = "0.10"
 # Match the reqwest major version aptos-sdk already pulls in. Keeping a second reqwest 0.12 here
 # would also drag in a second rustls provider (ring), which is what made rustls refuse to choose.
 reqwest = { version = "0.13", default-features = false, features = [

@@ -1,28 +1,107 @@
-# Decibel Rust Grid Monitor / TUI
+# Decibel Grid Bot — Rust TUI + CLI
 
-Rust 版本的 Decibel 网格规划与实时监控工具，位于：
+网格策略规划、监控与安全的 reconciliation-based 执行工具。支持 Decibel testnet 和 mainnet 的 **Spot**（仅 PFS 余额）和 **Perp**（中性/多头/空头模式）。
 
 ```text
 grid-bot/rust
 ```
 
-它提供智能启动方式：
+详细的 Testnet 验证、Shadow、Live 前检查、Mainnet 推进和故障处理请见：[运行与验证手册](运行与验证手册.md)。
 
-1. **无网格参数直接启动**：进入 TUI 的配置/操作仪表盘，在界面中选择利润预览或实时监控；
-2. **带完整网格参数直接启动**：自动进入 TUI 实时监控；
-3. **`preview` 子命令**：直接进入 TUI 的利润预览页；
-4. **`run` 子命令**：不进入 TUI，持续向 stdout 输出实时网格状态；
-5. **`tui` 子命令**：无论参数是否完整，都强制打开 TUI 配置仪表盘。
+## 安全设计
 
-> ## 当前版本的执行范围
->
-> Rust TUI 支持 **Preview → Execute Plan → Monitor** 流程。Preview 页面展示当前计划，按 `E` 或点击右上角 `EXECUTE PLAN` 后，会使用 Aptos Ed25519 私钥把当前 Perp 网格作为**一笔 bulk order 交易**签名、提交并等待确认；成功后自动进入 Monitor。
->
-> Monitor 只跟踪已提交订单、行情、账户和成交，不会在每次刷新时自动撤单重挂。当前执行需要 Aptos 私钥、Trading Account（Subaccount）地址和足够的 APT gas。Spot / Perp 使用官方对应的 `place_*_order_to_subaccount` ABI。
->
-> `run` 子命令仍是监控/规划输出，不执行交易。真实执行只从 TUI Preview 页面触发。请先在 testnet 验证，再考虑 mainnet。
->
-> Python 版本仍可用于需要 bulk-order 自动替换的网格策略:`../python`。
+- Spot 执行只使用 Subaccount 的 **PFS**（`spot.positions`）余额；不进行 Cross→PFS 划转、不自动补币、不等待 POST_ONLY 成交。
+- 每次执行前先 **reconcile**(对比期望网格与交易所实际订单)。由于 bulk API 没有 client-order-id，只要市场已存在任何订单，CLI Live 模式就不会提交 bulk replacement。
+- 主网执行需要 `--confirm-mainnet MAINNET` 显式确认。
+- 每个 Live/Shadow 运行写入 append-only event journal(JSON Lines)，默认状态记录在 `~/.local/share/decibel-grid/runs/<run_id>/`；受限容器可设 `DECIBEL_GRID_DATA_DIR` 覆盖根目录。
+- journal 不保存原始子账户地址，仅保存不可逆 SHA3-256 指纹。
+
+## CLI 命令
+
+| 命令 | 行为 |
+|------|------|
+| `check-key` | 验证 API key 格式 + 远程连通性 |
+| `status` | 一次快照（市场、计划、账户、成交） |
+| `reconcile` | 一次 reconcile（快照 + 期望 vs 实际订单对比） |
+| `doctor` | 完整前置检查：API key、市场规则、计划、余额、reconciliation |
+| `run` | 持续循环：fetch → 打印快照；（加 `-e` 后 reconcile → 仅在安全时替换整个 ladder） |
+| `shadow` | 持续 fetch + PFS 适配 + reconcile + journal；绝不签名、提交、取消或转账 |
+| `tui` | TUI 配置与监控 |
+| `preview` | 直接进入 TUI Preview 标签 |
+
+所有 read-only 命令都不修改交易所状态。
+
+## 启动方式
+
+```bash
+# 无参数 → TUI 配置
+cargo run --
+
+# 完整的网格参数 → TUI 监控
+cargo run -- --product spot --market APT/USDC --subaccount 0x... \
+  --range-percent 5 --grid-count 40 --total-budget 1000
+
+# CLI 持续监控
+cargo run -- run --product spot --market APT/USDC ...
+
+# CLI 执行（主网需额外确认）
+cargo run -- run -e --product perp --market BTC/USD \
+  --subaccount 0x... \
+  --aptos-private-key 0x... \
+  -e
+# 主网:
+cargo run -- run -e --network mainnet --confirm-mainnet MAINNET \
+  --product spot --market APT/USDC ...
+
+# 前置检查
+cargo run -- doctor --product spot --market APT/USDC --subaccount 0x...
+
+# 只读 reconcile
+cargo run -- reconcile --product perp --market BTC/USD --subaccount 0x...
+
+# 持续 shadow reconciliation（不签名、不下单、不转账）
+cargo run -- shadow --product spot --market APT/USDC --subaccount 0x... \
+  --range-percent 5 --grid-count 20 --total-budget 500 --refresh-seconds 3
+
+# 有界 Shadow：成功完成 N 次 reconciliation 后正常退出（适合 CI/Testnet 验证）
+cargo run -- shadow --product perp --market BTC/USD --subaccount 0x... \
+  --range-percent 5 --grid-count 20 --total-budget 500 --shadow-cycles 2
+
+# 自定义 journal 存储目录（容器、受限环境等）
+# DECIBEL_GRID_DATA_DIR=/path/to/writable cargo run -- shadow ...
+
+```
+
+## 执行流程（`run -e`）
+
+```
+循环:
+  1. 读取市场规则、价格、账户余额、未完成订单
+  2. Spot 时按 PFS 余额缩小网格（自动保留最靠近 mid 的可负担档位）
+  3. 打印快照 + 写入 event journal
+  4. Reconcile（期望档位 vs 实际挂单）
+  5. 若市场已存在任何订单 → 记录 RiskRejected 事件,跳过本轮（无法证明订单归属）
+  6. 仅在市场为空且有缺失档位时 → 提交完整 bulk 替换,记录 BulkOrderSubmitted/Failed 事件
+  7. 等待 refresh_interval
+```
+
+## 研究参考
+
+项目受以下工具设计启发，源码已下载至 `.atlas/research/`：
+
+| 工具 | 特性 |
+|------|------|
+| Hummingbot V2 | Controller/Executor 分离、网格状态机、event-driven order lifecycle |
+| Passivbot | Perp 网格风控（分仓敞口、realized-loss gate、reconcile-first 重启） |
+| Freqtrade | 配置优先级与 JSON Schema、telegram/webhook 通知、回测 |
+| OctoBot | 多交易所网格模式、paper trading 与 backtesting |
+
+### 对本项目的关键影响
+
+- Exchange 订单是事实来源；本地 journal 是审计和 intent 归属来源
+- 没有 client-order-id 时，不自动认定与期望价格/数量相同的订单是自家订单
+- 启动先进入 reconcile-only；未管理订单拒绝自动取消
+- 纯函数 planning/risk core 被 preview、reconcile、execute 共享
 
 ## 功能
 
