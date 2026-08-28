@@ -18,6 +18,20 @@ pub struct DesiredOrder {
     pub size: Decimal,
 }
 
+/// Where a resting order came from, which determines whether it may be replaced automatically.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+pub enum OrderOrigin {
+    /// An individually placed order. Decibel exposes no client-order ID for these, so ownership
+    /// cannot be proven and an automatic bulk replacement must not silently remove it.
+    #[default]
+    Standalone,
+    /// A level of this (subaccount, market)'s active bulk ladder. The bulk ABI atomically
+    /// replaces the entire ladder, and only one ladder can exist per subaccount and market, so
+    /// submitting a new bulk order necessarily supersedes these levels. They therefore never
+    /// block replacement.
+    Bulk,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct ActualOrder {
     pub order_id: String,
@@ -26,6 +40,20 @@ pub struct ActualOrder {
     /// The currently resting quantity. An absent/zero remaining quantity must not match a new
     /// desired level because a partial or terminal order cannot safely be treated as full cover.
     pub remaining_size: Decimal,
+    /// Defaulted so journals written before this field existed still deserialize, conservatively,
+    /// as `Standalone`.
+    #[serde(default)]
+    pub origin: OrderOrigin,
+}
+
+/// Orders that must block an automatic bulk replacement: everything whose ownership cannot be
+/// established. Levels of the account's own bulk ladder are excluded because a new bulk
+/// submission replaces them atomically by design.
+pub fn blocking_orders(orders: &[ActualOrder]) -> Vec<&ActualOrder> {
+    orders
+        .iter()
+        .filter(|order| order.origin == OrderOrigin::Standalone)
+        .collect()
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -124,7 +152,7 @@ pub fn reconcile(
 mod tests {
     use rust_decimal_macros::dec;
 
-    use super::{ActualOrder, DesiredOrder, reconcile};
+    use super::{ActualOrder, DesiredOrder, OrderOrigin, reconcile};
     use crate::Side;
 
     fn desired(
@@ -146,6 +174,19 @@ mod tests {
             side,
             price,
             remaining_size: size,
+            origin: OrderOrigin::Standalone,
+        }
+    }
+
+    fn bulk_level(
+        id: &str,
+        side: Side,
+        price: rust_decimal::Decimal,
+        size: rust_decimal::Decimal,
+    ) -> ActualOrder {
+        ActualOrder {
+            origin: OrderOrigin::Bulk,
+            ..actual(id, side, price, size)
         }
     }
 
@@ -164,6 +205,17 @@ mod tests {
 
         assert!(result.is_converged());
         assert_eq!(result.matched.len(), 2);
+    }
+
+    #[test]
+    fn bulk_levels_do_not_block_replacement() {
+        let orders = vec![
+            bulk_level("bulk:1:Ask:0", Side::Ask, dec!(101), dec!(10)),
+            actual("manual", Side::Bid, dec!(99), dec!(10)),
+        ];
+        let blocking = super::blocking_orders(&orders);
+        assert_eq!(blocking.len(), 1);
+        assert_eq!(blocking[0].order_id, "manual");
     }
 
     #[test]

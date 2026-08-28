@@ -1349,8 +1349,17 @@ async fn doctor_cli(settings: Settings) -> Result<()> {
         }
     }
     println!("  reconciliation: {}", result.summary());
-    if !result.unmanaged.is_empty() {
-        println!("  warning: existing unmanaged orders will block live bulk replacement.");
+    let blocking = decibel_grid_tui::reconcile::blocking_orders(&result.unmanaged);
+    if !blocking.is_empty() {
+        println!(
+            "  warning: {} standalone order(s) of unprovable ownership will block live bulk replacement.",
+            blocking.len()
+        );
+    } else if !result.unmanaged.is_empty() {
+        println!(
+            "  note: {} unmanaged level(s) belong to this account's bulk ladder; a new bulk submission replaces them atomically.",
+            result.unmanaged.len()
+        );
     }
     println!("  result: read-only checks passed; no exchange state changed.");
     Ok(())
@@ -1480,9 +1489,15 @@ async fn shadow_cli(settings: Settings, max_cycles: Option<usize>) -> Result<()>
                 is_converged: result.is_converged(),
             };
             journal.append(&event)?;
-            if !result.unmanaged.is_empty() {
+            let blocking = decibel_grid_tui::reconcile::blocking_orders(&result.unmanaged);
+            if !blocking.is_empty() {
                 println!(
-                    "  {} unmanaged order(s) detected. Bulk replacement would be blocked until operator review.",
+                    "  {} standalone order(s) of unprovable ownership detected. Bulk replacement would be blocked until operator review.",
+                    blocking.len()
+                );
+            } else if !result.unmanaged.is_empty() {
+                println!(
+                    "  {} unmanaged level(s) belong to this account's bulk ladder; a new bulk submission would replace them atomically.",
                     result.unmanaged.len()
                 );
             }
@@ -1644,13 +1659,16 @@ async fn run_cli(settings: Settings, execute: bool, confirm_mainnet: Option<&str
                 journal.save_state(&run_state)?;
             }
 
-            // 2. Decibel's bulk API does not expose a client-order ID. Even an exact price/size
-            // match cannot prove ownership, so any pre-existing order makes this market
-            // reconcile-only. A bulk submission could otherwise replace a manual order.
-            if !actual.is_empty() {
+            // 2. Standalone orders carry no client-order ID, so ownership cannot be proven and a
+            // bulk submission could silently remove a manual order — those still halt execution.
+            // Levels of this (subaccount, market)'s own bulk ladder are different: only one bulk
+            // ladder can exist per pair and a new submission replaces it atomically by design, so
+            // they must not block the very replacement that supersedes them.
+            let blocking = decibel_grid_tui::reconcile::blocking_orders(&actual);
+            if !blocking.is_empty() {
                 let reason = format!(
-                    "{} existing open order(s); live replacement halted until operator review",
-                    actual.len()
+                    "{} standalone open order(s) of unprovable ownership; live replacement halted until operator review",
+                    blocking.len()
                 );
                 println!("  {reason}");
                 if let Some(journal) = &journal {

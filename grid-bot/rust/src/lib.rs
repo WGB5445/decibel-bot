@@ -2035,6 +2035,7 @@ fn append_bulk_levels(
                 .ok_or_else(|| anyhow!("/bulk_orders {prices_key}[{index}] has no price"))?,
             remaining_size: decimal_value(size)
                 .ok_or_else(|| anyhow!("/bulk_orders {sizes_key}[{index}] has no size"))?,
+            origin: reconcile::OrderOrigin::Bulk,
         });
     }
     Ok(())
@@ -2061,6 +2062,8 @@ fn parse_open_order(value: &Value) -> Result<reconcile::ActualOrder> {
         remaining_size: decimal_field(value, "remaining_size")
             .or_else(|| decimal_field(value, "orig_size"))
             .ok_or_else(|| anyhow!("open order is missing remaining_size"))?,
+        // Individually placed orders carry no client-order ID, so ownership cannot be proven.
+        origin: reconcile::OrderOrigin::Standalone,
     })
 }
 
