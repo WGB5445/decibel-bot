@@ -1137,6 +1137,12 @@ pub fn shrink_spot_to_available(
     }
     plan.bids.retain(|level| level.size >= market.min_size);
     plan.asks.retain(|level| level.size >= market.min_size);
+    // `prices()` and the Move bulk ABI require bids highest-to-lowest (nearest mid first),
+    // while the affordability pass above sorts bids low-to-high to keep the closest levels.
+    // Restore the ABI order after shrinking; otherwise level 1 fails on-chain with
+    // "bulk Bid prices are not strictly ordered".
+    plan.bids
+        .sort_by_key(|level| std::cmp::Reverse(level.price));
     let bid_notional: Decimal = plan.bids.iter().map(|l| l.notional).sum();
     let ask_quantity: Decimal = plan.asks.iter().map(|l| l.size).sum();
     plan.quote_required = bid_notional * fee_multiplier;
@@ -2559,6 +2565,73 @@ mod tests {
         assert_eq!(plan.asks.len(), 2);
         assert!(plan.asks.iter().all(|level| level.size >= market.min_size));
         assert!(plan.base_required <= dec!(21.048783));
+    }
+
+    #[test]
+    fn shrink_spot_restores_descending_bid_order_for_the_bulk_abi() {
+        // Regression: the affordability pass sorts bids ascending to keep the levels nearest mid.
+        // If that order leaks out, the Move bulk ABI rejects the transaction at level 1 with
+        // "bulk Bid prices are not strictly ordered". Bids must come back highest-price-first,
+        // and asks must stay lowest-price-first.
+        let market = Market {
+            address: "0x1".to_owned(),
+            name: "APT/USDC".to_owned(),
+            tick_size: dec!(0.0001),
+            lot_size: dec!(0.01),
+            min_size: dec!(10),
+            px_decimals: 4,
+            sz_decimals: 2,
+            product: Product::Spot,
+            base_asset_addr: None,
+            quote_asset_addr: None,
+            base_symbol: Some("APT".to_owned()),
+            quote_symbol: Some("USDC".to_owned()),
+        };
+        let level = |side, price: Decimal| GridLevel {
+            side,
+            price,
+            size: dec!(24.5),
+            notional: price * dec!(24.5),
+            state: LevelState::Planned,
+        };
+        let mut plan = GridPlan {
+            mid: dec!(0.5377),
+            lower: dec!(0.4839),
+            upper: dec!(0.5915),
+            // Built by `prices()` in ABI order: descending for bids.
+            bids: vec![
+                level(Side::Bid, dec!(0.5363)),
+                level(Side::Bid, dec!(0.5350)),
+                level(Side::Bid, dec!(0.5336)),
+                level(Side::Bid, dec!(0.5323)),
+            ],
+            asks: vec![
+                level(Side::Ask, dec!(0.5390)),
+                level(Side::Ask, dec!(0.5404)),
+            ],
+            quote_required: dec!(52.5),
+            base_required: dec!(49),
+            estimated_margin: None,
+        };
+
+        shrink_spot_to_available(&mut plan, dec!(60), dec!(25), &market).unwrap();
+
+        assert!(plan.bids.len() >= 2, "expected surviving bid levels");
+        assert!(
+            plan.bids.windows(2).all(|pair| pair[0].price > pair[1].price),
+            "bids must be strictly descending for the bulk ABI, got {:?}",
+            plan.bids.iter().map(|l| l.price).collect::<Vec<_>>()
+        );
+        assert!(
+            plan.asks.windows(2).all(|pair| pair[0].price < pair[1].price),
+            "asks must be strictly ascending for the bulk ABI"
+        );
+
+        // The real failure was only caught on-chain, so assert the pre-signing validator agrees.
+        let bids: Vec<&GridLevel> = plan.bids.iter().collect();
+        let asks: Vec<&GridLevel> = plan.asks.iter().collect();
+        prepare_bulk_order_parameters(1, &bids, &asks, &market)
+            .expect("shrunk plan must satisfy the bulk ABI ordering invariants");
     }
 
     #[test]
