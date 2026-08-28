@@ -1790,13 +1790,55 @@ impl DecibelClient {
                 rows.len()
             )
         }
-        rows.iter()
+        let mut orders: Vec<reconcile::ActualOrder> = rows
+            .iter()
             .filter(|order| {
                 normalized_address(value_str(order, "market").unwrap_or_default())
                     == normalized_address(&market.address)
             })
             .map(parse_open_order)
-            .collect()
+            .collect::<Result<_>>()?;
+
+        // The REST open_orders endpoint does not expose orders created by the bulk ABI. The
+        // bulk-orders endpoint does expose the currently active ladder, so include its levels as
+        // synthetic ActualOrder values. This is deliberately conservative: merely seeing a bulk
+        // ladder makes the caller treat the market as occupied and refuse an automatic replacement
+        // unless ownership/replacement has been explicitly reviewed.
+        let bulk_data = self
+            .get(
+                "bulk_orders",
+                &[
+                    ("account", subaccount.to_owned()),
+                    ("market", market.address.clone()),
+                    ("asset_type", asset_type.to_owned()),
+                ],
+            )
+            .await?;
+        let bulk_rows = bulk_data
+            .as_array()
+            .ok_or_else(|| anyhow!("/bulk_orders did not return an array"))?;
+        if let Some(latest) = bulk_rows.iter().max_by_key(|row| {
+            integer_field(row, "sequence_number").unwrap_or_default()
+        }) {
+            let sequence = integer_field(latest, "sequence_number").unwrap_or_default();
+            append_bulk_levels(
+                &mut orders,
+                latest,
+                "bid_prices",
+                "bid_sizes",
+                Side::Bid,
+                sequence,
+            )?;
+            append_bulk_levels(
+                &mut orders,
+                latest,
+                "ask_prices",
+                "ask_sizes",
+                Side::Ask,
+                sequence,
+            )?;
+        }
+        Ok(orders)
     }
 
     /// The amount of actual USDC collateral that Decibel permits moving from Cross/CBS into PFS.
@@ -1957,6 +1999,45 @@ pub async fn fetch_snapshot(
         trades,
         status: "LIVE DATA — EXECUTION PLAN MONITOR".to_owned(),
     })
+}
+
+/// Convert active levels from a bulk-orders row into synthetic open orders for reconciliation.
+/// Bulk orders do not have individual order IDs in the REST open_orders response, so the synthetic
+/// ID is only an observation key; it must never be used to cancel a single order.
+fn append_bulk_levels(
+    orders: &mut Vec<reconcile::ActualOrder>,
+    row: &Value,
+    prices_key: &str,
+    sizes_key: &str,
+    side: Side,
+    sequence: i64,
+) -> Result<()> {
+    let prices = row
+        .get(prices_key)
+        .and_then(Value::as_array)
+        .ok_or_else(|| anyhow!("/bulk_orders row has no {prices_key} array"))?;
+    let sizes = row
+        .get(sizes_key)
+        .and_then(Value::as_array)
+        .ok_or_else(|| anyhow!("/bulk_orders row has no {sizes_key} array"))?;
+    if prices.len() != sizes.len() {
+        bail!(
+            "/bulk_orders {prices_key}/{sizes_key} length mismatch: {} prices, {} sizes",
+            prices.len(),
+            sizes.len()
+        )
+    }
+    for (index, (price, size)) in prices.iter().zip(sizes).enumerate() {
+        orders.push(reconcile::ActualOrder {
+            order_id: format!("bulk:{sequence}:{side:?}:{index}"),
+            side,
+            price: decimal_value(price)
+                .ok_or_else(|| anyhow!("/bulk_orders {prices_key}[{index}] has no price"))?,
+            remaining_size: decimal_value(size)
+                .ok_or_else(|| anyhow!("/bulk_orders {sizes_key}[{index}] has no size"))?,
+        });
+    }
+    Ok(())
 }
 
 /// Convert the documented open-order shape into the venue-neutral reconciliation shape.
@@ -2227,6 +2308,44 @@ pub fn format_decimal(value: Decimal, scale: u32) -> String {
 mod tests {
     use super::*;
     use rust_decimal_macros::dec;
+
+    #[test]
+    fn bulk_levels_are_visible_to_reconciliation() {
+        let row = serde_json::json!({
+            "sequence_number": 427,
+            "bid_prices": [0.55],
+            "bid_sizes": [10.0],
+            "ask_prices": [0.56, 0.57],
+            "ask_sizes": [10.0, 5.0]
+        });
+        let mut orders = Vec::new();
+        append_bulk_levels(&mut orders, &row, "bid_prices", "bid_sizes", Side::Bid, 427)
+            .expect("bulk bids");
+        append_bulk_levels(&mut orders, &row, "ask_prices", "ask_sizes", Side::Ask, 427)
+            .expect("bulk asks");
+        assert_eq!(orders.len(), 3);
+        assert_eq!(orders[0].order_id, "bulk:427:Bid:0");
+        assert_eq!(orders[1].side, Side::Ask);
+        assert_eq!(orders[2].remaining_size, dec!(5));
+    }
+
+    #[test]
+    fn bulk_levels_reject_mismatched_price_and_size_arrays() {
+        let row = serde_json::json!({
+            "bid_prices": [0.55],
+            "bid_sizes": []
+        });
+        let error = append_bulk_levels(
+            &mut Vec::new(),
+            &row,
+            "bid_prices",
+            "bid_sizes",
+            Side::Bid,
+            1,
+        )
+        .expect_err("mismatched bulk arrays must fail");
+        assert!(error.to_string().contains("length mismatch"));
+    }
 
     fn market() -> Market {
         Market {
