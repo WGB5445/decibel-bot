@@ -178,15 +178,42 @@ pub struct SpotFunds {
     pub quote_balance: Decimal,
     pub base_reserved: Decimal,
     pub quote_reserved: Decimal,
+    /// Withdrawable USDC held in the Cross/collateral account rather than in the spot PFS.
+    ///
+    /// Observed behaviour on testnet: spot sell proceeds settle here, not into `spot.positions`,
+    /// so a spot grid funded only from PFS quote can sell its base inventory down and never
+    /// recycle the proceeds into bids. Whether the spot bulk entry function may *spend* this
+    /// balance directly is NOT established by any read-only endpoint — it depends on the Move
+    /// module's funding source. Treat it as diagnostic until proven by an on-chain trial.
+    pub quote_cross_balance: Decimal,
 }
 
 impl SpotFunds {
+    /// `base_balance`/`quote_balance` come from `spot.positions`, and the account overview's own
+    /// arithmetic proves that figure is already net of `in_flight_orders` reservations:
+    /// `spot.total_usd` equals the sum of `positions[].usd_value` PLUS `reserved_usd_value`, so a
+    /// reserved amount is not double-present in `positions.amount`. Subtracting `base_reserved`/
+    /// `quote_reserved` again here would double-count it and can zero out a real balance (see
+    /// `in_flight_reservation_is_classified_by_asset_address_from_positions`, verified against a
+    /// live account: 8.078783 APT free + 70 APT reserved were both real, but the old formula
+    /// reported 0 available). `base_reserved`/`quote_reserved` are kept on the struct for display
+    /// and future verification, not for this calculation.
     pub fn available_base(&self) -> Decimal {
-        (self.base_balance - self.base_reserved).max(Decimal::ZERO)
+        self.base_balance.max(Decimal::ZERO)
     }
 
+    /// Quote available to the Spot grid.
+    ///
+    /// Decibel settles Spot sell proceeds into the Cross/collateral USDC balance rather than
+    /// into `spot.positions`, so a PFS-only figure reports zero quote on an account that has
+    /// been selling and produces a sell-only ladder that never recycles proceeds into bids.
+    ///
+    /// The two figures are combined with `max`, not `+`: it is not established whether they are
+    /// separate pools or the same balance reported twice. Taking the larger cannot invent quote
+    /// that does not exist; summing could. See `available_base` for why reservations are not
+    /// subtracted again here.
     pub fn available_quote(&self) -> Decimal {
-        (self.quote_balance - self.quote_reserved).max(Decimal::ZERO)
+        self.quote_balance.max(self.quote_cross_balance).max(Decimal::ZERO)
     }
 }
 
@@ -2046,10 +2073,34 @@ fn parse_spot_funds(overview: &Value, market: &Market) -> Option<SpotFunds> {
             .sum()
     };
     let base_balance: Decimal = position_amount(&base_symbol, market.base_asset_addr.as_ref());
-    // Spot bulk order funding is PFS-only. `usdc_cross_withdrawable_balance` is not usable
-    // directly — it would first require a `transfer_assets_between_non_collateral_and_collateral`
-    // call to move it into PFS. Only read the PFS positions for the quote side.
+    // The market metadata may omit asset addresses, while in-flight reservations identify assets
+    // by address. Recover the addresses from the corresponding Spot positions before classifying
+    // reservations; otherwise an APT reservation is incorrectly counted as USDC.
+    let position_asset_address = |symbol: &str| {
+        positions.iter().find_map(|row| {
+            row.get("asset_symbol")
+                .and_then(Value::as_str)
+                .filter(|actual| actual.eq_ignore_ascii_case(symbol))
+                .and_then(|_| row.get("asset_addr"))
+                .and_then(Value::as_str)
+        })
+    };
+    let base_asset_address = market
+        .base_asset_addr
+        .as_deref()
+        .or_else(|| position_asset_address(&base_symbol));
+    let quote_asset_address = market
+        .quote_asset_addr
+        .as_deref()
+        .or_else(|| position_asset_address(&quote_symbol));
+    // PFS quote position. Kept separate from the Cross balance below: which of the two the spot
+    // bulk entry function can actually spend is not observable from any read-only endpoint.
     let quote_balance: Decimal = position_amount(&quote_symbol, market.quote_asset_addr.as_ref());
+    // Observed on testnet: spot sell proceeds settle into the Cross/collateral USDC balance
+    // rather than into `spot.positions`. Recorded for diagnostics and for the opt-in funding
+    // policy; never silently folded into the PFS figure.
+    let quote_cross_balance =
+        decimal_field(overview, "usdc_cross_withdrawable_balance").unwrap_or(Decimal::ZERO);
     let (base_reserved, quote_reserved) = spot
         .get("in_flight_orders")
         .and_then(Value::as_array)
@@ -2062,13 +2113,18 @@ fn parse_spot_funds(overview: &Value, market: &Market) -> Option<SpotFunds> {
                         .get("reserved_asset")
                         .and_then(Value::as_str)
                         .unwrap_or_default();
-                    let is_base = market.base_asset_addr.as_ref().is_some_and(|expected| {
-                        normalized_address(asset) == normalized_address(expected)
-                    }) || asset.eq_ignore_ascii_case(&base_symbol);
+                    let is_base = base_asset_address
+                        .is_some_and(|expected| normalized_address(asset) == normalized_address(expected))
+                        || asset.eq_ignore_ascii_case(&base_symbol);
+                    let is_quote = quote_asset_address
+                        .is_some_and(|expected| normalized_address(asset) == normalized_address(expected))
+                        || asset.eq_ignore_ascii_case(&quote_symbol);
                     if is_base {
                         (base + amount, quote)
-                    } else {
+                    } else if is_quote {
                         (base, quote + amount)
+                    } else {
+                        (base, quote)
                     }
                 })
         })
@@ -2080,6 +2136,7 @@ fn parse_spot_funds(overview: &Value, market: &Market) -> Option<SpotFunds> {
         quote_balance,
         base_reserved,
         quote_reserved,
+        quote_cross_balance,
     })
 }
 
@@ -2203,7 +2260,11 @@ mod tests {
     }
 
     #[test]
-    fn spot_funds_exclude_in_flight_reservations() {
+    fn spot_funds_keep_positions_net_of_in_flight_reservations() {
+        // `base_balance`/`quote_balance` come from `spot.positions`, which the account overview's
+        // own arithmetic (`total_usd` = positions + reserved) proves is already net of
+        // `in_flight_orders`. Available must equal the position balance as-is, not balance minus
+        // reserved again — see `available_base`/`available_quote` doc comments for the proof.
         let funds = SpotFunds {
             base_symbol: "BTC".to_owned(),
             quote_symbol: "USDC".to_owned(),
@@ -2211,9 +2272,10 @@ mod tests {
             quote_balance: dec!(1000),
             base_reserved: dec!(0.2),
             quote_reserved: dec!(400),
+            quote_cross_balance: Decimal::ZERO,
         };
-        assert_eq!(funds.available_base(), dec!(0.3));
-        assert_eq!(funds.available_quote(), dec!(600));
+        assert_eq!(funds.available_base(), dec!(0.5));
+        assert_eq!(funds.available_quote(), dec!(1000));
     }
 
     #[test]
@@ -2245,22 +2307,91 @@ mod tests {
             quote_symbol: Some("USDC".to_owned()),
         };
         let funds = parse_spot_funds(&overview, &market).expect("spot funds");
-        assert_eq!(funds.available_base(), dec!(0.3));
-        assert_eq!(funds.available_quote(), dec!(600));
+        assert_eq!(funds.available_base(), dec!(0.5));
+        assert_eq!(funds.available_quote(), dec!(1000));
     }
 
     #[test]
     fn spot_funds_never_report_negative_available_balances() {
+        // Even though reservations are not subtracted from `positions` again, a negative
+        // position balance (which should never happen, but must not panic or underflow) is
+        // still floored at zero rather than propagated.
         let funds = SpotFunds {
             base_symbol: "APT".to_owned(),
             quote_symbol: "USDC".to_owned(),
-            base_balance: dec!(1),
-            quote_balance: dec!(10),
+            base_balance: dec!(-1),
+            quote_balance: dec!(-10),
             base_reserved: dec!(2),
             quote_reserved: dec!(20),
+            quote_cross_balance: Decimal::ZERO,
         };
         assert_eq!(funds.available_base(), Decimal::ZERO);
         assert_eq!(funds.available_quote(), Decimal::ZERO);
+    }
+
+    #[test]
+    fn in_flight_reservation_is_classified_by_asset_address_from_positions() {
+        // The /markets row for APT/USDC returns null asset addresses, while in_flight_orders
+        // identifies the reserved asset by address. The base reservation must not be counted
+        // against the quote balance.
+        let overview = serde_json::json!({
+            "usdc_cross_withdrawable_balance": 958.884555,
+            "spot": {
+                "positions": [
+                    {"asset_addr": "0xa", "asset_symbol": "APT", "amount": 8.078783},
+                    {"asset_addr": "0x5428", "asset_symbol": "USDC", "amount": 0.0005}
+                ],
+                "in_flight_orders": [
+                    {"reserved_asset": "0xa", "reserved_amount": 70.0}
+                ]
+            }
+        });
+        let market = Market {
+            address: "0x26f1".to_owned(),
+            name: "APT/USDC".to_owned(),
+            tick_size: dec!(0.0001),
+            lot_size: dec!(0.01),
+            min_size: dec!(10),
+            px_decimals: 4,
+            sz_decimals: 2,
+            product: Product::Spot,
+            base_asset_addr: None,
+            quote_asset_addr: None,
+            base_symbol: None,
+            quote_symbol: None,
+        };
+        // Verified against a live testnet account: 8.078783 APT free + 70 APT reserved in a
+        // resting sell ladder were both real (78.078783 total, matching the wallet display).
+        // `base_reserved` is recorded for display/future verification; `available_base` must
+        // still report the free 8.078783, not double-subtract the 70 already excluded from
+        // `positions.amount`.
+        let funds = parse_spot_funds(&overview, &market).expect("spot funds");
+        assert_eq!(funds.base_reserved, dec!(70));
+        assert_eq!(funds.quote_reserved, Decimal::ZERO);
+        assert_eq!(funds.available_base(), dec!(8.078783));
+        assert_eq!(funds.available_quote(), dec!(958.884555));
+    }
+
+    #[test]
+    fn spot_funds_use_cross_quote_without_double_counting_pfs_quote() {
+        let funds = SpotFunds {
+            base_symbol: "APT".to_owned(),
+            quote_symbol: "USDC".to_owned(),
+            base_balance: dec!(8),
+            quote_balance: dec!(0.0005),
+            base_reserved: Decimal::ZERO,
+            quote_reserved: Decimal::ZERO,
+            quote_cross_balance: dec!(958.884555),
+        };
+        assert_eq!(funds.available_quote(), dec!(958.884555));
+
+        // quote_reserved is no longer subtracted (see available_quote's doc comment): a
+        // reservation recorded elsewhere does not change what is presently free in `positions`.
+        let with_pfs_reservation = SpotFunds {
+            quote_reserved: dec!(100),
+            ..funds
+        };
+        assert_eq!(with_pfs_reservation.available_quote(), dec!(958.884555));
     }
 
     #[test]
@@ -2458,6 +2589,7 @@ mod tests {
             quote_balance: dec!(2000),
             base_reserved: dec!(0.2),
             quote_reserved: dec!(500),
+            quote_cross_balance: Decimal::ZERO,
         };
         let grid = GridPlan {
             mid: dec!(60000),
@@ -2499,6 +2631,7 @@ mod tests {
             quote_balance: dec!(1000),
             base_reserved: Decimal::ZERO,
             quote_reserved: Decimal::ZERO,
+            quote_cross_balance: Decimal::ZERO,
         };
         let grid = GridPlan {
             mid: dec!(0.5782),
@@ -2539,6 +2672,7 @@ mod tests {
             quote_balance: dec!(200),
             base_reserved: dec!(0),
             quote_reserved: dec!(0),
+            quote_cross_balance: Decimal::ZERO,
         };
         let grid = GridPlan {
             mid: dec!(60000),
@@ -2580,6 +2714,7 @@ mod tests {
             quote_balance: dec!(100),
             base_reserved: Decimal::ZERO,
             quote_reserved: Decimal::ZERO,
+            quote_cross_balance: Decimal::ZERO,
         };
         let grid = GridPlan {
             mid: dec!(1),
@@ -2621,6 +2756,7 @@ mod tests {
             quote_balance: dec!(100),
             base_reserved: Decimal::ZERO,
             quote_reserved: Decimal::ZERO,
+            quote_cross_balance: Decimal::ZERO,
         };
         let grid = GridPlan {
             mid: dec!(1),
@@ -2660,6 +2796,7 @@ mod tests {
             quote_balance: dec!(2000),
             base_reserved: dec!(0),
             quote_reserved: dec!(0),
+            quote_cross_balance: Decimal::ZERO,
         };
         let grid = GridPlan {
             mid: dec!(60000),
