@@ -1325,8 +1325,30 @@ async fn doctor_cli(settings: Settings) -> Result<()> {
                 funds.available_quote(),
                 funds.quote_symbol
             );
-            if funds.available_base() < snapshot.plan.base_required
-                || funds.available_quote() < snapshot.plan.quote_required
+            // A bulk replacement also gets credit for whatever is already escrowed in the
+            // resting ladder, so report that separately rather than implying it is unusable.
+            if funds.base_reserved > Decimal::ZERO || funds.quote_reserved > Decimal::ZERO {
+                println!(
+                    "  bulk escrow (credited on replacement): {} {}, {} {} → usable {} {} / {} {}",
+                    funds.base_reserved,
+                    funds.base_symbol,
+                    funds.quote_reserved,
+                    funds.quote_symbol,
+                    funds.available_base_for_bulk(),
+                    funds.base_symbol,
+                    funds.available_quote_for_bulk(),
+                    funds.quote_symbol
+                );
+            }
+            if funds.quote_cross_balance() > Decimal::ZERO {
+                println!(
+                    "  note: {} {} sits in Cross and is NOT spendable by spot bulk orders; transfer it into PFS to fund bids.",
+                    funds.quote_cross_balance(),
+                    funds.quote_symbol
+                );
+            }
+            if funds.available_base_for_bulk() < snapshot.plan.base_required
+                || funds.available_quote_for_bulk() < snapshot.plan.quote_required
             {
                 println!(
                     "  note: Spot execution will shrink to the currently available PFS balances."
@@ -1686,11 +1708,13 @@ async fn run_cli(settings: Settings, execute: bool, confirm_mainnet: Option<&str
 
                 let mut exec_plan = snapshot.plan.clone();
 
-                // Spot: shrink to available PFS if needed
+                // Spot bulk orders source PFS only. On replacement, the existing bulk escrow is
+                // credited by the Move entry function, so include the currently reserved side
+                // when deciding how much of the replacement ladder can be funded.
                 if snapshot.market.product == Product::Spot
                     && let Some(funds) = &snapshot.account.spot_funds
-                    && (funds.available_quote() < exec_plan.quote_required
-                        || funds.available_base() < exec_plan.base_required)
+                    && (funds.available_quote_for_bulk() < exec_plan.quote_required
+                        || funds.available_base_for_bulk() < exec_plan.base_required)
                 {
                     let account = api
                         .account(Some(&settings.subaccount), &snapshot.market)
@@ -1701,11 +1725,11 @@ async fn run_cli(settings: Settings, execute: bool, confirm_mainnet: Option<&str
                         .unwrap_or_else(|| funds.clone());
                     if let Ok(adjustment) = decibel_grid_tui::shrink_spot_to_available(
                         &mut exec_plan,
-                        fresh_funds.available_quote(),
-                        fresh_funds.available_base(),
+                        fresh_funds.available_quote_for_bulk(),
+                        fresh_funds.available_base_for_bulk(),
                         &snapshot.market,
                     ) {
-                        println!("Spot PFS limited the grid: {adjustment}");
+                        println!("Spot PFS/bulk-escrow limited the grid: {adjustment}");
                     }
                 }
 

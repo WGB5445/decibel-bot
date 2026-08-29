@@ -202,18 +202,39 @@ impl SpotFunds {
         self.base_balance.max(Decimal::ZERO)
     }
 
-    /// Quote available to the Spot grid.
+    /// Quote available to the Spot grid, from the subaccount's PFS only.
     ///
-    /// Decibel settles Spot sell proceeds into the Cross/collateral USDC balance rather than
-    /// into `spot.positions`, so a PFS-only figure reports zero quote on an account that has
-    /// been selling and produces a sell-only ladder that never recycles proceeds into bids.
-    ///
-    /// The two figures are combined with `max`, not `+`: it is not established whether they are
-    /// separate pools or the same balance reported twice. Taking the larger cannot invent quote
-    /// that does not exist; summing could. See `available_base` for why reservations are not
-    /// subtracted again here.
+    /// The Cross/collateral balance is deliberately NOT included. `spot_order_public_api::
+    /// source_bulk_funds_from_pfs` asserts against `primary_fungible_store::balance` alone, and
+    /// `dex_accounts_spot_extension::place_spot_bulk_order_to_subaccount` documents that bulk
+    /// orders source funds "from the subaccount's PFS only — CBS sourcing is intentionally not
+    /// supported". Counting Cross here makes the bot plan bids it cannot fund and the chain
+    /// rejects the whole submission with `EINSUFFICIENT_PFS_FUNDS(0x1)`.
     pub fn available_quote(&self) -> Decimal {
-        self.quote_balance.max(self.quote_cross_balance).max(Decimal::ZERO)
+        self.quote_balance.max(Decimal::ZERO)
+    }
+
+    /// Base usable when *replacing* this market's bulk ladder.
+    ///
+    /// `source_bulk_funds_from_pfs` credits whatever already sits in the existing bulk escrow
+    /// against the new requirement and only withdraws the delta from PFS:
+    /// `base_delta = if (base_needed > existing_base) { base_needed - existing_base } else { 0 }`.
+    /// The reserved amount reported by `in_flight_orders` is exactly that escrow, so for a
+    /// replacement it is spendable, not locked away.
+    pub fn available_base_for_bulk(&self) -> Decimal {
+        (self.base_balance + self.base_reserved).max(Decimal::ZERO)
+    }
+
+    /// Quote counterpart of [`Self::available_base_for_bulk`]. Still PFS-sourced: the escrow
+    /// credit does not make Cross funds reachable.
+    pub fn available_quote_for_bulk(&self) -> Decimal {
+        (self.quote_balance + self.quote_reserved).max(Decimal::ZERO)
+    }
+
+    /// Withdrawable Cross USDC that could be moved into PFS to fund bids. Diagnostic only — it
+    /// is not spendable by the bulk entry function until the operator transfers it.
+    pub fn quote_cross_balance(&self) -> Decimal {
+        self.quote_cross_balance.max(Decimal::ZERO)
     }
 }
 
@@ -297,13 +318,15 @@ pub async fn execute_bulk_grid(
         // PFS — that requires ChangingCollateralFundsMovement on the signer address, which is
         // separate from TradeSpotAllMarkets. Instead the grid is scaled to the available PFS
         // balances and submitted as-is.
-        if funds.available_quote() < execution_plan.quote_required
-            || funds.available_base() < execution_plan.base_required
+        let bulk_quote_available = funds.available_quote_for_bulk();
+        let bulk_base_available = funds.available_base_for_bulk();
+        if bulk_quote_available < execution_plan.quote_required
+            || bulk_base_available < execution_plan.base_required
         {
             let adjustment = shrink_spot_to_available(
                 &mut execution_plan,
-                funds.available_quote(),
-                funds.available_base(),
+                bulk_quote_available,
+                bulk_base_available,
                 market,
             )?;
             println!("Spot PFS balances limited the grid: {adjustment}");
@@ -2089,15 +2112,19 @@ pub fn fit_spot_snapshot_to_pfs(snapshot: &mut MonitorSnapshot) -> Result<Option
             snapshot.market.name
         )
     })?;
-    if funds.available_quote() >= snapshot.plan.quote_required
-        && funds.available_base() >= snapshot.plan.base_required
+    // Use the bulk-replacement figures: a new bulk submission credits the existing escrow
+    // against its requirement, so the resting ladder's reserved inventory is spendable here.
+    let quote_available = funds.available_quote_for_bulk();
+    let base_available = funds.available_base_for_bulk();
+    if quote_available >= snapshot.plan.quote_required
+        && base_available >= snapshot.plan.base_required
     {
         return Ok(None);
     }
     shrink_spot_to_available(
         &mut snapshot.plan,
-        funds.available_quote(),
-        funds.available_base(),
+        quote_available,
+        base_available,
         &snapshot.market,
     )
     .map(Some)
@@ -2497,11 +2524,19 @@ mod tests {
         assert_eq!(funds.base_reserved, dec!(70));
         assert_eq!(funds.quote_reserved, Decimal::ZERO);
         assert_eq!(funds.available_base(), dec!(8.078783));
-        assert_eq!(funds.available_quote(), dec!(958.884555));
+        // On replacement the resting ladder's escrow is credited by the Move entry function.
+        assert_eq!(funds.available_base_for_bulk(), dec!(78.078783));
+        // Cross USDC is NOT spendable by `place_bulk_order_from_pfs`; only PFS quote counts.
+        assert_eq!(funds.available_quote(), dec!(0.0005));
+        assert_eq!(funds.available_quote_for_bulk(), dec!(0.0005));
+        assert_eq!(funds.quote_cross_balance(), dec!(958.884555));
     }
 
     #[test]
-    fn spot_funds_use_cross_quote_without_double_counting_pfs_quote() {
+    fn spot_funds_do_not_treat_cross_quote_as_bulk_funding() {
+        // Verified on-chain: `source_bulk_funds_from_pfs` asserts against
+        // `primary_fungible_store::balance` alone, so counting Cross here produced a plan the
+        // chain rejected with EINSUFFICIENT_PFS_FUNDS(0x1).
         let funds = SpotFunds {
             base_symbol: "APT".to_owned(),
             quote_symbol: "USDC".to_owned(),
@@ -2511,15 +2546,15 @@ mod tests {
             quote_reserved: Decimal::ZERO,
             quote_cross_balance: dec!(958.884555),
         };
-        assert_eq!(funds.available_quote(), dec!(958.884555));
+        assert_eq!(funds.available_quote(), dec!(0.0005));
+        assert_eq!(funds.quote_cross_balance(), dec!(958.884555));
 
-        // quote_reserved is no longer subtracted (see available_quote's doc comment): a
-        // reservation recorded elsewhere does not change what is presently free in `positions`.
-        let with_pfs_reservation = SpotFunds {
+        // Existing escrow is credited for replacement sizing; Cross funds still are not.
+        let with_escrow = SpotFunds {
             quote_reserved: dec!(100),
             ..funds
         };
-        assert_eq!(with_pfs_reservation.available_quote(), dec!(958.884555));
+        assert_eq!(with_escrow.available_quote_for_bulk(), dec!(100.0005));
     }
 
     #[test]
