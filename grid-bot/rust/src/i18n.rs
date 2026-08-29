@@ -223,10 +223,10 @@ pub fn t(language: Language, key: Key) -> &'static str {
             "↑↓/点击 选择 · Enter 使用该市场 · f 刷新 · Tab 切换页签 · q 退出"
         }
         (English, HelpGrid) => {
-            "1/2/3 or Tab switch tabs · ↑↓/click select cell · E execute Preview plan · F2 error details · f refresh · q quit"
+            "1/2/3 or Tab switch tabs · ↑↓/click select cell · E execute Preview plan · U Spot funding setup · F2 error details · f refresh · q quit"
         }
         (Chinese, HelpGrid) => {
-            "1/2/3 或 Tab 切换页签 · ↑↓/点击选择格子 · E 执行预览计划 · F2 错误详情 · f 刷新 · q 退出"
+            "1/2/3 或 Tab 切换页签 · ↑↓/点击选择格子 · E 执行预览计划 · U Spot 资金设置 · F2 错误详情 · f 刷新 · q 退出"
         }
         (English, HelpEditing) => "Type or paste · Enter save · Esc cancel",
         (Chinese, HelpEditing) => "输入或粘贴 · Enter 保存 · Esc 取消",

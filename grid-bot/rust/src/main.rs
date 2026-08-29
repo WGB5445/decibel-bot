@@ -33,7 +33,7 @@ use ratatui::{
     text::{Line, Span},
     widgets::{Block, Borders, Cell, Clear, Paragraph, Row, Table, Wrap},
 };
-use rust_decimal::Decimal;
+use rust_decimal::{Decimal, prelude::ToPrimitive};
 
 /// Every resting order occupies one grid cell. Render them in price order rather than pairing
 /// the bid and ask arrays by index, because they live on opposite sides of the current mid.
@@ -256,6 +256,8 @@ enum Cmd {
     /// Continuous shadow mode: reconcile every cycle, journal events, but never sign or submit.
     /// With --cycles N, exit after N successful reconciliation cycles (exit 0).
     Shadow,
+    /// Move Cross USDC into PFS; set future settlement routing manually as subaccount owner first.
+    SpotFundingSetup,
     Tui,
 }
 
@@ -296,6 +298,12 @@ struct Args {
         hide_env_values = true
     )]
     subaccount: Option<String>,
+    /// Human-readable USDC amount to move from Cross to PFS for `spot-funding-setup`.
+    #[arg(long, global = true, env = "SPOT_FUNDING_AMOUNT", default_value = "0")]
+    spot_funding_amount: String,
+    /// USDC metadata object; defaults to the testnet USDC metadata.
+    #[arg(long, global = true, env = "SPOT_FUNDING_METADATA")]
+    spot_funding_metadata: Option<String>,
     #[arg(
         long,
         global = true,
@@ -708,6 +716,10 @@ enum MarketFetch {
         settings_revision: u64,
         result: Box<Result<ExecutionResult>>,
     },
+    Funding {
+        settings_revision: u64,
+        result: Box<Result<String>>,
+    },
 }
 
 struct MarketPicker {
@@ -752,6 +764,10 @@ struct App {
     edit_before: String,
     password: String,
     password_purpose: Option<PasswordPurpose>,
+    /// Cross→PFS funding setup modal input, expressed in human-readable USDC.
+    funding_dialog: Option<String>,
+    funding_pending: bool,
+    funding_requested: bool,
     profile_name: String,
     settings: Settings,
     settings_revision: u64,
@@ -807,6 +823,9 @@ impl App {
             edit_before: String::new(),
             password: String::new(),
             password_purpose: None,
+            funding_dialog: None,
+            funding_pending: false,
+            funding_requested: false,
             profile_name,
             settings,
             settings_revision: 0,
@@ -1217,6 +1236,14 @@ async fn main() -> Result<()> {
         Some(Cmd::Status) => status_cli(Settings::from(&cli.args)).await,
         Some(Cmd::Doctor) => doctor_cli(Settings::from(&cli.args)).await,
         Some(Cmd::Shadow) => shadow_cli(Settings::from(&cli.args), cli.args.shadow_cycles).await,
+        Some(Cmd::SpotFundingSetup) => {
+            spot_funding_setup_cli(
+                Settings::from(&cli.args),
+                cli.args.spot_funding_amount.clone(),
+                cli.args.spot_funding_metadata.clone(),
+            )
+            .await
+        }
         Some(Cmd::Run) => {
             run_cli(
                 Settings::from(&cli.args),
@@ -1278,6 +1305,51 @@ async fn status_cli(settings: Settings) -> Result<()> {
     let api = settings.api_client()?;
     let snapshot = fetch_snapshot(&api, &config, optional_subaccount(&settings)).await?;
     print_snapshot(&snapshot, &config);
+    Ok(())
+}
+
+/// Explicit, operator-confirmed Cross→PFS transfer. The bot does not attempt to set
+/// HOLD_AS_NON_COLLATERAL: that entry function is owner-only, while the bot signer may only have
+/// delegated trading/funds permissions. The operator must set the future-settlement flag manually
+/// in the Decibel UI/wallet first.
+async fn spot_funding_setup_cli(
+    settings: Settings,
+    amount: String,
+    metadata: Option<String>,
+) -> Result<()> {
+    if settings.aptos_private_key.trim().is_empty() {
+        anyhow::bail!("spot-funding-setup requires APTOS_PRIVATE_KEY")
+    }
+    if settings.subaccount.trim().is_empty() {
+        anyhow::bail!("spot-funding-setup requires SUBACCOUNT_ADDRESS")
+    }
+    let metadata = metadata.unwrap_or_else(|| decibel_grid_tui::TESTNET_USDC_METADATA.to_owned());
+    let amount_decimal = Decimal::from_str(amount.trim())
+        .context("--spot-funding-amount/SPOT_FUNDING_AMOUNT must be a decimal USDC amount")?;
+    if amount_decimal < Decimal::ZERO {
+        anyhow::bail!("--spot-funding-amount/SPOT_FUNDING_AMOUNT cannot be negative")
+    }
+    println!(
+        "NOTICE: HOLD_AS_NON_COLLATERAL is owner-only and is not submitted by this bot. Set it manually in the Decibel UI/wallet before relying on future Spot proceeds staying in PFS."
+    );
+    if amount_decimal.is_zero() {
+        println!("No transfer amount given (0); skipping the Cross→PFS transfer.");
+        return Ok(());
+    }
+    let raw = (amount_decimal * Decimal::from(1_000_000u64))
+        .floor()
+        .to_i64()
+        .ok_or_else(|| anyhow::anyhow!("--spot-funding-amount is outside the supported range"))?;
+    println!("Transferring {amount_decimal} USDC from Cross to PFS...");
+    let transfer_tx = decibel_grid_tui::transfer_spot_cross_pfs(
+        &settings.network,
+        &settings.aptos_private_key,
+        &settings.subaccount,
+        &metadata,
+        -raw,
+    )
+    .await?;
+    println!("  Transfer submitted. tx {transfer_tx}");
     Ok(())
 }
 
@@ -1952,6 +2024,81 @@ async fn tui_loop(
                     }
                 }
                 MarketFetch::Execution { .. } => {}
+                MarketFetch::Funding {
+                    settings_revision,
+                    result,
+                } if settings_revision == app.settings_revision => {
+                    app.funding_pending = false;
+                    match *result {
+                        Ok(transfer_tx) => {
+                            app.funding_dialog = None;
+                            app.error = None;
+                            app.grid_change_notice = Some(if transfer_tx.is_empty() {
+                                "Spot funding setup: no transfer requested (amount was 0)."
+                                    .to_owned()
+                            } else {
+                                format!("Cross→PFS transfer submitted: tx {transfer_tx}")
+                            });
+                            app.refresh_now = true;
+                        }
+                        Err(error) => app.set_error(error),
+                    }
+                }
+                MarketFetch::Funding { .. } => {}
+            }
+        }
+
+        if app.funding_requested && !app.funding_pending {
+            app.funding_requested = false;
+            let amount = app.funding_dialog.clone().unwrap_or_default();
+            let job = (
+                app.settings.network.clone(),
+                app.settings.aptos_private_key.clone(),
+                app.settings.subaccount.clone(),
+                amount,
+                app.settings_revision,
+            );
+            if job.1.trim().is_empty() || job.2.trim().is_empty() {
+                app.set_error("Aptos private key and subaccount are required for funding setup");
+            } else if !job.0.eq_ignore_ascii_case("testnet") {
+                app.set_error("TUI Spot funding setup requires an explicit mainnet USDC metadata address; use the CLI --spot-funding-metadata option");
+            } else {
+                app.funding_pending = true;
+                let tx = fetch_tx.clone();
+                tokio::spawn(async move {
+                    let result = async {
+                        use rust_decimal::prelude::ToPrimitive;
+                        let amount_decimal = rust_decimal::Decimal::from_str(job.3.trim())
+                            .context("Cross→PFS amount must be a decimal USDC amount")?;
+                        if amount_decimal < rust_decimal::Decimal::ZERO {
+                            anyhow::bail!("Cross→PFS amount cannot be negative")
+                        }
+                        let raw = (amount_decimal * rust_decimal::Decimal::from(1_000_000u64))
+                            .floor()
+                            .to_i64()
+                            .ok_or_else(|| {
+                                anyhow::anyhow!("Cross→PFS amount is outside i64 range")
+                            })?;
+                        let transfer_tx = if raw == 0 {
+                            String::new()
+                        } else {
+                            decibel_grid_tui::transfer_spot_cross_pfs(
+                                &job.0,
+                                &job.1,
+                                &job.2,
+                                decibel_grid_tui::TESTNET_USDC_METADATA,
+                                -raw,
+                            )
+                            .await?
+                        };
+                        Ok::<_, anyhow::Error>(transfer_tx)
+                    }
+                    .await;
+                    let _ = tx.send(MarketFetch::Funding {
+                        settings_revision: job.4,
+                        result: Box::new(result),
+                    });
+                });
             }
         }
 
@@ -2311,6 +2458,21 @@ fn handle_event(app: &mut App) -> Result<bool> {
             }
             _ => {}
         },
+        Event::Key(key) if app.funding_dialog.is_some() => match key.code {
+            KeyCode::Enter => app.funding_requested = true,
+            KeyCode::Esc => app.funding_dialog = None,
+            KeyCode::Backspace => {
+                if let Some(value) = app.funding_dialog.as_mut() {
+                    value.pop();
+                }
+            }
+            KeyCode::Char(character) if character.is_ascii_digit() || character == '.' => {
+                if let Some(value) = app.funding_dialog.as_mut() {
+                    value.push(character);
+                }
+            }
+            _ => {}
+        },
         Event::Key(key) if app.password_purpose.is_some() => match key.code {
             KeyCode::Enter => app.submit_password(),
             KeyCode::Esc => {
@@ -2354,6 +2516,14 @@ fn handle_event(app: &mut App) -> Result<bool> {
             }
             // `m` opens the market terminal modal rather than changing the page.
             KeyCode::Char('m') => app.open_market_picker(),
+            // Spot funding setup is explicit: U opens a confirmation/input modal and never
+            // moves funds merely because the monitor refreshed.
+            KeyCode::Char('u') if app.tab == TAB_PREVIEW || app.tab == TAB_MONITOR => {
+                if app.settings.product == Product::Spot {
+                    app.funding_dialog = Some(String::new());
+                    app.error = None;
+                }
+            }
             KeyCode::Tab | KeyCode::Right => {
                 app.tab = (app.tab + 1) % TAB_COUNT;
                 app.refresh_now = true;
@@ -2631,6 +2801,9 @@ fn render(area: Rect, frame: &mut ratatui::Frame, app: &App, config: Option<&Gri
     if app.market_picker.is_some() {
         render_market_picker(area, frame, app);
     }
+    if app.funding_dialog.is_some() {
+        render_funding_modal(area, frame, app);
+    }
     // Keep the compact header status visible by default. The full inspector is explicitly opened
     // with F2, and Esc/F2 can then reliably close it without immediately being rendered again.
     if app.error_dialog && app.error_report.is_some() {
@@ -2828,6 +3001,55 @@ fn render_market_picker(area: Rect, frame: &mut ratatui::Frame, app: &App) {
                 .title("Market picker controls"),
         ),
         rows[2],
+    );
+}
+
+/// Explicit Spot funding setup modal. The bot only submits Cross→PFS transfer; setting
+/// HOLD_AS_NON_COLLATERAL is owner-only and must be done manually in the Decibel UI/wallet.
+/// Nothing here runs automatically on a monitor refresh.
+fn render_funding_modal(area: Rect, frame: &mut ratatui::Frame, app: &App) {
+    let Some(input) = app.funding_dialog.as_deref() else {
+        return;
+    };
+    let popup = centered_rect(78, 13, area);
+    frame.render_widget(Clear, popup);
+    let cross_line = app
+        .snapshot
+        .as_ref()
+        .and_then(|snapshot| snapshot.account.spot_funds.as_ref())
+        .map(|funds| {
+            format!(
+                "Cross USDC currently withdrawable: {}",
+                format_decimal(funds.quote_cross_balance(), 6)
+            )
+        })
+        .unwrap_or_else(|| "Cross USDC balance: refresh the monitor to load it".to_owned());
+    let lines = vec![
+        Line::from(Span::styled(
+            "Spot funding setup (testnet USDC)",
+            Style::default().add_modifier(Modifier::BOLD),
+        )),
+        Line::from(cross_line),
+        Line::from(
+            "NOTE: HOLD_AS_NON_COLLATERAL is owner-only; set it manually in the Decibel UI/wallet.",
+        ),
+        Line::from("Pressing Enter submits one on-chain action:"),
+        Line::from("  transfer the amount below from Cross into PFS (0 = skip the transfer)"),
+        Line::from(""),
+        Line::from(format!("Amount to move Cross → PFS (USDC): {input}_")),
+        Line::from(if app.funding_pending {
+            "Submitting... this may take up to a minute.".to_owned()
+        } else {
+            "Enter confirm and submit · Esc cancel · digits/. edit amount".to_owned()
+        }),
+    ];
+    frame.render_widget(
+        Paragraph::new(lines).wrap(Wrap { trim: true }).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title("Fund Spot bulk orders from PFS"),
+        ),
+        popup,
     );
 }
 
@@ -3268,6 +3490,21 @@ fn render_grid(area: Rect, frame: &mut ratatui::Frame, app: &App, config: Option
             "尚未收到网格刷新",
         )
     });
+    let spot_funding_warning = if snapshot.market.product == Product::Spot {
+        snapshot
+            .account
+            .spot_funds
+            .as_ref()
+            .filter(|funds| funds.quote_cross_balance() > Decimal::ZERO)
+            .map(|funds| {
+                format!(
+                    "WARNING: {} USDC is in Cross; future Spot proceeds may route to Cross. Set HOLD_AS_NON_COLLATERAL manually as owner, then press U to move USDC → PFS.",
+                    format_decimal(funds.quote_cross_balance(), 6)
+                )
+            })
+    } else {
+        None
+    };
     let reconciliation_line = match snapshot.reconciliation.as_ref() {
         Some(result) if result.unmanaged.is_empty() => format!(
             "{}  {} {}  {} {}  {} {}  ·  {}",
@@ -3335,6 +3572,13 @@ fn render_grid(area: Rect, frame: &mut ratatui::Frame, app: &App, config: Option
         ),
         capital_line,
         exposure_line,
+        spot_funding_warning.unwrap_or_else(|| {
+            if snapshot.market.product == Product::Spot {
+                "Spot funding routing: no Cross balance warning; press U to configure future proceeds and optional Cross→PFS transfer.".to_owned()
+            } else {
+                String::new()
+            }
+        }),
         change_notice.to_owned(),
         reconciliation_line,
     ]

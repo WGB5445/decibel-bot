@@ -9,8 +9,10 @@ grid-bot/rust
 详细的 Testnet 验证、Shadow、Live 前检查、Mainnet 推进和故障处理请见：[运行与验证手册](运行与验证手册.md)。
 
 ## 安全设计
+- Spot bulk 执行只使用 Subaccount 的 **PFS**(`spot.positions`)余额；Cross/CBS 中的 quote 不能直接用于 `place_spot_bulk_order_to_subaccount`。
+- Spot 成交后的资产默认可能路由到 Cross。为避免卖出所得 USDC 不能被下一轮 bulk 买单使用,应将已有 Cross USDC 转回 PFS,并设置 `HOLD_AS_NON_COLLATERAL=true` 让未来成交继续留在 PFS。**`set_hold_as_non_collateral_for_subaccount` 只能由 subaccount owner 本人调用**(`dex_accounts::get_subaccount_signer_if_owner`,不接受 delegate),因此本工具不会代为提交这笔交易,只会提示你手动在 Decibel UI/钱包中完成。Cross→PFS 转账走 `transfer_assets_between_non_collateral_and_collateral`,可由 owner 或拥有 `ChangingCollateralFundsMovement` 权限的 delegate 签名,本工具的 API 私钥若只是 delegate 也能提交这一笔。
+- TUI 的 Spot Preview/Monitor 页面会显示 Cross USDC 警告,并提示需手动设置 HOLD_AS_NON_COLLATERAL;按 `U` 打开资金设置弹窗,输入要转回 PFS 的 USDC 数量后按 Enter,只提交 Cross→PFS 转账一笔交易。不会在刷新或下单循环中自动转账,也不会尝试提交 owner-only 的 routing 设置交易。
 
-- Spot 执行只使用 Subaccount 的 **PFS**（`spot.positions`）余额；不进行 Cross→PFS 划转、不自动补币、不等待 POST_ONLY 成交。
 - 每次执行前先 **reconcile**(对比期望网格与交易所实际订单)。由于 bulk API 没有 client-order-id，只要市场已存在任何订单，CLI Live 模式就不会提交 bulk replacement。
 - 主网执行需要 `--confirm-mainnet MAINNET` 显式确认。
 - 每个 Live/Shadow 运行写入 append-only event journal(JSON Lines)，默认状态记录在 `~/.local/share/decibel-grid/runs/<run_id>/`；受限容器可设 `DECIBEL_GRID_DATA_DIR` 覆盖根目录。
@@ -25,7 +27,8 @@ grid-bot/rust
 | `reconcile` | 一次 reconcile（快照 + 期望 vs 实际订单对比） |
 | `doctor` | 完整前置检查：API key、市场规则、计划、余额、reconciliation |
 | `run` | 持续循环：fetch → 打印快照；（加 `-e` 后 reconcile → 仅在安全时替换整个 ladder） |
-| `shadow` | 持续 fetch + PFS 适配 + reconcile + journal；绝不签名、提交、取消或转账 |
+| `shadow` | 持续 fetch + PFS 适配 + reconcile + journal;绝不签名、提交、取消或转账 |
+| `spot-funding-setup` | 显式设置 USDC future settlement 路由，并可将 Cross USDC 转入 PFS |
 | `tui` | TUI 配置与监控 |
 | `preview` | 直接进入 TUI Preview 标签 |
 
@@ -55,6 +58,43 @@ cargo run -- run -e --network mainnet --confirm-mainnet MAINNET \
 
 # 前置检查
 cargo run -- doctor --product spot --market APT/USDC --subaccount 0x...
+
+# Spot 资金初始化：设置未来成交留在 PFS，并把指定 Cross USDC 转回 PFS
+# amount 使用人类可读 USDC 数量；0 只设置路由，不转账
+cargo run -- spot-funding-setup \
+  --network testnet \
+  --subaccount 0xYOUR_SUBACCOUNT \
+  --aptos-private-key 0xYOUR_PRIVATE_KEY \
+  --spot-funding-amount 945.910599
+
+# 主网必须显式指定该网络的 USDC metadata 地址
+cargo run -- spot-funding-setup \
+  --network mainnet \
+  --subaccount 0xYOUR_SUBACCOUNT \
+  --aptos-private-key 0xYOUR_PRIVATE_KEY \
+  --spot-funding-metadata 0xYOUR_MAINNET_USDC_METADATA \
+  --spot-funding-amount 100
+```
+
+## Spot Cross → PFS 资金闭环
+
+Decibel Spot bulk 下单调用 `place_spot_bulk_order_to_subaccount`，资金从 subaccount 的 PFS（primary fungible store）读取；Cross/CBS 里的 USDC 不能直接作为 bulk 买单资金。另一方面，Spot 成交结算在默认路由下可能把卖出所得 USDC 放入 Cross。如果不处理，网格卖出几轮后会出现“Cross 有 USDC、PFS 没 USDC、bulk 买单 `EINSUFFICIENT_PFS_FUNDS`”的状态。
+
+建议在开始 Spot 网格前先由 subaccount owner 在 Decibel UI/钱包中设置 `HOLD_AS_NON_COLLATERAL=true`，因为 `set_hold_as_non_collateral_for_subaccount` 使用 owner-only 权限，本工具不会代为提交。然后执行 `spot-funding-setup`，只将已有 Cross USDC 转入 PFS:
+
+1. owner 手动调用/设置 `dex_accounts_spot_entry::set_hold_as_non_collateral_for_subaccount`，对 USDC 设置 `hold=true`，影响**未来**结算；不会搬运已有 Cross 余额。
+2. 本工具调用 `dex_accounts_entry::transfer_assets_between_non_collateral_and_collateral`，传入负的 `i64` amount，把 Cross 转入 PFS。正数方向是 PFS → Cross，负数方向是 Cross → PFS。
+3. 等待交易确认后重新运行 `doctor`，确认 PFS USDC 已增加。
+
+Testnet USDC metadata：
+
+```text
+0x5428acf5c112826d0c74ae1cd2de9030f53d1d01235e6c2621d967bf914ee1c8
+```
+
+例如转 `945.910599 USDC`,原始 amount 是 `-945910599`(USDC 6 位精度)。命令只执行 Cross→PFS 转账;不会提交 owner-only 的 routing 设置交易。
+
+TUI 中进入 Preview 或 Monitor 后按 `U`,输入要从 Cross 转回 PFS 的 USDC 数量并按 Enter。TUI 会显示 Cross 余额提示，并明确提示必须由 owner 手动设置 HOLD 状态；TUI 只提交 Cross→PFS 转账。合约没有公开的只读 view 用来确认 HOLD 状态,因此 UI 不会伪造“已设置”状态。转账需要 subaccount owner,或拥有 `ChangingCollateralFundsMovement` 的 delegate;私钥会签署真实链上交易,请先核对 network、subaccount、metadata 和金额。
 
 # 只读 reconcile
 cargo run -- reconcile --product perp --market BTC/USD --subaccount 0x...

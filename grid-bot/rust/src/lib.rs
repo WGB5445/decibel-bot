@@ -286,6 +286,28 @@ pub struct BulkOrderParameters {
 
 const MAINNET_PACKAGE: &str = "0x50ead22afd6ffd9769e3b3d6e0e64a2a350d68e8b102c4e72e33d0b8cfdfdb06";
 const TESTNET_PACKAGE: &str = "0xe7da2794b1d8af76532ed95f38bfdf1136abfd8ea3a240189971988a83101b7f";
+/// Decibel's testnet USDC metadata object. Mainnet assets must be supplied explicitly by the
+/// caller because metadata addresses are network-specific.
+pub const TESTNET_USDC_METADATA: &str =
+    "0x5428acf5c112826d0c74ae1cd2de9030f53d1d01235e6c2621d967bf914ee1c8";
+
+fn package_for_network(network: &str) -> Result<&'static str> {
+    match network.trim().to_ascii_lowercase().as_str() {
+        "mainnet" => Ok(MAINNET_PACKAGE),
+        "testnet" => Ok(TESTNET_PACKAGE),
+        other => bail!("unsupported execution network {other}; expected mainnet or testnet"),
+    }
+}
+
+fn aptos_for_network(network: &str) -> Result<Aptos> {
+    Ok(Aptos::new(
+        match network.trim().to_ascii_lowercase().as_str() {
+            "mainnet" => AptosConfig::mainnet(),
+            "testnet" => AptosConfig::testnet(),
+            other => bail!("unsupported execution network {other}; expected mainnet or testnet"),
+        },
+    )?)
+}
 
 /// Build, sign, submit, and wait for an official Spot or Perp bulk order transaction.
 /// Spot: reads real PFS balances, automatically shrinks the grid if needed, and submits.
@@ -906,6 +928,107 @@ async fn cancel_spot_order(
         }
     }
     Ok(())
+}
+
+/// Move funds between a subaccount's Cross/collateral balance and PFS.
+/// Positive `amount` is PFS -> Cross; negative `amount` is Cross -> PFS.
+pub async fn transfer_spot_cross_pfs(
+    network: &str,
+    private_key: &str,
+    subaccount: &str,
+    metadata: &str,
+    amount: i64,
+) -> Result<String> {
+    submit_spot_account_management_entry(
+        network,
+        private_key,
+        "dex_accounts_entry::transfer_assets_between_non_collateral_and_collateral",
+        subaccount,
+        metadata,
+        Some(amount),
+    )
+    .await
+}
+
+async fn submit_spot_account_management_entry(
+    network: &str,
+    private_key: &str,
+    function_suffix: &str,
+    subaccount: &str,
+    metadata: &str,
+    amount: Option<i64>,
+) -> Result<String> {
+    let key = normalize_private_key(private_key)?;
+    let signer =
+        Ed25519Account::from_private_key_hex(&key).context("invalid Aptos Ed25519 private key")?;
+    let subaccount_addr: AccountAddress =
+        subaccount.parse().context("invalid subaccount address")?;
+    let metadata_addr: AccountAddress =
+        metadata.parse().context("invalid asset metadata address")?;
+    let package = package_for_network(network)?;
+    let aptos = aptos_for_network(network)?;
+    let entry_function = format!("{package}::{function_suffix}");
+    let mut payload = InputEntryFunctionData::new(&entry_function)
+        .arg(subaccount_addr)
+        .arg(metadata_addr);
+    if let Some(value) = amount {
+        payload = payload.arg(value);
+    }
+    let payload = payload
+        .build()
+        .context("build Spot account-management transaction")?;
+    let gas_price = aptos
+        .fullnode()
+        .estimate_gas_price()
+        .await?
+        .data
+        .recommended();
+    if gas_price == 0 {
+        bail!("Aptos returned a zero gas unit price")
+    }
+    let max_gas_amount = 50_000_000u64 / gas_price;
+    if max_gas_amount == 0 {
+        bail!("gas price exceeds the 0.5 APT transaction cap")
+    }
+    let raw = TransactionBuilder::new()
+        .sender(signer.address())
+        .sequence_number(aptos.get_sequence_number(signer.address()).await?)
+        .payload(payload)
+        .max_gas_amount(max_gas_amount)
+        .gas_unit_price(gas_price)
+        .chain_id(aptos.ensure_chain_id().await?)
+        .expiration_from_now(600)
+        .build()
+        .context("build Spot account-management transaction with 0.5 APT gas cap")?;
+    let signed = sign_transaction(&raw, &signer)
+        .with_context(|| format!("sign Spot account-management transaction ({entry_function})"))?;
+    let response = aptos
+        .submit_and_wait(&signed, Some(Duration::from_secs(60)))
+        .await
+        .with_context(|| {
+            format!("submit Spot account-management transaction ({entry_function})")
+        })?;
+    if !response
+        .data
+        .get("success")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        bail!(
+            "Spot account-management transaction failed: {}",
+            response
+                .data
+                .get("vm_status")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown VM status")
+        )
+    }
+    Ok(response
+        .data
+        .get("hash")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_owned())
 }
 
 /// Validate every Move-side bulk invariant before signing anything.
@@ -1846,9 +1969,10 @@ impl DecibelClient {
         let bulk_rows = bulk_data
             .as_array()
             .ok_or_else(|| anyhow!("/bulk_orders did not return an array"))?;
-        if let Some(latest) = bulk_rows.iter().max_by_key(|row| {
-            integer_field(row, "sequence_number").unwrap_or_default()
-        }) {
+        if let Some(latest) = bulk_rows
+            .iter()
+            .max_by_key(|row| integer_field(row, "sequence_number").unwrap_or_default())
+        {
             let sequence = integer_field(latest, "sequence_number").unwrap_or_default();
             append_bulk_levels(
                 &mut orders,
@@ -2230,12 +2354,12 @@ fn parse_spot_funds(overview: &Value, market: &Market) -> Option<SpotFunds> {
                         .get("reserved_asset")
                         .and_then(Value::as_str)
                         .unwrap_or_default();
-                    let is_base = base_asset_address
-                        .is_some_and(|expected| normalized_address(asset) == normalized_address(expected))
-                        || asset.eq_ignore_ascii_case(&base_symbol);
-                    let is_quote = quote_asset_address
-                        .is_some_and(|expected| normalized_address(asset) == normalized_address(expected))
-                        || asset.eq_ignore_ascii_case(&quote_symbol);
+                    let is_base = base_asset_address.is_some_and(|expected| {
+                        normalized_address(asset) == normalized_address(expected)
+                    }) || asset.eq_ignore_ascii_case(&base_symbol);
+                    let is_quote = quote_asset_address.is_some_and(|expected| {
+                        normalized_address(asset) == normalized_address(expected)
+                    }) || asset.eq_ignore_ascii_case(&quote_symbol);
                     if is_base {
                         (base + amount, quote)
                     } else if is_quote {
@@ -2653,12 +2777,16 @@ mod tests {
 
         assert!(plan.bids.len() >= 2, "expected surviving bid levels");
         assert!(
-            plan.bids.windows(2).all(|pair| pair[0].price > pair[1].price),
+            plan.bids
+                .windows(2)
+                .all(|pair| pair[0].price > pair[1].price),
             "bids must be strictly descending for the bulk ABI, got {:?}",
             plan.bids.iter().map(|l| l.price).collect::<Vec<_>>()
         );
         assert!(
-            plan.asks.windows(2).all(|pair| pair[0].price < pair[1].price),
+            plan.asks
+                .windows(2)
+                .all(|pair| pair[0].price < pair[1].price),
             "asks must be strictly ascending for the bulk ABI"
         );
 
