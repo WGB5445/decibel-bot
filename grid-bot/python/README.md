@@ -269,8 +269,13 @@ python grid_bot.py perp ...
 | `--aptos-node-api-key` | `APTOS_NODE_API_KEY` | Aptos fullnode RPC API key，用于交易提交和 gas 查询。 |
 | `--maker-fee-rate` | `GRID_MAKER_FEE_RATE` | 覆盖 maker 手续费率。 |
 | `--preview-leverage` | `PREVIEW_LEVERAGE` | 预览保证金估算杠杆。 |
-| `--preview` | 无 | 单次只读预览。 |
+| `--preview` | 无 | 单次只读预览；不能与 `--log-file` 同时使用。 |
 | `--dry-run` | `DRY_RUN` | 持续刷新但不发送交易。 |
+| `--log-file` | `LOG_FILE` | 覆盖写入日志文件，并将 stdout/stderr 重定向到该文件。 |
+| `--spot-funding-amount` | `SPOT_FUNDING_AMOUNT` | Spot 启动前从 Cross 转入 PFS 的 USDC 数量；只支持 Cross → PFS。 |
+| `--spot-funding-metadata` | `SPOT_FUNDING_METADATA` | Cross → PFS 使用的 quote asset metadata 地址。 |
+
+`--log-file PATH`（或 `LOG_FILE`）会覆盖写入日志文件，并将 Python 的 stdout/stderr 和 logging 输出都写入其中；不能与 `--preview` 同时使用。
 
 ### 合约模式参数
 
@@ -861,16 +866,33 @@ GRID_LEVELS_PER_SIDE=40
 
 ### Spot 资金
 
-Spot 双向网格理论上需要：
+Spot bulk 订单只从 **PFS (Primary Fungible Store)** 取资金，不会直接使用 Cross/collateral 中的 USDC。现货账户中的 `positions` 是扣除 in-flight reservation 后的余额；在替换已有 bulk ladder 时，已有 escrow 会计入 replacement 可用量。
 
-```text
-quote 余额 >= 所有 Bid 的总名义价值 + 手续费缓冲
-base 余额 >= 所有 Ask 的总 base 数量
+程序现在会：
+
+- 区分 PFS base/quote、bulk escrow 和 Cross USDC；
+- Spot 强制使用 order book mid，不使用 Perp 专用 `/prices` feed；
+- 在首次铺网格前最多执行 6 次有界 IOC 买入，补足缺失 base；IOC 只使用 bid reserve 之外的 PFS quote；
+- funding 完成后重新读取余额；如果仍不足，则保留最靠近 mid 的档位并按 `Bid 降序 / Ask 升序` 提交；
+- 已有 bulk ladder 与目标完全一致时跳过 replacement；同样档位数量下的小幅漂移在 30 秒冷却期内跳过。
+
+首次运行 Spot 时，推荐先预览：
+
+```bash
+python grid_bot.py spot --preview
 ```
 
-如果资金不够，预览会显示警告，但程序不会自动借贷、转账或减少网格数量。
+如果 USDC 在 Cross 而不是 PFS，可显式请求 Cross → PFS 转账（负数方向由程序固定处理）：
 
-你可以通过以下方式降低资金需求：
+```bash
+python grid_bot.py spot \
+  --spot-funding-amount 945.910599 \
+  --spot-funding-metadata 0x5428acf5c112826d0c74ea1cd2de9030f53d1d01235e6c2621d967bf914ee1c8
+```
+
+程序只提交 `transfer_assets_between_non_collateral_and_collateral`，不会提交 `HOLD_AS_NON_COLLATERAL`：后者是 subaccount owner-only 设置，必须由 owner 在 Decibel UI/wallet 手动完成。Testnet USDC metadata 如上；mainnet 必须提供对应网络的 metadata 地址。
+
+如果 PFS 资金不足，程序不会借贷；它会尝试上述一次性 IOC 补 base，并将最终 bulk ladder 缩减到实际 PFS/escrow 可支持的档位。你也可以通过以下方式降低资金需求:
 
 - 减少 `--levels-per-side`；
 - 减少 `--order-size`；
@@ -918,19 +940,31 @@ python grid_bot.py perp --preview --preview-leverage 5
 
 Decibel bulk order 使用递增的 sequence number。
 
-程序启动时会读取已有 bulk order，尝试从最大 sequence 后继续递增。刷新时提交新的 sequence。
+程序启动时会读取已有 bulk order,尝试从最大 sequence 后继续递增。刷新时提交新的 sequence。
 
-不要同时运行：
+程序会在启动时为 `(network, subaccount)` 获取一把非阻塞的文件锁（与市场/产品无关），锁文件位于：
+
+```text
+${DECIBEL_GRID_DATA_DIR:-~/.local/share}/decibel-grid/locks/subaccount-<sha256>.lock
+```
+
+同一 subaccount 的第二个进程会立即报错退出，而不是继续运行并与第一个进程竞争 bulk sequence 或 Spot funding。因此不要尝试在同一 subaccount 下并行运行多个实例，否则会看到：
+
+```text
+another grid process is already running for network <network> and this subaccount; stop it before starting a second instance
+```
+
+即使在锁生效之前，同时运行:
 
 ```text
 同一个 subaccount + 同一个产品 + 同一个市场
 ```
 
-的多个机器人实例，否则可能出现：
+的多个机器人实例仍然可能出现:
 
-- sequence 冲突；
-- 新订单被旧进程覆盖；
-- 取消操作互相影响；
+- sequence 冲突;
+- 新订单被旧进程覆盖;
+- 取消操作互相影响;
 - 网格状态无法判断。
 
 如果程序异常退出，重新启动前建议：

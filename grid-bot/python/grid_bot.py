@@ -4,18 +4,25 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import fcntl
+import hashlib
 import logging
 import os
 import signal
+import sys
+import time
 from dataclasses import dataclass
 from decimal import ROUND_DOWN, Decimal
+from pathlib import Path
 from typing import Literal
 
 from aptos_sdk.account import Account
 from aptos_sdk.ed25519 import PrivateKey
 from decibel import NAMED_CONFIGS, BaseSDKOptions, DecibelWriteDex, PlaceBulkOrdersSuccess
+from decibel._transaction_builder import InputEntryFunctionData
 from decibel._utils import FetchError, get_primary_subaccount_addr
 from decibel.read import DecibelReadDex, PerpMarket
+from decibel.write import TimeInForce
 from dotenv import load_dotenv
 
 Product = Literal["spot", "perp"]
@@ -23,6 +30,10 @@ PerpMode = Literal["neutral", "long", "short"]
 PriceSource = Literal["depth", "prices"]
 RangeMode = Literal["bounds", "percent", "step"]
 MAX_BULK_LEVELS_PER_SIDE = 40
+BULK_REPLACEMENT_COOLDOWN_SECONDS = 30.0
+MAX_TAKER_FUNDING_ATTEMPTS = 6
+TAKER_SLIPPAGE = Decimal("0.003")
+TAKER_FEE_BUFFER = Decimal("0.001")
 LOG = logging.getLogger("decibel_grid")
 
 
@@ -50,6 +61,9 @@ class GridConfig:
     preview_leverage: Decimal
     price_source: PriceSource
     dry_run: bool
+    log_file: str | None = None
+    spot_funding_amount: Decimal | None = None
+    spot_funding_metadata: str | None = None
 
     @classmethod
     def from_env_and_args(cls, product: Product, args: argparse.Namespace) -> GridConfig:
@@ -143,6 +157,18 @@ class GridConfig:
             ),
             price_source=str(first_set(args.price_source, "PRICE_SOURCE", "depth")),
             dry_run=args.dry_run or os.getenv("DRY_RUN", "false").lower() == "true",
+            log_file=(
+                str(first_set(args.log_file, "LOG_FILE"))
+                if first_set(args.log_file, "LOG_FILE")
+                else None
+            ),
+            spot_funding_amount=optional_decimal_value(
+                "SPOT_FUNDING_AMOUNT",
+                first_set(args.spot_funding_amount, "SPOT_FUNDING_AMOUNT"),
+            ),
+            spot_funding_metadata=str(
+                first_set(args.spot_funding_metadata, "SPOT_FUNDING_METADATA")
+            ) if first_set(args.spot_funding_metadata, "SPOT_FUNDING_METADATA") else None,
         )
         if config.levels_per_side < 1 or config.levels_per_side > MAX_BULK_LEVELS_PER_SIDE:
             raise ValueError(
@@ -194,6 +220,32 @@ class GridOrders:
 
 
 @dataclass(frozen=True)
+class SpotFunds:
+    base_balance: Decimal
+    quote_balance: Decimal
+    base_reserved: Decimal = Decimal(0)
+    quote_reserved: Decimal = Decimal(0)
+    quote_cross_balance: Decimal = Decimal(0)
+
+    @property
+    def available_base(self) -> Decimal:
+        return max(self.base_balance, Decimal(0))
+
+    @property
+    def available_quote(self) -> Decimal:
+        # Bulk orders can source only from the PFS, never Cross/collateral.
+        return max(self.quote_balance, Decimal(0))
+
+    @property
+    def available_base_for_bulk(self) -> Decimal:
+        return max(self.base_balance + self.base_reserved, Decimal(0))
+
+    @property
+    def available_quote_for_bulk(self) -> Decimal:
+        return max(self.quote_balance + self.quote_reserved, Decimal(0))
+
+
+@dataclass(frozen=True)
 class ProfitPreview:
     pair_count: int
     gross_profit: Decimal
@@ -212,6 +264,31 @@ class FundingPreview:
     required_margin: Decimal | None
     available_margin: Decimal | None
     warnings: list[str]
+
+
+def fit_spot_orders_to_funds(
+    orders: GridOrders, funds: SpotFunds, maker_fee_rate: Decimal = Decimal(0)
+) -> GridOrders:
+    """Keep the nearest levels that the PFS can fund, preserving ABI ordering."""
+    bid_count = 0
+    quote_used = Decimal(0)
+    for price, size in zip(orders.bid_prices, orders.bid_sizes, strict=True):
+        cost = price * size * (Decimal(1) + maker_fee_rate)
+        if quote_used + cost > funds.available_quote_for_bulk:
+            break
+        quote_used += cost
+        bid_count += 1
+    ask_count = 0
+    base_used = Decimal(0)
+    for size in orders.ask_sizes:
+        if base_used + size > funds.available_base_for_bulk:
+            break
+        base_used += size
+        ask_count += 1
+    return GridOrders(
+        orders.bid_prices[:bid_count], orders.bid_sizes[:bid_count],
+        orders.ask_prices[:ask_count], orders.ask_sizes[:ask_count],
+    )
 
 
 class GridMath:
@@ -458,7 +535,62 @@ def chain_units_to_decimal(value: int | float, decimals: int) -> Decimal:
 
 
 def normalize_addr(value: str) -> str:
-    return value.lower().removeprefix("0x").lstrip("0") or "0"
+    return value.strip().lower().removeprefix("0x").lstrip("0") or "0"
+
+
+def compute_spot_taker_funding(
+    funds: SpotFunds,
+    orders: GridOrders,
+    best_ask: Decimal,
+    tick_size: Decimal,
+    lot_size: Decimal,
+    min_size: Decimal,
+) -> tuple[Decimal, Decimal, Decimal]:
+    """Return (base_gap, limit_price, IOC quantity) without consuming bid reserve."""
+    if best_ask <= 0:
+        raise ValueError("best ask must be positive for Spot IOC funding")
+    required_quote = sum(
+        (price * size for price, size in zip(orders.bid_prices, orders.bid_sizes, strict=True)),
+        Decimal(0),
+    )
+    base_gap = max(sum(orders.ask_sizes, Decimal(0)) - funds.available_base_for_bulk, Decimal(0))
+    quote_surplus = min(
+        max(funds.available_quote_for_bulk - required_quote, Decimal(0)),
+        funds.available_quote,
+    )
+    limit_price = quantize_down(best_ask * (Decimal(1) + TAKER_SLIPPAGE), tick_size)
+    affordable = quote_surplus / (limit_price * (Decimal(1) + TAKER_FEE_BUFFER))
+    quantity = quantize_down(min(base_gap, affordable), lot_size)
+    if quantity < min_size:
+        quantity = Decimal(0)
+    return base_gap, limit_price, quantity
+
+
+class SubaccountRunLock:
+    """Non-blocking process lock shared by all markets on one subaccount."""
+
+    def __init__(self, network: str, subaccount: str) -> None:
+        root = Path(os.getenv("DECIBEL_GRID_DATA_DIR", Path.home() / ".local" / "share"))
+        lock_dir = root / "decibel-grid" / "locks"
+        lock_dir.mkdir(parents=True, exist_ok=True)
+        key = f"{network.strip().lower()}:{normalize_addr(subaccount)}".encode()
+        path = lock_dir / f"subaccount-{hashlib.sha256(key).hexdigest()}.lock"
+        self._file = path.open("a+")
+        try:
+            fcntl.flock(self._file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            self._file.close()
+            raise RuntimeError(
+                f"another grid process is already running for network {network} and this "
+                "subaccount; stop it before starting a second instance"
+            ) from exc
+
+    def __enter__(self) -> SubaccountRunLock:
+        return self
+
+    def __exit__(self, *_: object) -> None:
+        fcntl.flock(self._file.fileno(), fcntl.LOCK_UN)
+        self._file.close()
 
 
 class DecibelGridExecution:
@@ -596,13 +728,55 @@ class GridBot:
             and self.market is not None
             and self.subaccount
         )
+        # One process lock per (network, subaccount), independent of market, so two processes
+        # cannot race bulk sequence numbers or Spot funding for the same subaccount.
+        with SubaccountRunLock(self.config.network, self.subaccount):
+            await self._run_loop()
+
+    async def _run_loop(self) -> None:
+        assert (
+            self.read is not None
+            and self.write is not None
+            and self.market is not None
+            and self.subaccount
+        )
+        if self.config.product == "spot" and not self.config.dry_run:
+            await self._transfer_cross_to_pfs()
         executor = DecibelGridExecution(
             self.write, self.config, self.market, self.subaccount, await self._next_bulk_sequence()
         )
+        # One-shot Spot base funding: only ever attempted once per process, and only before
+        # any bulk ladder is resting, since re-buying after each sell fill would hand back the
+        # captured spread plus taker fees.
+        spot_base_funded = self.config.product != "spot" or self.config.dry_run
+        last_bulk_replacement_at: float | None = None
+        last_submitted_level_count: int | None = None
         try:
             while not self.stop_event.is_set():
                 try:
+                    if not spot_base_funded:
+                        spot_base_funded = True
+                        try:
+                            await self._fund_spot_base_if_needed()
+                        except Exception:
+                            LOG.exception("Spot base funding failed; ask side will be shrunk")
                     orders = await self._build_orders()
+                    if self.config.product == "spot":
+                        funds = await self._spot_funds()
+                        fee = await self._maker_fee_rate()
+                        fitted = fit_spot_orders_to_funds(orders, funds, fee)
+                        if len(fitted.bid_prices) < len(orders.bid_prices) or len(
+                            fitted.ask_prices
+                        ) < len(orders.ask_prices):
+                            LOG.warning(
+                                "Spot PFS limited the grid: %d bid(s) + %d ask(s) fit "
+                                "(planned %d + %d)",
+                                len(fitted.bid_prices),
+                                len(fitted.ask_prices),
+                                len(orders.bid_prices),
+                                len(orders.ask_prices),
+                            )
+                        orders = fitted
                     if self.config.product == "perp" and not await self._position_is_safe(orders):
                         LOG.warning(
                             "perp position limit or worst-case grid exposure reached; "
@@ -610,7 +784,33 @@ class GridBot:
                         )
                         await executor.cancel()
                     else:
-                        await executor.place(orders)
+                        level_count = len(orders.bid_prices) + len(orders.ask_prices)
+                        structural_change = (
+                            last_submitted_level_count is None
+                            or last_submitted_level_count != level_count
+                        )
+                        cooldown_active = (
+                            last_bulk_replacement_at is not None
+                            and (time.monotonic() - last_bulk_replacement_at)
+                            < BULK_REPLACEMENT_COOLDOWN_SECONDS
+                        )
+                        if await self._bulk_matches(orders):
+                            LOG.info(
+                                "bulk ladder already matches desired levels; replacement skipped"
+                            )
+                            last_bulk_replacement_at = time.monotonic()
+                            last_submitted_level_count = level_count
+                        elif cooldown_active and not structural_change:
+                            LOG.info(
+                                "bulk replacement skipped: minor ladder drift during %ds "
+                                "cooldown (%d desired levels; no level-count change)",
+                                int(BULK_REPLACEMENT_COOLDOWN_SECONDS),
+                                level_count,
+                            )
+                        else:
+                            await executor.place(orders)
+                            last_bulk_replacement_at = time.monotonic()
+                            last_submitted_level_count = level_count
                 except Exception:
                     LOG.exception("grid refresh failed")
                     if self.config.product == "perp" and not self.config.dry_run:
@@ -632,6 +832,117 @@ class GridBot:
                     LOG.exception("failed to cancel grid during shutdown")
             await self.read.close()
 
+    async def _transfer_cross_to_pfs(self) -> None:
+        """Move an explicitly requested USDC amount from Cross into Spot PFS.
+
+        HOLD_AS_NON_COLLATERAL is deliberately not changed here: that Move entry function is
+        owner-only and a trading signer/delegate cannot safely submit it on the operator's behalf.
+        """
+        assert self.write is not None and self.subaccount
+        amount = self.config.spot_funding_amount
+        metadata = self.config.spot_funding_metadata
+        if amount is None:
+            return
+        if not metadata:
+            raise ValueError(
+                "SPOT_FUNDING_METADATA/--spot-funding-metadata is required with "
+                "SPOT_FUNDING_AMOUNT"
+            )
+        if amount < 0:
+            raise ValueError("SPOT_FUNDING_AMOUNT cannot be negative")
+        raw_amount = int((amount * Decimal(1_000_000)).to_integral_value(rounding=ROUND_DOWN))
+        if raw_amount <= 0:
+            raise ValueError("SPOT_FUNDING_AMOUNT is below one USDC micro-unit")
+        network = NAMED_CONFIGS[self.config.network]
+        package = network.deployment.package
+        payload = InputEntryFunctionData(
+            function=f"{package}::dex_accounts_entry::transfer_assets_between_non_collateral_and_collateral",
+            type_arguments=[],
+            function_arguments=[self.subaccount, metadata, -raw_amount],
+        )
+        LOG.warning(
+            "NOTICE: HOLD_AS_NON_COLLATERAL is owner-only and is not submitted by this bot. "
+            "Set it manually in the Decibel UI/wallet before relying on future Spot proceeds "
+            "staying in PFS."
+        )
+        LOG.info("Transferring %s USDC from Cross to PFS", amount)
+        result = await self.write._send_tx(payload)  # type: ignore[attr-defined]
+        LOG.info("Cross to PFS transfer submitted: tx=%s", result.get("hash", ""))
+
+    async def _fund_spot_base_if_needed(self) -> None:
+        """Buy any Spot base shortfall with bounded IOC orders before the first placement."""
+        assert (
+            self.read is not None
+            and self.write is not None
+            and self.market is not None
+            and self.subaccount
+        )
+        orders = await self._build_orders()
+        funds = await self._spot_funds()
+        ask_total = sum(orders.ask_sizes, Decimal(0))
+        base_gap = max(ask_total - funds.available_base_for_bulk, Decimal(0))
+        if base_gap <= 0:
+            return
+        tick = chain_units_to_decimal(self.market.tick_size, self.market.px_decimals)
+        lot = chain_units_to_decimal(self.market.lot_size, self.market.sz_decimals)
+        min_size = chain_units_to_decimal(self.market.min_size, self.market.sz_decimals)
+        LOG.info(
+            "Spot base funding: plan needs %s base, PFS holds %s, buying up to %s with IOC orders.",
+            sum(orders.ask_sizes, Decimal(0)),
+            funds.available_base_for_bulk,
+            base_gap,
+        )
+        for attempt in range(1, MAX_TAKER_FUNDING_ATTEMPTS + 1):
+            depth = await self.read.market_depth.get_by_addr(self.market.market_addr, limit=1)
+            if not depth.asks:
+                raise ValueError(f"Spot order book for {self.market.market_name} has no ask")
+            best_ask = Decimal(str(depth.asks[0].price))
+            remaining_gap, limit_price, quantity = compute_spot_taker_funding(
+                funds, orders, best_ask, tick, lot, min_size
+            )
+            if remaining_gap <= 0:
+                return
+            if quantity <= 0:
+                LOG.info(
+                    "Spot IOC funding stopped with %s base remaining; below minimum order "
+                    "size %s at %s quote.",
+                    remaining_gap,
+                    min_size,
+                    limit_price,
+                )
+                return
+            # The SDK's spot order writer accepts chain units, unlike the pure Decimal
+            # planning code above. Keep the IOC bound aligned with the market tick/lot ABI.
+            result = await self.write.place_spot_order(
+                price=scale_to_chain_units(limit_price, self.market.px_decimals),
+                size=scale_to_chain_units(quantity, self.market.sz_decimals),
+                is_buy=True,
+                time_in_force=TimeInForce.ImmediateOrCancel,
+                market_addr=self.market.market_addr,
+                subaccount_addr=self.subaccount,
+                tick_size=self.market.tick_size,
+            )
+            LOG.info(
+                "  IOC %d/%d: buy up to %s at limit %s, tx=%s",
+                attempt,
+                MAX_TAKER_FUNDING_ATTEMPTS,
+                quantity,
+                limit_price,
+                getattr(result, "transaction_hash", ""),
+            )
+            funds = await self._spot_funds()
+            remaining = max(ask_total - funds.available_base_for_bulk, Decimal(0))
+            LOG.info(
+                "  filled to %s base; %s still needed", funds.available_base_for_bulk, remaining
+            )
+            if remaining <= 0:
+                return
+        LOG.warning(
+            "Spot funding stopped short of the planned asks after %d IOC attempts; "
+            "the ask side will be shrunk to fit.",
+            MAX_TAKER_FUNDING_ATTEMPTS,
+        )
+
     async def _build_orders(self, maker_fee_rate: Decimal | None = None) -> GridOrders:
         assert self.market is not None
         mid = await self._mid_price()
@@ -647,7 +958,9 @@ class GridBot:
 
     async def _mid_price(self) -> Decimal:
         assert self.read is not None and self.market is not None
-        if self.config.price_source == "prices":
+        # `/prices` is a perpetual feed. Spot always uses its live order book,
+        # even when PRICE_SOURCE=prices was inherited from a perp configuration.
+        if self.config.product != "spot" and self.config.price_source == "prices":
             return await self._mid_from_prices()
         try:
             depth = await self.read.market_depth.get_by_addr(self.market.market_addr, limit=1)
@@ -756,26 +1069,61 @@ class GridBot:
                 None,
                 ["Spot inventory is unavailable; cannot verify funds."],
             )
-        assets = await self.read.spot_market_assets(self.market.market_addr)
-        balances = {
-            position.asset_addr.lower(): Decimal(str(position.amount))
-            for position in overview.spot.positions
-        }
-        base_available = balances.get(assets.base_asset_addr.lower(), Decimal(0))
-        quote_available = balances.get(assets.quote_asset_addr.lower(), Decimal(0))
+        funds = await self._spot_funds(overview)
         warnings = []
-        if quote_available < quote_required:
-            warnings.append("INSUFFICIENT QUOTE: not enough quote asset to reserve all spot bids.")
-        if base_available < base_required:
+        if funds.available_quote_for_bulk < quote_required:
+            warnings.append(
+                "INSUFFICIENT PFS QUOTE: Cross/collateral USDC cannot fund Spot bulk bids; "
+                "transfer it to PFS first."
+            )
+        if funds.available_base_for_bulk < base_required:
             warnings.append("INSUFFICIENT BASE: not enough base asset to reserve all spot asks.")
+        if funds.quote_cross_balance > 0:
+            warnings.append(
+                f"Cross USDC {funds.quote_cross_balance:.8f} is diagnostic only; "
+                "the bot cannot use it directly for Spot bulk bids."
+            )
         return FundingPreview(
             quote_required,
-            quote_available,
+            funds.available_quote_for_bulk,
             base_required,
-            base_available,
+            funds.available_base_for_bulk,
             None,
             None,
             warnings,
+        )
+
+    async def _spot_funds(self, overview: object | None = None) -> SpotFunds:
+        assert self.read is not None and self.market is not None and self.subaccount
+        if overview is None:
+            overview = await self.read.account_overview.get_by_addr(sub_addr=self.subaccount)
+        spot = getattr(overview, "spot", None)
+        if spot is None:
+            raise ValueError("Spot inventory is unavailable from account overview")
+        assets = await self.read.spot_market_assets(self.market.market_addr)
+        base_addr = normalize_addr(assets.base_asset_addr)
+        quote_addr = normalize_addr(assets.quote_asset_addr)
+        positions = {
+            normalize_addr(position.asset_addr): Decimal(str(position.amount))
+            for position in spot.positions
+        }
+        base_reserved = Decimal(0)
+        quote_reserved = Decimal(0)
+        for order in spot.in_flight_orders:
+            amount = max(Decimal(str(order.reserved_amount)), Decimal(0))
+            if normalize_addr(order.reserved_asset) == base_addr:
+                base_reserved += amount
+            elif normalize_addr(order.reserved_asset) == quote_addr:
+                quote_reserved += amount
+        return SpotFunds(
+            base_balance=positions.get(base_addr, Decimal(0)),
+            quote_balance=positions.get(quote_addr, Decimal(0)),
+            base_reserved=base_reserved,
+            quote_reserved=quote_reserved,
+            quote_cross_balance=max(
+                Decimal(str(getattr(overview, "usdc_cross_withdrawable_balance", 0) or 0)),
+                Decimal(0),
+            ),
         )
 
     async def _position_is_safe(self, orders: GridOrders) -> bool:
@@ -795,6 +1143,32 @@ class GridBot:
             abs(current) < self.config.max_position
             and abs(worst_long) <= self.config.max_position
             and abs(worst_short) <= self.config.max_position
+        )
+
+    async def _bulk_matches(self, orders: GridOrders) -> bool:
+        """Reconcile the desired ladder against the latest active bulk row."""
+        assert self.read is not None and self.market is not None and self.subaccount
+        rows = await self.read.user_bulk_orders.get_by_addr(
+            sub_addr=self.subaccount,
+            market=self.market.market_addr,
+            asset_type=self.config.product,
+        )
+        active = [row for row in rows if row.cancellation_reason is None]
+        if not active:
+            return False
+        row = max(active, key=lambda item: item.sequence_number)
+
+        def same(values: list[float], wanted: list[Decimal]) -> bool:
+            pairs = zip(values, wanted, strict=True)
+            return len(values) == len(wanted) and all(
+                Decimal(str(actual)) == expected for actual, expected in pairs
+            )
+
+        return (
+            same(row.bid_prices, orders.bid_prices)
+            and same(row.bid_sizes, orders.bid_sizes)
+            and same(row.ask_prices, orders.ask_prices)
+            and same(row.ask_sizes, orders.ask_sizes)
         )
 
     async def _next_bulk_sequence(self) -> int:
@@ -871,6 +1245,22 @@ def print_preview(
         print("Funding check: sufficient for the previewed worst-case reservation.")
 
 
+def redirect_output_to_log(path_value: str) -> None:
+    """Truncate a log file and redirect both Python stdout and stderr to it."""
+    path = Path(path_value).expanduser()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    stream = path.open("w", encoding="utf-8")
+    sys.stdout = stream
+    sys.stderr = stream
+    logging.basicConfig(
+        level=os.getenv("LOG_LEVEL", "INFO"),
+        format="%(asctime)s %(levelname)s %(message)s",
+        stream=stream,
+        force=True,
+    )
+    print(f"CLI log started; output is being overwritten at {path}", flush=True)
+
+
 def parse_args() -> tuple[Product, argparse.Namespace]:
     parser = argparse.ArgumentParser(description="Decibel spot/perpetual grid bot")
     parser.add_argument("product", choices=("spot", "perp"), help="market product")
@@ -931,13 +1321,30 @@ def parse_args() -> tuple[Product, argparse.Namespace]:
     parser.add_argument(
         "--dry-run", action="store_true", help="run refresh loop but send no transactions"
     )
+    parser.add_argument(
+        "--log-file",
+        help="truncate and redirect stdout/stderr to this file (also LOG_FILE)",
+    )
+    parser.add_argument(
+        "--spot-funding-amount",
+        help="USDC amount to transfer from Cross to PFS before running Spot",
+    )
+    parser.add_argument(
+        "--spot-funding-metadata",
+        help="Spot quote asset metadata address (required with --spot-funding-amount)",
+    )
     args = parser.parse_args()
     return args.product, args
 
 
 async def main() -> None:
     product, args = parse_args()
-    bot = GridBot(GridConfig.from_env_and_args(product, args))
+    config = GridConfig.from_env_and_args(product, args)
+    if config.log_file:
+        if args.preview:
+            raise ValueError("--log-file is not supported with --preview")
+        redirect_output_to_log(config.log_file)
+    bot = GridBot(config)
     if args.preview:
         await bot.preview()
         return

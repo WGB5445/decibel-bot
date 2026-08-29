@@ -4,9 +4,14 @@ import pytest
 
 from grid_bot import (
     MAX_BULK_LEVELS_PER_SIDE,
+    TAKER_FEE_BUFFER,
     GridConfig,
     GridMath,
+    GridOrders,
+    SpotFunds,
     chain_units_to_decimal,
+    compute_spot_taker_funding,
+    fit_spot_orders_to_funds,
     grid_side_counts,
     quantize_down,
     scale_to_chain_units,
@@ -185,3 +190,76 @@ def test_grid_rejects_size_below_market_minimum() -> None:
             Decimal("0.01"),
             Decimal("0.02"),
         )
+
+
+def test_spot_funds_available_base_and_quote_never_go_negative() -> None:
+    funds = SpotFunds(base_balance=Decimal("-1"), quote_balance=Decimal("-10"))
+    assert funds.available_base == Decimal(0)
+    assert funds.available_quote == Decimal(0)
+
+
+def test_spot_funds_available_for_bulk_credits_existing_escrow() -> None:
+    funds = SpotFunds(
+        base_balance=Decimal("8.078783"),
+        quote_balance=Decimal("0.0005"),
+        base_reserved=Decimal("70"),
+        quote_reserved=Decimal("100"),
+        quote_cross_balance=Decimal("958.884555"),
+    )
+    assert funds.available_base == Decimal("8.078783")
+    # Cross USDC is diagnostic only; it must never inflate available_quote.
+    assert funds.available_quote == Decimal("0.0005")
+    assert funds.available_base_for_bulk == Decimal("78.078783")
+    assert funds.available_quote_for_bulk == Decimal("100.0005")
+
+
+def test_fit_spot_orders_to_funds_keeps_nearest_levels_and_preserves_order() -> None:
+    orders = grid_orders(levels_per_side=3, order_size=Decimal("1"))
+    assert orders.bid_prices == [Decimal("96"), Decimal("93"), Decimal("90")]
+    assert orders.ask_prices == [Decimal("103"), Decimal("106"), Decimal("110")]
+    # Only enough quote for 1 bid (96) and enough base for 2 asks (1 + 1).
+    funds = SpotFunds(base_balance=Decimal("2"), quote_balance=Decimal("100"))
+    fitted = fit_spot_orders_to_funds(orders, funds)
+    assert fitted.bid_prices == [Decimal("96")]
+    assert fitted.ask_prices == [Decimal("103"), Decimal("106")]
+    # Bids stay descending and asks stay ascending, matching the Move bulk ABI requirement.
+    assert fitted.bid_prices == sorted(fitted.bid_prices, reverse=True)
+    assert fitted.ask_prices == sorted(fitted.ask_prices)
+
+
+def test_compute_spot_taker_funding_never_spends_bid_reserve() -> None:
+    orders = grid_orders(order_size=Decimal("1"))
+    # 500 quote free, 400 of it reserved for the grid's own bids -> 100 spare for funding.
+    funds = SpotFunds(base_balance=Decimal(0), quote_balance=Decimal("500"))
+    orders_with_costly_bids = GridOrders(
+        orders.bid_prices,
+        [Decimal("4")] * len(orders.bid_prices),
+        orders.ask_prices,
+        orders.ask_sizes,
+    )
+    base_gap, limit_price, quantity = compute_spot_taker_funding(
+        funds,
+        orders_with_costly_bids,
+        Decimal("100"),
+        Decimal("1"),
+        Decimal("0.01"),
+        Decimal("0.01"),
+    )
+    assert base_gap == sum(orders.ask_sizes, Decimal(0))
+    cost = quantity * limit_price * (Decimal(1) + TAKER_FEE_BUFFER)
+    assert cost <= Decimal("100")
+
+
+def test_compute_spot_taker_funding_credits_existing_bulk_escrow() -> None:
+    orders = grid_orders(order_size=Decimal("1"))
+    funds = SpotFunds(
+        base_balance=Decimal("1"),
+        quote_balance=Decimal("1000"),
+        base_reserved=Decimal("2"),
+    )
+    base_gap, _limit_price, _quantity = compute_spot_taker_funding(
+        funds, orders, Decimal("100"), Decimal("1"), Decimal("0.01"), Decimal("0.01")
+    )
+    # available_base_for_bulk is 3 (1 free + 2 escrowed), which already covers the 2-unit ask
+    # requirement, so crediting the escrow must zero the gap rather than leaving it at 1.
+    assert base_gap == Decimal(0)
