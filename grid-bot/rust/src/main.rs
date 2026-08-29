@@ -2,8 +2,9 @@ use std::{
     backtrace::Backtrace,
     fs,
     io::{self, Write},
+    os::fd::AsRawFd,
     panic::{self, PanicHookInfo},
-    path::PathBuf,
+    path::{Path, PathBuf},
     str::FromStr,
     time::Duration,
 };
@@ -298,6 +299,9 @@ struct Args {
         hide_env_values = true
     )]
     subaccount: Option<String>,
+    /// Write stdout and stderr to this file, replacing it at startup.
+    #[arg(long, global = true, env = "LOG_FILE")]
+    log_file: Option<PathBuf>,
     /// Human-readable USDC amount to move from Cross to PFS for `spot-funding-setup`.
     #[arg(long, global = true, env = "SPOT_FUNDING_AMOUNT", default_value = "0")]
     spot_funding_amount: String,
@@ -1175,6 +1179,100 @@ fn print_snapshot(snapshot: &MonitorSnapshot, config: &GridConfig) {
     }
 }
 
+/// Send this process's stdout and stderr to `path`, replacing any previous contents.
+///
+/// This replaces file descriptors 1 and 2 rather than merely wrapping `println!`, so panic
+/// reports and anything a dependency writes directly to those descriptors land in the same file.
+/// Rust's stdout is line-buffered even when it is not a terminal, so the file stays readable
+/// while a long `run` is still going.
+fn redirect_output_to_log(path: &Path) -> Result<()> {
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("cannot create log directory {}", parent.display()))?;
+    }
+    // Truncating open: each run starts from a clean file instead of appending to stale output.
+    let file = fs::File::create(path)
+        .with_context(|| format!("cannot create log file {}", path.display()))?;
+    let fd = file.as_raw_fd();
+    for (target, name) in [
+        (libc::STDOUT_FILENO, "stdout"),
+        (libc::STDERR_FILENO, "stderr"),
+    ] {
+        // SAFETY: `fd` is a valid descriptor owned by `file` and still open here, and `target`
+        // is one of the two standard descriptors, which are always valid dup2 targets.
+        if unsafe { libc::dup2(fd, target) } < 0 {
+            return Err(io::Error::last_os_error())
+                .with_context(|| format!("cannot redirect {name} to {}", path.display()));
+        }
+    }
+    // Descriptors 1 and 2 now reference the same open file, so the original handle is redundant.
+    drop(file);
+    Ok(())
+}
+
+struct SubaccountRunLock {
+    file: fs::File,
+}
+
+impl SubaccountRunLock {
+    /// Acquire one non-blocking process lock per network/subaccount. The lock is intentionally
+    /// independent of market so two processes cannot race bulk sequence numbers or funding for
+    /// different markets on the same subaccount.
+    fn acquire(network: &str, subaccount: &str) -> Result<Self> {
+        use sha3::{Digest, Sha3_256};
+
+        let base = std::env::var_os("DECIBEL_GRID_DATA_DIR")
+            .map(PathBuf::from)
+            .or_else(|| dirs::data_local_dir().or_else(dirs::data_dir))
+            .ok_or_else(|| anyhow::anyhow!("could not determine the local data directory"))?;
+        let lock_dir = base.join("decibel-grid").join("locks");
+        fs::create_dir_all(&lock_dir)
+            .with_context(|| format!("could not create lock directory {}", lock_dir.display()))?;
+        let canonical_subaccount = subaccount
+            .trim()
+            .trim_start_matches("0x")
+            .trim_start_matches('0')
+            .to_ascii_lowercase();
+        let key = format!(
+            "{}:{}",
+            network.trim().to_ascii_lowercase(),
+            canonical_subaccount
+        );
+        let digest = hex::encode(Sha3_256::digest(key.as_bytes()));
+        let path = lock_dir.join(format!("subaccount-{digest}.lock"));
+        let file = fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(&path)
+            .with_context(|| format!("could not open subaccount lock {}", path.display()))?;
+        // SAFETY: `file` is an open regular file descriptor. flock only changes kernel lock
+        // state for this descriptor and the lock is released automatically when it is dropped.
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+            let error = io::Error::last_os_error();
+            if error.kind() == io::ErrorKind::WouldBlock {
+                anyhow::bail!(
+                    "another grid process is already running for network {} and this subaccount; stop it before starting a second instance",
+                    network
+                )
+            }
+            return Err(error)
+                .with_context(|| format!("could not acquire subaccount lock {}", path.display()));
+        }
+        Ok(Self { file })
+    }
+}
+
+impl Drop for SubaccountRunLock {
+    fn drop(&mut self) {
+        // SAFETY: the descriptor belongs to this guard and remains open during Drop.
+        let _ = unsafe { libc::flock(self.file.as_raw_fd(), libc::LOCK_UN) };
+    }
+}
+
 fn install_panic_reporter() {
     let previous = panic::take_hook();
     panic::set_hook(Box::new(move |info: &PanicHookInfo<'_>| {
@@ -1230,6 +1328,19 @@ async fn main() -> Result<()> {
     install_panic_reporter();
     dotenv().ok();
     let cli = Cli::parse();
+    let opens_tui = matches!(&cli.command, Some(Cmd::Preview | Cmd::Tui) | None);
+    if let Some(path) = cli.args.log_file.as_deref() {
+        if opens_tui {
+            anyhow::bail!(
+                "--log-file is only supported by CLI commands (run/status/reconcile/doctor/shadow/check-key), not TUI/preview"
+            )
+        }
+        redirect_output_to_log(path)?;
+        println!(
+            "CLI log started; output is being overwritten at {}",
+            path.display()
+        );
+    }
     match cli.command {
         Some(Cmd::CheckKey) => check_api_key(Settings::from(&cli.args)).await,
         Some(Cmd::Reconcile) => reconcile_cli(Settings::from(&cli.args)).await,
@@ -1509,6 +1620,7 @@ async fn shadow_cli(settings: Settings, max_cycles: Option<usize>) -> Result<()>
     if max_cycles == Some(0) {
         anyhow::bail!("shadow --cycles must be at least 1")
     }
+    let _subaccount_lock = SubaccountRunLock::acquire(&settings.network, &settings.subaccount)?;
     let config = settings.to_grid_config()?;
     let api = settings.api_client()?;
     let run_id = journal::generate_run_id();
@@ -1637,6 +1749,17 @@ async fn run_cli(settings: Settings, execute: bool, confirm_mainnet: Option<&str
             "Mainnet execution requires --confirm-mainnet MAINNET (or CONFIRM_MAINNET=MAINNET)"
         )
     }
+    // Keep the guard for the entire live run. This covers bulk sequence reads, replacements, and
+    // Spot funding, preventing two processes for the same network/subaccount from racing each
+    // other. Read-only `run` monitoring does not need the lock.
+    let _subaccount_lock = if execute {
+        Some(SubaccountRunLock::acquire(
+            &settings.network,
+            &settings.subaccount,
+        )?)
+    } else {
+        None
+    };
     let config = settings.to_grid_config()?;
     let api = settings.api_client()?;
     let run_id = journal::generate_run_id();
@@ -1682,6 +1805,26 @@ async fn run_cli(settings: Settings, execute: bool, confirm_mainnet: Option<&str
         println!("Spot: only PFS balances will be used. No automatic Cross→PFS transfer.");
     }
 
+    // Spot base inventory is acquired at most ONCE per process. Acquiring the inventory a
+    // two-sided grid needs is a capital-allocation decision; topping it up again after a sell
+    // fill is not. The grid's profit comes from selling high and letting the *bid* side buy back
+    // lower, so re-buying at the ask after every fill would return the captured spread, plus
+    // taker fees, to the market on every round trip.
+    let mut spot_base_funded_this_run = false;
+    // A small mid-price move can change many quantized levels and otherwise cause a full bulk
+    // replacement every refresh. Keep a short cooldown for same-sized ladders; initial placement
+    // and structural changes (level count changes, fills, funding/affordability changes) bypass it.
+    const BULK_REPLACEMENT_COOLDOWN: Duration = Duration::from_secs(30);
+    let mut last_bulk_replacement_at: Option<tokio::time::Instant> = None;
+    // Total resting levels (bid_count + ask_count) from the last submitted bulk ladder. A
+    // changed level count means inventory/affordability moved (a fill, funding, or a PFS-driven
+    // shrink), which must replace immediately regardless of the cooldown.
+    let mut last_submitted_level_count: Option<usize> = None;
+    // Trade history is the reliable fill signal. Bulk synthetic order IDs change on every
+    // replacement because the sequence number changes, so comparing those IDs would falsely
+    // classify every replacement as a fill.
+    let mut last_seen_trade_ms: Option<i64> = None;
+
     loop {
         let cycle_start = tokio::time::Instant::now();
         let snapshot = match fetch_snapshot(&api, &config, optional_subaccount(&settings)).await {
@@ -1695,7 +1838,85 @@ async fn run_cli(settings: Settings, execute: bool, confirm_mainnet: Option<&str
         // Rebuild the plan without trade-history markers. Historical fills are a UI hint and
         // must not suppress a future desired order during reconciliation or execution.
         let mut snapshot = snapshot;
+        // Trade history is returned newest-first. A newly observed trade is a strong trigger for
+        // replacement; a small price-only drift is not. Seed the cursor on the first cycle so
+        // historical fills from before this process started do not cause an immediate refresh.
+        let latest_trade_ms = snapshot.trades.iter().map(|trade| trade.timestamp_ms).max();
+        let new_trade_observed = match (last_seen_trade_ms, latest_trade_ms) {
+            (Some(previous), Some(latest)) => latest > previous,
+            (None, Some(_)) => false,
+            _ => false,
+        };
+        if let Some(latest) = latest_trade_ms {
+            last_seen_trade_ms =
+                Some(last_seen_trade_ms.map_or(latest, |previous| previous.max(latest)));
+        }
         snapshot.plan = build_plan(&config, &snapshot.market, snapshot.plan.mid)?;
+
+        // Read the resting orders BEFORE fitting a Spot plan to PFS. Fitting first shrinks the
+        // ask side to whatever base is already held, which makes the plan match the chain
+        // exactly (`0 missing`) and hides the very shortfall that funding is supposed to close.
+        let mut actual_for_execution = None;
+        if execute {
+            let actual = match api
+                .open_orders(&settings.subaccount, &snapshot.market)
+                .await
+            {
+                Ok(orders) => orders,
+                Err(e) => {
+                    eprintln!("reconciliation failed (open_orders): {e:#}; skipping cycle");
+                    tokio::time::sleep(config.refresh).await;
+                    continue;
+                }
+            };
+            // Compare the complete configured plan with current PFS plus the active bulk
+            // escrow. Try this at most once per process: retrying after a sell fill would buy
+            // inventory back at the ask and return the captured spread plus taker fees.
+            let needs_spot_base = !spot_base_funded_this_run
+                && snapshot.market.product == Product::Spot
+                && decibel_grid_tui::reconcile::blocking_orders(&actual).is_empty();
+            if needs_spot_base
+                && let Some(funds) = &snapshot.account.spot_funds
+                && funds.available_base_for_bulk() < snapshot.plan.base_required
+            {
+                // Consume the one-shot attempt before submitting, including on failure; a later
+                // refresh must not turn a transient funding problem into repeated taker buys.
+                spot_base_funded_this_run = true;
+                let funding_result = decibel_grid_tui::fund_spot_base_for_grid(
+                    &settings.network,
+                    &settings.api_key,
+                    &settings.aptos_private_key,
+                    &settings.subaccount,
+                    &snapshot.market,
+                    &snapshot.plan,
+                )
+                .await;
+                match &funding_result {
+                    Ok(funding) if funding.bought_base > rust_decimal::Decimal::ZERO => {
+                        println!(
+                            "Spot base funded: bought {} to cover a {} shortfall.",
+                            funding.bought_base, funding.base_gap_before
+                        );
+                    }
+                    Ok(_) => {}
+                    Err(error) => eprintln!("Spot base funding skipped: {error:#}"),
+                }
+                // Always re-read balances after the funding attempt. IOC can partially fill
+                // before returning an error; fitting against the pre-funding snapshot would
+                // discard the newly bought inventory for this cycle.
+                match api
+                    .account(Some(&settings.subaccount), &snapshot.market)
+                    .await
+                {
+                    Ok(account) => snapshot.account = account,
+                    Err(error) => {
+                        eprintln!("  balance refresh after funding failed: {error:#}")
+                    }
+                }
+            }
+            actual_for_execution = Some(actual);
+        }
+
         if let Some(adjustment) = fit_spot_snapshot_to_pfs(&mut snapshot)? {
             println!("Spot PFS limited the grid: {adjustment}");
         }
@@ -1715,18 +1936,9 @@ async fn run_cli(settings: Settings, execute: bool, confirm_mainnet: Option<&str
         }
 
         if execute {
-            // 1. Reconcile desired plan with actual open orders
-            let actual = match api
-                .open_orders(&settings.subaccount, &snapshot.market)
-                .await
-            {
-                Ok(orders) => orders,
-                Err(e) => {
-                    eprintln!("reconciliation failed (open_orders): {e:#}; skipping cycle");
-                    tokio::time::sleep(config.refresh).await;
-                    continue;
-                }
-            };
+            // 1. Reconcile using the order snapshot fetched before Spot funding/fitting.
+            let actual = actual_for_execution
+                .ok_or_else(|| anyhow::anyhow!("execution order snapshot was not available"))?;
             let desired = decibel_grid_tui::reconcile::desired_orders(
                 &snapshot.plan,
                 snapshot.market.tick_size,
@@ -1778,6 +1990,8 @@ async fn run_cli(settings: Settings, execute: bool, confirm_mainnet: Option<&str
                 // 3. Submit the FULL desired plan. The Decibel bulk ABI atomically replaces the
                 // entire order ladder for this (subaccount, market) pair — it does not merge.
 
+                // Spot base funding already ran before the plan was fitted to PFS, so this plan
+                // already reflects any inventory that was bought this cycle.
                 let mut exec_plan = snapshot.plan.clone();
 
                 // Spot bulk orders source PFS only. On replacement, the existing bulk escrow is
@@ -1808,45 +2022,62 @@ async fn run_cli(settings: Settings, execute: bool, confirm_mainnet: Option<&str
                 if exec_plan.bids.is_empty() && exec_plan.asks.is_empty() {
                     println!("  No levels can be placed (budget exhausted).");
                 } else {
-                    match execute_bulk_grid(
-                        &settings.network,
-                        &settings.api_key,
-                        &settings.aptos_private_key,
-                        &settings.subaccount,
-                        &snapshot.market,
-                        &exec_plan,
-                    )
-                    .await
-                    {
-                        Ok(execution) => {
-                            println!(
-                                "  FULL ladder replaced: {} bid(s), {} ask(s) in tx {}",
-                                execution.bid_count,
-                                execution.ask_count,
-                                execution.transaction_hash
-                            );
-                            if let Some(journal) = &journal {
-                                let event = journal::JournalEvent::BulkOrderSubmitted {
-                                    at: Utc::now(),
-                                    transaction_hash: execution.transaction_hash,
-                                    bid_count: execution.bid_count,
-                                    ask_count: execution.ask_count,
-                                };
-                                journal.append(&event)?;
-                                run_state.apply(&event);
-                                journal.save_state(&run_state)?;
+                    let desired_level_count = exec_plan.bids.len() + exec_plan.asks.len();
+                    let structural_change = new_trade_observed
+                        || last_submitted_level_count
+                            .is_none_or(|previous| previous != desired_level_count);
+                    let cooldown_active = last_bulk_replacement_at
+                        .is_some_and(|submitted| submitted.elapsed() < BULK_REPLACEMENT_COOLDOWN);
+                    if cooldown_active && !structural_change {
+                        println!(
+                            "  bulk replacement skipped: minor ladder drift during {}s cooldown ({} desired levels; no level-count change)",
+                            BULK_REPLACEMENT_COOLDOWN.as_secs(),
+                            desired_level_count
+                        );
+                    } else {
+                        match execute_bulk_grid(
+                            &settings.network,
+                            &settings.api_key,
+                            &settings.aptos_private_key,
+                            &settings.subaccount,
+                            &snapshot.market,
+                            &exec_plan,
+                        )
+                        .await
+                        {
+                            Ok(execution) => {
+                                last_bulk_replacement_at = Some(tokio::time::Instant::now());
+                                last_submitted_level_count =
+                                    Some(execution.bid_count + execution.ask_count);
+                                println!(
+                                    "  FULL ladder replaced: {} bid(s), {} ask(s) in tx {}",
+                                    execution.bid_count,
+                                    execution.ask_count,
+                                    execution.transaction_hash
+                                );
+                                if let Some(journal) = &journal {
+                                    let event = journal::JournalEvent::BulkOrderSubmitted {
+                                        at: Utc::now(),
+                                        transaction_hash: execution.transaction_hash,
+                                        bid_count: execution.bid_count,
+                                        ask_count: execution.ask_count,
+                                    };
+                                    journal.append(&event)?;
+                                    run_state.apply(&event);
+                                    journal.save_state(&run_state)?;
+                                }
                             }
-                        }
-                        Err(error) => {
-                            eprintln!("  bulk order failed: {error:#}");
-                            if let Some(journal) = &journal {
-                                let event = journal::JournalEvent::BulkOrderFailed {
-                                    at: Utc::now(),
-                                    error: format!("{error:#}"),
-                                };
-                                journal.append(&event)?;
-                                run_state.apply(&event);
-                                journal.save_state(&run_state)?;
+                            Err(error) => {
+                                eprintln!("  bulk order failed: {error:#}");
+                                if let Some(journal) = &journal {
+                                    let event = journal::JournalEvent::BulkOrderFailed {
+                                        at: Utc::now(),
+                                        error: format!("{error:#}"),
+                                    };
+                                    journal.append(&event)?;
+                                    run_state.apply(&event);
+                                    journal.save_state(&run_state)?;
+                                }
                             }
                         }
                     }
@@ -1864,6 +2095,16 @@ fn optional_subaccount(settings: &Settings) -> Option<&str> {
 }
 
 async fn run_tui(settings: Settings, profile_name: String, initial_tab: usize) -> Result<()> {
+    // When a subaccount is configured, hold the same process lock as CLI execution for the
+    // lifetime of the TUI. This prevents TUI `E`/funding actions from racing a CLI instance.
+    let _subaccount_lock = if settings.subaccount.trim().is_empty() {
+        None
+    } else {
+        Some(SubaccountRunLock::acquire(
+            &settings.network,
+            &settings.subaccount,
+        )?)
+    };
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;

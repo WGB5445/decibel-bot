@@ -12,6 +12,7 @@ grid-bot/rust
 - Spot bulk 执行只使用 Subaccount 的 **PFS**(`spot.positions`)余额；Cross/CBS 中的 quote 不能直接用于 `place_spot_bulk_order_to_subaccount`。
 - Spot 成交后的资产默认可能路由到 Cross。为避免卖出所得 USDC 不能被下一轮 bulk 买单使用,应将已有 Cross USDC 转回 PFS,并设置 `HOLD_AS_NON_COLLATERAL=true` 让未来成交继续留在 PFS。**`set_hold_as_non_collateral_for_subaccount` 只能由 subaccount owner 本人调用**(`dex_accounts::get_subaccount_signer_if_owner`,不接受 delegate),因此本工具不会代为提交这笔交易,只会提示你手动在 Decibel UI/钱包中完成。Cross→PFS 转账走 `transfer_assets_between_non_collateral_and_collateral`,可由 owner 或拥有 `ChangingCollateralFundsMovement` 权限的 delegate 签名,本工具的 API 私钥若只是 delegate 也能提交这一笔。
 - TUI 的 Spot Preview/Monitor 页面会显示 Cross USDC 警告,并提示需手动设置 HOLD_AS_NON_COLLATERAL;按 `U` 打开资金设置弹窗,输入要转回 PFS 的 USDC 数量后按 Enter,只提交 Cross→PFS 转账一笔交易。不会在刷新或下单循环中自动转账,也不会尝试提交 owner-only 的 routing 设置交易。
+- **Spot 首次铺网格时会自动买入缺口 base 库存**(见下节)。这只发生在链上尚无 bulk ladder 时;之后的每轮刷新都不会再自动买入。
 
 - 每次执行前先 **reconcile**(对比期望网格与交易所实际订单)。由于 bulk API 没有 client-order-id，只要市场已存在任何订单，CLI Live 模式就不会提交 bulk replacement。
 - 主网执行需要 `--confirm-mainnet MAINNET` 显式确认。
@@ -31,6 +32,18 @@ grid-bot/rust
 | `spot-funding-setup` | 显式设置 USDC future settlement 路由，并可将 Cross USDC 转入 PFS |
 | `tui` | TUI 配置与监控 |
 | `preview` | 直接进入 TUI Preview 标签 |
+
+CLI 命令支持 `--log-file PATH`：启动时覆盖旧文件，并将 stdout/stderr（包括错误和 panic 输出）写入该文件。适合 `run -e` 长时间运行后交给我分析；该选项不适用于 TUI/Preview。
+
+```bash
+# 覆盖写入 /tmp/decibel-spot.log；目录不存在时会自动创建
+cargo run -- run -e \
+  --log-file /tmp/decibel-spot.log \
+  --product spot --market APT/USDC --subaccount 0x... \
+  --aptos-private-key 0x... --decibel-api-key ...
+
+# 也可用环境变量 LOG_FILE=/tmp/decibel-spot.log
+```
 
 所有 read-only 命令都不修改交易所状态。
 
@@ -124,6 +137,15 @@ cargo run -- shadow --product perp --market BTC/USD --subaccount 0x... \
   6. 仅在市场为空且有缺失档位时 → 提交完整 bulk 替换,记录 BulkOrderSubmitted/Failed 事件
   7. 等待 refresh_interval
 ```
+
+### Spot 首次铺网格的 base 自动补足
+
+当 Spot 首次执行时，如果完整计划所需的 base 数量大于 PFS 当前余额，程序会先读取订单簿卖一价，使用有上限的 IOC 主动买单补足缺口，再重新读取 PFS 余额。补货金额只使用扣除完整 bid 资金预留后的 USDC 余量，不会挪用买单预算；补货完成后才提交完整 bulk ladder。
+
+- 只在该 subaccount/market 没有现存 bulk ladder 时触发；后续刷新不会因为卖单成交而自动追买，避免用 taker 费把网格价差还回去。
+- IOC 限价会在 best ask 上方设置有限滑点上限；流动性不足或补货失败时不会宣称已补足。
+- 如果补货后仍未补齐(流动性不足、USDC 余量不够或补货报错)，程序会打印实际缺口，然后按现有余额缩减卖单侧并照常提交本轮 ladder——即回落到原来的行为，不会阻塞下单。
+- 例如总预算约 1000 USDC 时，约 500 USDC 可能被 bid 侧预留；剩余 USDC 才用于买入缺少的 APT。
 
 ## 研究参考
 

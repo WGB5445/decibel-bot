@@ -724,6 +724,7 @@ dependencies = [
  "dotenvy",
  "futures-util",
  "hex",
+ "libc",
  "pretty_assertions",
  "rand 0.8.7",
  "ratatui",

@@ -12,7 +12,7 @@ use aptos_sdk::{
 use chrono::{DateTime, Utc};
 use clap::ValueEnum;
 use futures_util::{SinkExt, StreamExt};
-use profile::{FundingOrderRecord, FundingOrderStore};
+use profile::FundingOrderStore;
 use reqwest::{Client as HttpClient, header};
 use rust_decimal::{Decimal, RoundingStrategy, prelude::ToPrimitive};
 use serde_json::Value;
@@ -254,8 +254,8 @@ pub struct ExecutionResult {
     pub ask_count: usize,
 }
 
-// Retained for compatibility with the existing public funding helpers. The live grid-start path
-// below does not invoke them; it only submits a PFS-funded, balance-fitted bulk grid.
+// Result of the optional automatic Spot base-inventory funding step. The live execution path
+// invokes this before sizing/shrinking a Spot bulk ladder when the planned asks exceed PFS base.
 #[derive(Clone, Debug)]
 pub struct SpotFundingResult {
     pub base_gap_before: Decimal,
@@ -484,8 +484,73 @@ pub async fn execute_bulk_grid(
     })
 }
 
-/// Buy missing Spot base inventory with one passive order, then wait for it to fill.
-/// The order is deliberately neither cancelled nor repriced.
+/// Bounded taker-buy sizing for the Spot base inventory a grid's ask side needs.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SpotTakerFunding {
+    /// Base still missing for the plan's ask side.
+    pub base_gap: Decimal,
+    /// Quote left over after fully reserving the plan's bid requirement.
+    pub quote_surplus: Decimal,
+    /// IOC limit price: the best ask plus a bounded sweep allowance.
+    pub limit_price: Decimal,
+    /// Lot-rounded quantity affordable without touching the bid reserve.
+    pub quantity: Decimal,
+}
+
+/// How many IOC sweeps may be attempted before giving up and letting the ask side shrink.
+const MAX_TAKER_FUNDING_ATTEMPTS: usize = 6;
+
+/// Size a single aggressive (IOC) base purchase that cannot consume quote the grid's own bids
+/// need. Pure arithmetic so the cost bound is unit-testable without touching the network.
+pub fn compute_spot_taker_funding(
+    funds: &SpotFunds,
+    grid: &GridPlan,
+    best_ask: Decimal,
+    market: &Market,
+) -> Result<SpotTakerFunding> {
+    if best_ask <= Decimal::ZERO {
+        bail!("best ask must be positive to size a Spot taker funding order")
+    }
+    // Sweep allowance over the best ask so a thin top level does not stall funding, while still
+    // bounding how far up the book a single IOC may walk.
+    let slippage = Decimal::new(3, 3);
+    // Taker-fee headroom, so a complete fill still cannot encroach on the grid's bid reserve.
+    let fee_buffer = Decimal::new(1, 3);
+    // Existing bulk escrow is already credited by the replacement ABI, so it counts toward the
+    // target inventory. Excluding it would overbuy base when repairing an undersized ladder.
+    let base_gap = (grid.base_required - funds.available_base_for_bulk()).max(Decimal::ZERO);
+    // Quote spare for funding, measured consistently with `base_gap` above.
+    //
+    // The replacement credits the resting ladder's escrow against the new bids' requirement, so
+    // what the new bids still need from PFS is `quote_required - escrow`, and everything beyond
+    // that is spare. Measuring the surplus against free PFS alone would report zero spare
+    // whenever a ladder is resting (free < quote_required) and refuse to fund at all.
+    // The IOC itself can only draw on free PFS, so cap the surplus by that.
+    let quote_surplus = (funds.available_quote_for_bulk() - grid.quote_required)
+        .max(Decimal::ZERO)
+        .min(funds.available_quote());
+    let limit_price = round_up(best_ask * (Decimal::ONE + slippage), market.tick_size);
+    if limit_price <= Decimal::ZERO {
+        bail!(
+            "funding limit price rounds to zero at tick size {}",
+            market.tick_size
+        )
+    }
+    let affordable = quote_surplus / (limit_price * (Decimal::ONE + fee_buffer));
+    let quantity = round_down(base_gap.min(affordable), market.lot_size);
+    Ok(SpotTakerFunding {
+        base_gap,
+        quote_surplus,
+        limit_price,
+        quantity,
+    })
+}
+
+/// Aggressively buy the Spot base inventory the grid's ask side needs, using IOC orders.
+///
+/// Deliberately scoped to *initial* grid placement. Re-buying inventory after every sell fill
+/// would hand back the captured spread plus taker fees, so callers must invoke this only when no
+/// bulk ladder is resting for the (subaccount, market) pair.
 pub async fn fund_spot_base_for_grid(
     network: &str,
     api_key: &str,
@@ -502,32 +567,19 @@ pub async fn fund_spot_base_for_grid(
         bail!("subaccount address is required for automatic Spot funding")
     }
     let client = DecibelClient::new(network, api_key)?;
-    // A prior invocation may have left a partially filled funding bid resting. Cancel only the
-    // locally recorded bot order, then re-read balances and the book before calculating a fresh
-    // passive price. We never cancel a grid level or an unrelated manual order.
+    // An older build could have left a resting POST_ONLY funding bid. That order is standalone,
+    // so it would block bulk replacement; clear any locally recorded one before funding.
     cancel_recorded_spot_funding_order(network, private_key, subaccount, market, &client).await?;
     let initial = client.account(Some(subaccount), market).await?;
-    let funds = initial.spot_funds.ok_or_else(|| {
-        anyhow!("spot funds unavailable for {}: account_overviews did not include a usable spot balance", market.name)
-    })?;
-    let book = client.order_book(market, 1).await?;
-    let best_bid = book
-        .bids
-        .first()
-        .map(|level| level.price)
-        .unwrap_or(plan.mid);
-    let funding = compute_spot_funding_plan(&funds, plan, best_bid, plan.mid, market)?;
-    if funding.quote_gap > Decimal::ZERO {
-        bail!(
-            "spot quote funds insufficient for {}: {} required for grid bids, available {}, short {}; automatic conversion is disabled, so deposit {} before starting",
-            market.name,
-            funding.required_quote_for_grid,
-            funds.available_quote(),
-            funding.quote_gap,
-            funds.quote_symbol
+    let mut funds = initial.spot_funds.ok_or_else(|| {
+        anyhow!(
+            "spot funds unavailable for {}: account_overviews did not include a usable spot balance",
+            market.name
         )
-    }
-    if funding.base_gap <= Decimal::ZERO {
+    })?;
+    let initial_base = funds.available_base_for_bulk();
+    let base_gap_before = (plan.base_required - initial_base).max(Decimal::ZERO);
+    if base_gap_before <= Decimal::ZERO {
         return Ok(SpotFundingResult {
             base_gap_before: Decimal::ZERO,
             bought_base: Decimal::ZERO,
@@ -535,89 +587,90 @@ pub async fn fund_spot_base_for_grid(
             borrowed_from_grid_quote: Decimal::ZERO,
         });
     }
-    let buy_price = funding.buy_price.ok_or_else(|| anyhow!(
-        "{} base is short by {}, but no spare {} remains after reserving {} for grid bids; deposit base or additional quote",
-        funds.base_symbol, funding.base_gap, funds.quote_symbol, funding.required_quote_for_grid
-    ))?;
-    if funding.buy_quantity < market.min_size {
-        bail!(
-            "{} base is short by {}, but spare {} can only buy {} at {} (below market minimum {})",
-            funds.base_symbol,
-            funding.base_gap,
-            funds.quote_symbol,
-            funding.buy_quantity,
-            buy_price,
-            market.min_size
-        )
-    }
-    if funding.buy_quantity < funding.base_gap {
-        bail!(
-            "{} base is short by {}, but spare {} can buy only {} at {}; deposit more {} before starting so grid bid funds remain reserved",
-            funds.base_symbol,
-            funding.base_gap,
-            funds.quote_symbol,
-            funding.buy_quantity,
-            buy_price,
-            funds.quote_symbol
-        )
-    }
-    let transaction_hash = submit_spot_post_only_bid(
-        network,
-        private_key,
-        subaccount,
-        market,
-        buy_price,
-        funding.buy_quantity,
-    )
-    .await?;
-    let mut funding_store = FundingOrderStore::load()?;
-    funding_store.replace(FundingOrderRecord {
-        network: network.to_owned(),
-        subaccount: subaccount.to_owned(),
-        market: market.address.clone(),
-        price: buy_price.normalize().to_string(),
-        quantity: funding.buy_quantity.normalize().to_string(),
-        order_id: None,
-        transaction_hash: transaction_hash.clone(),
-    });
-    funding_store.save()?;
     println!(
-        "Spot funding order submitted: buy {} {} at {} {} (POST_ONLY), tx {}. Waiting without cancellation or repricing.",
-        funding.buy_quantity, funds.base_symbol, buy_price, funds.quote_symbol, transaction_hash
+        "Spot base funding: plan needs {} {}, PFS holds {}, buying up to {} with IOC orders.",
+        plan.base_required, funds.base_symbol, initial_base, base_gap_before
     );
-
-    loop {
-        tokio::time::sleep(Duration::from_secs(5)).await;
-        let current = client.account(Some(subaccount), market).await?;
-        let current_funds = current.spot_funds.ok_or_else(|| {
-            anyhow!("spot funds became unavailable while waiting for the funding order")
-        })?;
-        let current_base = current_funds.available_base();
-        let remaining = (plan.base_required - current_base).max(Decimal::ZERO);
-        if remaining <= Decimal::ZERO {
-            println!(
-                "Spot funding complete: {} available {} now covers {} required for grid asks.",
-                current_base, current_funds.base_symbol, plan.base_required
-            );
-            let mut funding_store = FundingOrderStore::load()?;
-            funding_store.remove(network, subaccount, &market.address);
-            funding_store.save()?;
-            return Ok(SpotFundingResult {
-                base_gap_before: funding.base_gap,
-                bought_base: (current_base - funds.available_base()).max(Decimal::ZERO),
-                transaction_hash: Some(transaction_hash),
-                borrowed_from_grid_quote: funding.borrowed_from_grid_quote,
-            });
+    let mut last_hash = None;
+    for attempt in 1..=MAX_TAKER_FUNDING_ATTEMPTS {
+        let book = client.order_book(market, 1).await?;
+        let best_ask =
+            book.asks.first().map(|level| level.price).ok_or_else(|| {
+                anyhow!("Spot order book for {} has no ask to buy from", market.name)
+            })?;
+        let funding = compute_spot_taker_funding(&funds, plan, best_ask, market)?;
+        if funding.base_gap <= Decimal::ZERO {
+            break;
         }
-        let mid = client
-            .mid_price(market, PriceSource::Prices)
-            .await
-            .unwrap_or(plan.mid);
+        if funding.quantity < market.min_size {
+            // A residual smaller than one exchange order is not a funding failure: the previous
+            // IOC(s) may already have filled almost the entire target. Return the partial result
+            // so the caller refreshes balances and fits the ladder to the actual post-fill PFS
+            // balance instead of falling back to a stale pre-funding snapshot.
+            println!(
+                "Spot IOC funding stopped with {} {} remaining; below minimum order size {} at {} {}.",
+                funding.base_gap,
+                funds.base_symbol,
+                market.min_size,
+                funding.limit_price,
+                funds.quote_symbol
+            );
+            break;
+        }
+        let hash = submit_spot_ioc_bid(
+            network,
+            private_key,
+            subaccount,
+            market,
+            funding.limit_price,
+            funding.quantity,
+        )
+        .await?;
         println!(
-            "Waiting for Spot funding tx {}: {} available {}, {} still needed; funding limit {}, current mid {}.",
-            transaction_hash, current_base, current_funds.base_symbol, remaining, buy_price, mid
+            "  IOC {}/{}: buy up to {} {} at limit {} {}, tx {}",
+            attempt,
+            MAX_TAKER_FUNDING_ATTEMPTS,
+            funding.quantity,
+            funds.base_symbol,
+            funding.limit_price,
+            funds.quote_symbol,
+            hash
+        );
+        last_hash = Some(hash);
+        // An IOC leaves nothing resting, so the committed transaction is already reflected in the
+        // balance. Re-read it to decide whether another sweep is needed.
+        let current = client.account(Some(subaccount), market).await?;
+        funds = current.spot_funds.ok_or_else(|| {
+            anyhow!(
+                "spot funds became unavailable while funding {}",
+                market.name
+            )
+        })?;
+        let remaining = (plan.base_required - funds.available_base_for_bulk()).max(Decimal::ZERO);
+        println!(
+            "  filled to {} {}; {} still needed",
+            funds.available_base_for_bulk(),
+            funds.base_symbol,
+            remaining
+        );
+        if remaining <= Decimal::ZERO {
+            break;
+        }
+    }
+    let bought_base = (funds.available_base_for_bulk() - initial_base).max(Decimal::ZERO);
+    let remaining = (plan.base_required - funds.available_base_for_bulk()).max(Decimal::ZERO);
+    if remaining > Decimal::ZERO {
+        println!(
+            "Spot funding stopped {} {} short of the planned asks; the ask side will be shrunk to fit.",
+            remaining, funds.base_symbol
         );
     }
+    Ok(SpotFundingResult {
+        base_gap_before,
+        bought_base,
+        transaction_hash: last_hash,
+        borrowed_from_grid_quote: Decimal::ZERO,
+    })
 }
 
 /// Compute a passive base-buy that cannot consume quote required by the grid's own bids.
@@ -693,8 +746,9 @@ pub fn compute_spot_funding_plan(
     })
 }
 
-/// Submit the official eight-argument Spot ABI with POST_ONLY (1).
-async fn submit_spot_post_only_bid(
+/// Submit the official eight-argument Spot ABI with the requested time-in-force.
+/// `2` is IOC: it immediately takes available asks and leaves no resting order.
+async fn submit_spot_ioc_bid(
     network: &str,
     private_key: &str,
     subaccount: &str,
@@ -702,7 +756,7 @@ async fn submit_spot_post_only_bid(
     price: Decimal,
     quantity: Decimal,
 ) -> Result<String> {
-    const POST_ONLY: u8 = 1;
+    const IOC: u8 = 2;
     const MAX_GAS_OCTAS: u64 = 50_000_000;
     let key = normalize_private_key(private_key)?;
     let signer =
@@ -728,11 +782,11 @@ async fn submit_spot_post_only_bid(
         .arg(scale_chain_amount(price, market.px_decimals)?)
         .arg(scale_chain_amount(quantity, market.sz_decimals)?)
         .arg(true)
-        .arg(POST_ONLY)
+        .arg(IOC)
         .arg_raw(move_none())
         .arg_raw(move_none())
         .build()
-        .context("build Spot POST_ONLY funding transaction")?;
+        .context("build Spot IOC funding transaction")?;
     let sequence_number = aptos.get_sequence_number(signer.address()).await?;
     let gas_price = aptos
         .fullnode()
@@ -756,7 +810,7 @@ async fn submit_spot_post_only_bid(
         .chain_id(aptos.ensure_chain_id().await?)
         .expiration_from_now(600)
         .build()
-        .context("build Spot POST_ONLY funding transaction with 0.5 APT gas cap")?;
+        .context("build Spot IOC funding transaction with 0.5 APT gas cap")?;
     let signed = sign_transaction(&raw, &signer)
         .with_context(|| format!("sign Spot funding transaction ({entry_function})"))?;
     let response = aptos
@@ -2936,6 +2990,220 @@ mod tests {
             dec!(5.995),
             dec!(100)
         ));
+    }
+
+    fn spot_funding_market() -> Market {
+        Market {
+            address: "0x1".to_owned(),
+            name: "APT/USDC".to_owned(),
+            tick_size: dec!(0.0001),
+            lot_size: dec!(0.01),
+            min_size: dec!(0.01),
+            px_decimals: 4,
+            sz_decimals: 2,
+            product: Product::Spot,
+            base_asset_addr: None,
+            quote_asset_addr: None,
+            base_symbol: Some("APT".to_owned()),
+            quote_symbol: Some("USDC".to_owned()),
+        }
+    }
+
+    fn spot_funding_funds(base: Decimal, quote: Decimal) -> SpotFunds {
+        SpotFunds {
+            base_symbol: "APT".to_owned(),
+            quote_symbol: "USDC".to_owned(),
+            base_balance: base,
+            quote_balance: quote,
+            base_reserved: Decimal::ZERO,
+            quote_reserved: Decimal::ZERO,
+            quote_cross_balance: Decimal::ZERO,
+        }
+    }
+
+    fn spot_funding_grid(base_required: Decimal, quote_required: Decimal) -> GridPlan {
+        GridPlan {
+            mid: dec!(0.5372),
+            lower: dec!(0.4834),
+            upper: dec!(0.591),
+            bids: vec![],
+            asks: vec![],
+            quote_required,
+            base_required,
+            estimated_margin: None,
+        }
+    }
+
+    #[test]
+    fn taker_funding_buys_the_full_gap_when_quote_surplus_allows() {
+        // The reported live case: 40 bids reserve ~500 USDC of a ~969 USDC PFS balance, leaving
+        // enough surplus to buy the entire missing ask inventory rather than shrinking to 6 asks.
+        let funds = spot_funding_funds(dec!(64.367828), dec!(969.539875));
+        let grid = spot_funding_grid(dec!(120), dec!(499.830392));
+        let funding =
+            compute_spot_taker_funding(&funds, &grid, dec!(0.5375), &spot_funding_market())
+                .unwrap();
+        assert_eq!(funding.base_gap, dec!(55.632172));
+        // Whole gap is affordable, so the plan buys it all and the ask side is never shrunk.
+        assert_eq!(funding.quantity, dec!(55.63));
+    }
+
+    #[test]
+    fn taker_funding_never_spends_quote_reserved_for_the_bids() {
+        // Only 20 USDC is spare above the bid reserve, so the buy must be bounded by that surplus
+        // (including taker-fee headroom), not by the much larger base gap.
+        let funds = spot_funding_funds(Decimal::ZERO, dec!(520));
+        let grid = spot_funding_grid(dec!(800), dec!(500));
+        let market = spot_funding_market();
+        let funding = compute_spot_taker_funding(&funds, &grid, dec!(0.5), &market).unwrap();
+        assert_eq!(funding.quote_surplus, dec!(20));
+        let inclusive_cost =
+            funding.quantity * funding.limit_price * (Decimal::ONE + Decimal::new(1, 3));
+        assert!(
+            inclusive_cost <= funding.quote_surplus,
+            "cost {inclusive_cost} must stay within surplus {}",
+            funding.quote_surplus
+        );
+        // Buying is still bounded well below the 800 APT gap.
+        assert!(funding.quantity < funding.base_gap);
+    }
+
+    #[test]
+    fn taker_funding_limit_price_crosses_the_spread_but_is_bounded() {
+        let funds = spot_funding_funds(Decimal::ZERO, dec!(1000));
+        let grid = spot_funding_grid(dec!(100), dec!(500));
+        let market = spot_funding_market();
+        let best_ask = dec!(0.5375);
+        let funding = compute_spot_taker_funding(&funds, &grid, best_ask, &market).unwrap();
+        // Aggressive enough to take the resting ask, but never an unbounded market order.
+        assert!(funding.limit_price >= best_ask);
+        assert!(funding.limit_price <= best_ask * dec!(1.004));
+    }
+
+    #[test]
+    fn taker_funding_reports_no_gap_when_inventory_is_already_sufficient() {
+        let funds = spot_funding_funds(dec!(150), dec!(1000));
+        let grid = spot_funding_grid(dec!(120), dec!(500));
+        let funding =
+            compute_spot_taker_funding(&funds, &grid, dec!(0.5375), &spot_funding_market())
+                .unwrap();
+        assert_eq!(funding.base_gap, Decimal::ZERO);
+        assert_eq!(funding.quantity, Decimal::ZERO);
+    }
+
+    #[test]
+    fn taker_funding_counts_existing_bulk_escrow_as_held_inventory() {
+        // Reproduces the live symptom: an active ladder already escrows 36 APT while only 1.63
+        // sits free in PFS. The replacement ABI credits that escrow, so the funding gap is
+        // measured against base + escrow. Using the free balance alone would re-buy inventory
+        // the account already owns.
+        let funds = SpotFunds {
+            base_symbol: "APT".to_owned(),
+            quote_symbol: "USDC".to_owned(),
+            base_balance: dec!(1.63264),
+            quote_balance: dec!(488.418878),
+            base_reserved: dec!(36),
+            quote_reserved: dec!(499.876920),
+            quote_cross_balance: Decimal::ZERO,
+        };
+        let grid = spot_funding_grid(dec!(40), dec!(499.876920));
+        let funding =
+            compute_spot_taker_funding(&funds, &grid, dec!(0.5368), &spot_funding_market())
+                .unwrap();
+        // 40 needed - (1.63264 free + 36 escrowed) = 2.36736, NOT 40 - 1.63264 = 38.36736.
+        assert_eq!(funding.base_gap, dec!(2.36736));
+        assert!(
+            funding.quantity <= dec!(2.37),
+            "must not overbuy past the true gap, got {}",
+            funding.quantity
+        );
+    }
+
+    #[test]
+    fn taker_funding_ignores_escrow_it_does_not_have() {
+        // Same plan, but with no resting ladder: the whole ask side must be bought.
+        let funds = SpotFunds {
+            base_symbol: "APT".to_owned(),
+            quote_symbol: "USDC".to_owned(),
+            base_balance: dec!(1.63264),
+            quote_balance: dec!(988.295798),
+            base_reserved: Decimal::ZERO,
+            quote_reserved: Decimal::ZERO,
+            quote_cross_balance: Decimal::ZERO,
+        };
+        let grid = spot_funding_grid(dec!(40), dec!(499.876920));
+        let funding =
+            compute_spot_taker_funding(&funds, &grid, dec!(0.5368), &spot_funding_market())
+                .unwrap();
+        assert_eq!(funding.base_gap, dec!(38.36736));
+    }
+
+    #[test]
+    fn taker_funding_sees_spare_quote_while_a_ladder_is_resting() {
+        // Live shape: the resting ladder escrows ~499.88 USDC of bids and 36 APT of asks, so free
+        // PFS quote (488.42) is BELOW quote_required. Measuring surplus against free PFS alone
+        // reports zero spare and refuses to fund, even though the replacement credits the escrow
+        // and the free balance is genuinely available to buy base with.
+        let funds = SpotFunds {
+            base_symbol: "APT".to_owned(),
+            quote_symbol: "USDC".to_owned(),
+            base_balance: dec!(1.63264),
+            quote_balance: dec!(488.418878),
+            base_reserved: dec!(36),
+            quote_reserved: dec!(499.876920),
+            quote_cross_balance: Decimal::ZERO,
+        };
+        let grid = spot_funding_grid(dec!(40), dec!(499.876920));
+        let funding =
+            compute_spot_taker_funding(&funds, &grid, dec!(0.5368), &spot_funding_market())
+                .unwrap();
+        assert!(
+            funding.quote_surplus > Decimal::ZERO,
+            "escrowed bids must not mask the spare free balance"
+        );
+        assert_eq!(funding.base_gap, dec!(2.36736));
+        assert!(
+            funding.quantity >= market_min(),
+            "must actually fund the gap"
+        );
+    }
+
+    #[test]
+    fn taker_funding_never_promises_more_quote_than_pfs_holds() {
+        // Escrow makes `available_quote_for_bulk` large, but an IOC can only spend free PFS.
+        // The surplus must stay within the free balance or the IOC aborts on-chain.
+        let funds = SpotFunds {
+            base_symbol: "APT".to_owned(),
+            quote_symbol: "USDC".to_owned(),
+            base_balance: Decimal::ZERO,
+            quote_balance: dec!(10),
+            base_reserved: Decimal::ZERO,
+            quote_reserved: dec!(900),
+            quote_cross_balance: Decimal::ZERO,
+        };
+        let grid = spot_funding_grid(dec!(100), dec!(500));
+        let funding =
+            compute_spot_taker_funding(&funds, &grid, dec!(0.5), &spot_funding_market()).unwrap();
+        assert!(
+            funding.quote_surplus <= funds.available_quote(),
+            "surplus {} exceeded free PFS {}",
+            funding.quote_surplus,
+            funds.available_quote()
+        );
+    }
+
+    fn market_min() -> Decimal {
+        spot_funding_market().min_size
+    }
+
+    #[test]
+    fn taker_funding_rejects_a_non_positive_ask() {
+        let funds = spot_funding_funds(Decimal::ZERO, dec!(1000));
+        let grid = spot_funding_grid(dec!(100), dec!(500));
+        assert!(
+            compute_spot_taker_funding(&funds, &grid, Decimal::ZERO, &spot_funding_market())
+                .is_err()
+        );
     }
 
     #[test]
