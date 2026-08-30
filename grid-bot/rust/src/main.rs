@@ -2,7 +2,6 @@ use std::{
     backtrace::Backtrace,
     fs,
     io::{self, Write},
-    os::fd::AsRawFd,
     panic::{self, PanicHookInfo},
     path::{Path, PathBuf},
     str::FromStr,
@@ -35,6 +34,9 @@ use ratatui::{
     widgets::{Block, Borders, Cell, Clear, Paragraph, Row, Table, Wrap},
 };
 use rust_decimal::{Decimal, prelude::ToPrimitive};
+
+/// Cross USDC balance below this threshold is treated as zero for UI warnings and display.
+const USDC_CROSS_DUST: Decimal = Decimal::from_parts(1, 0, 0, false, 6);
 
 /// Every resting order occupies one grid cell. Render them in price order rather than pairing
 /// the bid and ask arrays by index, because they live on opposite sides of the current mid.
@@ -379,6 +381,8 @@ struct Settings {
     preview_leverage: String,
     refresh_seconds: String,
     price_source: PriceSource,
+    /// Optional USDC metadata override for Spot funding instructions on mainnet.
+    spot_funding_metadata: Option<String>,
 }
 
 impl From<&Args> for Settings {
@@ -420,6 +424,7 @@ impl From<&Args> for Settings {
             preview_leverage: args.preview_leverage.clone(),
             refresh_seconds: args.refresh_seconds.to_string(),
             price_source: args.price_source,
+            spot_funding_metadata: args.spot_funding_metadata.clone(),
         }
     }
 }
@@ -447,6 +452,7 @@ impl Settings {
             preview_leverage: "1".to_owned(),
             refresh_seconds: "3".to_owned(),
             price_source: PriceSource::Prices,
+            spot_funding_metadata: None,
         }
     }
 
@@ -720,10 +726,6 @@ enum MarketFetch {
         settings_revision: u64,
         result: Box<Result<ExecutionResult>>,
     },
-    Funding {
-        settings_revision: u64,
-        result: Box<Result<String>>,
-    },
 }
 
 struct MarketPicker {
@@ -768,10 +770,15 @@ struct App {
     edit_before: String,
     password: String,
     password_purpose: Option<PasswordPurpose>,
-    /// Cross→PFS funding setup modal input, expressed in human-readable USDC.
+    /// Spot funding info modal content. When Some, the modal is open.
     funding_dialog: Option<String>,
-    funding_pending: bool,
-    funding_requested: bool,
+    /// Text selection in the funding info modal: ((start_line, start_col), (end_line, end_col))
+    /// in display coordinates relative to the modal content area.
+    funding_selection: Option<((u16, u16), (u16, u16))>,
+    /// Start cell of an in-progress mouse drag selection.
+    funding_drag_start: Option<(u16, u16)>,
+    /// Vertical scroll offset inside the funding info modal (wrapped lines).
+    funding_scroll: u16,
     profile_name: String,
     settings: Settings,
     settings_revision: u64,
@@ -828,8 +835,9 @@ impl App {
             password: String::new(),
             password_purpose: None,
             funding_dialog: None,
-            funding_pending: false,
-            funding_requested: false,
+            funding_selection: None,
+            funding_drag_start: None,
+            funding_scroll: 0,
             profile_name,
             settings,
             settings_revision: 0,
@@ -1181,11 +1189,14 @@ fn print_snapshot(snapshot: &MonitorSnapshot, config: &GridConfig) {
 
 /// Send this process's stdout and stderr to `path`, replacing any previous contents.
 ///
-/// This replaces file descriptors 1 and 2 rather than merely wrapping `println!`, so panic
-/// reports and anything a dependency writes directly to those descriptors land in the same file.
-/// Rust's stdout is line-buffered even when it is not a terminal, so the file stays readable
-/// while a long `run` is still going.
+/// This replaces file descriptors 1 and 2 (or the Windows standard handles) rather than merely
+/// wrapping `println!`, so panic reports and anything a dependency writes directly to those
+/// descriptors land in the same file. Rust's stdout is line-buffered even when it is not a
+/// terminal, so the file stays readable while a long `run` is still going.
+#[cfg(unix)]
 fn redirect_output_to_log(path: &Path) -> Result<()> {
+    use std::os::fd::AsRawFd;
+
     if let Some(parent) = path.parent()
         && !parent.as_os_str().is_empty()
     {
@@ -1212,8 +1223,44 @@ fn redirect_output_to_log(path: &Path) -> Result<()> {
     Ok(())
 }
 
+#[cfg(windows)]
+fn redirect_output_to_log(path: &Path) -> Result<()> {
+    use std::os::windows::io::AsRawHandle;
+
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("cannot create log directory {}", parent.display()))?;
+    }
+    let file = fs::File::create(path)
+        .with_context(|| format!("cannot create log file {}", path.display()))?;
+    let handle = file.as_raw_handle();
+
+    // SAFETY: `handle` is a valid file handle owned by `file`. It is intentionally leaked so
+    // the standard handles remain valid for the lifetime of the process.
+    unsafe {
+        let ok = windows_sys::Win32::System::Console::SetStdHandle(
+            windows_sys::Win32::System::Console::STD_OUTPUT_HANDLE,
+            handle as _,
+        ) != 0
+            && windows_sys::Win32::System::Console::SetStdHandle(
+                windows_sys::Win32::System::Console::STD_ERROR_HANDLE,
+                handle as _,
+            ) != 0;
+        if !ok {
+            return Err(io::Error::last_os_error())
+                .with_context(|| format!("cannot redirect stdout/stderr to {}", path.display()));
+        }
+    }
+    std::mem::forget(file);
+    Ok(())
+}
+
 struct SubaccountRunLock {
-    file: fs::File,
+    // Held for the lifetime of the struct; the lock is released when this field is dropped.
+    #[allow(dead_code)]
+    lock: fslock::LockFile,
 }
 
 impl SubaccountRunLock {
@@ -1242,34 +1289,17 @@ impl SubaccountRunLock {
         );
         let digest = hex::encode(Sha3_256::digest(key.as_bytes()));
         let path = lock_dir.join(format!("subaccount-{digest}.lock"));
-        let file = fs::OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .read(true)
-            .write(true)
-            .open(&path)
+        let mut lock = fslock::LockFile::open(&path)
             .with_context(|| format!("could not open subaccount lock {}", path.display()))?;
-        // SAFETY: `file` is an open regular file descriptor. flock only changes kernel lock
-        // state for this descriptor and the lock is released automatically when it is dropped.
-        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
-            let error = io::Error::last_os_error();
-            if error.kind() == io::ErrorKind::WouldBlock {
-                anyhow::bail!(
-                    "another grid process is already running for network {} and this subaccount; stop it before starting a second instance",
-                    network
-                )
-            }
-            return Err(error)
-                .with_context(|| format!("could not acquire subaccount lock {}", path.display()));
+        if !lock.try_lock()
+            .with_context(|| format!("could not acquire subaccount lock {}", path.display()))?
+        {
+            anyhow::bail!(
+                "another grid process is already running for network {} and this subaccount; stop it before starting a second instance",
+                network
+            )
         }
-        Ok(Self { file })
-    }
-}
-
-impl Drop for SubaccountRunLock {
-    fn drop(&mut self) {
-        // SAFETY: the descriptor belongs to this guard and remains open during Drop.
-        let _ = unsafe { libc::flock(self.file.as_raw_fd(), libc::LOCK_UN) };
+        Ok(Self { lock })
     }
 }
 
@@ -1523,7 +1553,7 @@ async fn doctor_cli(settings: Settings) -> Result<()> {
                     funds.quote_symbol
                 );
             }
-            if funds.quote_cross_balance() > Decimal::ZERO {
+            if funds.quote_cross_balance() >= USDC_CROSS_DUST {
                 println!(
                     "  note: {} {} sits in Cross and is NOT spendable by spot bulk orders; transfer it into PFS to fund bids.",
                     funds.quote_cross_balance(),
@@ -2265,81 +2295,6 @@ async fn tui_loop(
                     }
                 }
                 MarketFetch::Execution { .. } => {}
-                MarketFetch::Funding {
-                    settings_revision,
-                    result,
-                } if settings_revision == app.settings_revision => {
-                    app.funding_pending = false;
-                    match *result {
-                        Ok(transfer_tx) => {
-                            app.funding_dialog = None;
-                            app.error = None;
-                            app.grid_change_notice = Some(if transfer_tx.is_empty() {
-                                "Spot funding setup: no transfer requested (amount was 0)."
-                                    .to_owned()
-                            } else {
-                                format!("Cross→PFS transfer submitted: tx {transfer_tx}")
-                            });
-                            app.refresh_now = true;
-                        }
-                        Err(error) => app.set_error(error),
-                    }
-                }
-                MarketFetch::Funding { .. } => {}
-            }
-        }
-
-        if app.funding_requested && !app.funding_pending {
-            app.funding_requested = false;
-            let amount = app.funding_dialog.clone().unwrap_or_default();
-            let job = (
-                app.settings.network.clone(),
-                app.settings.aptos_private_key.clone(),
-                app.settings.subaccount.clone(),
-                amount,
-                app.settings_revision,
-            );
-            if job.1.trim().is_empty() || job.2.trim().is_empty() {
-                app.set_error("Aptos private key and subaccount are required for funding setup");
-            } else if !job.0.eq_ignore_ascii_case("testnet") {
-                app.set_error("TUI Spot funding setup requires an explicit mainnet USDC metadata address; use the CLI --spot-funding-metadata option");
-            } else {
-                app.funding_pending = true;
-                let tx = fetch_tx.clone();
-                tokio::spawn(async move {
-                    let result = async {
-                        use rust_decimal::prelude::ToPrimitive;
-                        let amount_decimal = rust_decimal::Decimal::from_str(job.3.trim())
-                            .context("Cross→PFS amount must be a decimal USDC amount")?;
-                        if amount_decimal < rust_decimal::Decimal::ZERO {
-                            anyhow::bail!("Cross→PFS amount cannot be negative")
-                        }
-                        let raw = (amount_decimal * rust_decimal::Decimal::from(1_000_000u64))
-                            .floor()
-                            .to_i64()
-                            .ok_or_else(|| {
-                                anyhow::anyhow!("Cross→PFS amount is outside i64 range")
-                            })?;
-                        let transfer_tx = if raw == 0 {
-                            String::new()
-                        } else {
-                            decibel_grid_tui::transfer_spot_cross_pfs(
-                                &job.0,
-                                &job.1,
-                                &job.2,
-                                decibel_grid_tui::TESTNET_USDC_METADATA,
-                                -raw,
-                            )
-                            .await?
-                        };
-                        Ok::<_, anyhow::Error>(transfer_tx)
-                    }
-                    .await;
-                    let _ = tx.send(MarketFetch::Funding {
-                        settings_revision: job.4,
-                        result: Box::new(result),
-                    });
-                });
             }
         }
 
@@ -2700,16 +2655,37 @@ fn handle_event(app: &mut App) -> Result<bool> {
             _ => {}
         },
         Event::Key(key) if app.funding_dialog.is_some() => match key.code {
-            KeyCode::Enter => app.funding_requested = true,
-            KeyCode::Esc => app.funding_dialog = None,
-            KeyCode::Backspace => {
-                if let Some(value) = app.funding_dialog.as_mut() {
-                    value.pop();
+            KeyCode::Enter | KeyCode::Esc => {
+                app.funding_dialog = None;
+                app.funding_selection = None;
+                app.funding_drag_start = None;
+                app.funding_scroll = 0;
+            }
+            KeyCode::Char('c') | KeyCode::Char('C') => {
+                if let Some(text) = app.funding_dialog.as_deref() {
+                    if let Err(error) = copy_text_to_clipboard(text) {
+                        app.set_error(error);
+                    } else {
+                        app.grid_change_notice =
+                            Some("Funding instructions copied to clipboard.".to_owned());
+                    }
                 }
             }
-            KeyCode::Char(character) if character.is_ascii_digit() || character == '.' => {
-                if let Some(value) = app.funding_dialog.as_mut() {
-                    value.push(character);
+            KeyCode::PageUp => {
+                let (width, height) = crossterm::terminal::size()?;
+                let area = Rect::new(0, 0, width, height);
+                if let Some((_popup, _wrapped, visible, _max_scroll)) =
+                    funding_modal_layout(app, area)
+                {
+                    app.funding_scroll = app.funding_scroll.saturating_sub(visible);
+                }
+            }
+            KeyCode::PageDown => {
+                let (width, height) = crossterm::terminal::size()?;
+                let area = Rect::new(0, 0, width, height);
+                if let Some((_popup, _wrapped, visible, max_scroll)) = funding_modal_layout(app, area)
+                {
+                    app.funding_scroll = (app.funding_scroll + visible).min(max_scroll);
                 }
             }
             _ => {}
@@ -2757,11 +2733,14 @@ fn handle_event(app: &mut App) -> Result<bool> {
             }
             // `m` opens the market terminal modal rather than changing the page.
             KeyCode::Char('m') => app.open_market_picker(),
-            // Spot funding setup is explicit: U opens a confirmation/input modal and never
-            // moves funds merely because the monitor refreshed.
+            // Spot funding setup is explicit: U opens an informational modal; it never submits
+            // transactions. HOLD_AS_NON_COLLATERAL is owner-only and must be done manually.
             KeyCode::Char('u') if app.tab == TAB_PREVIEW || app.tab == TAB_MONITOR => {
                 if app.settings.product == Product::Spot {
-                    app.funding_dialog = Some(String::new());
+                    app.funding_dialog = build_funding_instructions(app);
+                    app.funding_selection = None;
+                    app.funding_drag_start = None;
+                    app.funding_scroll = 0;
                     app.error = None;
                 }
             }
@@ -2864,6 +2843,59 @@ fn handle_event(app: &mut App) -> Result<bool> {
                 }
             }
         }
+        Event::Mouse(mouse) if app.funding_dialog.is_some() => {
+            let (width, height) = crossterm::terminal::size()?;
+            let area = Rect::new(0, 0, width, height);
+            let Some((popup, wrapped, _visible, max_scroll)) = funding_modal_layout(app, area)
+            else {
+                return Ok(false);
+            };
+            match mouse.kind {
+                MouseEventKind::Down(_) => {
+                    if let Some((row, col)) =
+                        funding_modal_mouse_position(mouse.column, mouse.row, popup)
+                    {
+                        let content_row = row + app.funding_scroll;
+                        if let Some(orig) = funding_original_position(&wrapped, content_row, col) {
+                            app.funding_drag_start = Some(orig);
+                            app.funding_selection = Some((orig, orig));
+                        }
+                    }
+                }
+                MouseEventKind::Drag(_) => {
+                    if let (Some(start), Some((row, col))) = (
+                        app.funding_drag_start,
+                        funding_modal_mouse_position(mouse.column, mouse.row, popup),
+                    ) {
+                        let content_row = row + app.funding_scroll;
+                        if let Some(orig) =
+                            funding_original_position(&wrapped, content_row, col)
+                        {
+                            app.funding_selection = Some((start, orig));
+                        }
+                    }
+                }
+                MouseEventKind::Up(_) => {
+                    if let Some(text) = selected_funding_text(app) {
+                        if let Err(error) = copy_text_to_clipboard(&text) {
+                            app.set_error(error);
+                        } else {
+                            app.grid_change_notice = Some(
+                                "Selected funding instructions copied to clipboard.".to_owned(),
+                            );
+                        }
+                    }
+                    app.funding_drag_start = None;
+                }
+                MouseEventKind::ScrollUp => {
+                    app.funding_scroll = app.funding_scroll.saturating_sub(1);
+                }
+                MouseEventKind::ScrollDown => {
+                    app.funding_scroll = (app.funding_scroll + 1).min(max_scroll);
+                }
+                _ => {}
+            }
+        }
         Event::Mouse(mouse) if matches!(mouse.kind, MouseEventKind::Down(_)) => {
             if mouse.row == 1 {
                 let tab_area = Rect::new(0, 0, crossterm::terminal::size()?.0, 3);
@@ -2885,32 +2917,49 @@ fn handle_event(app: &mut App) -> Result<bool> {
                     // deliberately keyboard-confirmed with Enter/Space to prevent accidental
                     // changes when a user is merely inspecting the form.
                 }
-            } else if app.tab == TAB_PREVIEW {
-                let (width, height) = crossterm::terminal::size()?;
-                let screen = Rect::new(0, 0, width, height);
-                let content = Layout::default()
-                    .direction(Direction::Vertical)
-                    .constraints([
-                        Constraint::Length(3),
-                        Constraint::Min(3),
-                        Constraint::Length(3),
-                    ])
-                    .split(screen)[1];
-                let button = preview_execute_button(content);
-                if mouse.column >= button.x
-                    && mouse.column < button.right()
-                    && mouse.row >= button.y
-                    && mouse.row < button.bottom()
+            } else if app.tab == TAB_PREVIEW || app.tab == TAB_MONITOR {
+                if app.settings.product == Product::Spot
+                    && let Some(area) = spot_funding_line_area()
+                    && mouse.column >= area.x
+                    && mouse.column < area.right()
+                    && mouse.row >= area.y
+                    && mouse.row < area.bottom()
                 {
-                    // A mouse click is equivalent to the explicit [E] confirmation key. It only
-                    // works on Preview; Monitor never submits transactions.
-                    app.execute_requested = true;
+                    // Clicking the Spot funding line opens the same info modal as the U key.
+                    app.funding_dialog = build_funding_instructions(app);
+                    app.funding_selection = None;
+                    app.funding_drag_start = None;
+                    app.funding_scroll = 0;
                     app.error = None;
+                    return Ok(false);
+                }
+                if app.tab == TAB_PREVIEW {
+                    let (width, height) = crossterm::terminal::size()?;
+                    let screen = Rect::new(0, 0, width, height);
+                    let content = Layout::default()
+                        .direction(Direction::Vertical)
+                        .constraints([
+                            Constraint::Length(3),
+                            Constraint::Min(3),
+                            Constraint::Length(3),
+                        ])
+                        .split(screen)[1];
+                    let button = preview_execute_button(content);
+                    if mouse.column >= button.x
+                        && mouse.column < button.right()
+                        && mouse.row >= button.y
+                        && mouse.row < button.bottom()
+                    {
+                        // A mouse click is equivalent to the explicit [E] confirmation key. It only
+                        // works on Preview; Monitor never submits transactions.
+                        app.execute_requested = true;
+                        app.error = None;
+                    } else {
+                        select_grid_cell_from_mouse(app, mouse.column, mouse.row);
+                    }
                 } else {
                     select_grid_cell_from_mouse(app, mouse.column, mouse.row);
                 }
-            } else if app.tab == TAB_MONITOR {
-                select_grid_cell_from_mouse(app, mouse.column, mouse.row);
             }
         }
         _ => {}
@@ -2933,6 +2982,33 @@ fn preview_execute_button(content: Rect) -> Rect {
         20.min(summary.width),
         1,
     )
+}
+
+/// Returns the screen rectangle of the Spot funding warning/config line inside the summary block.
+/// This is `None` only when the terminal size cannot be read, which should not happen in the TUI.
+fn spot_funding_line_area() -> Option<Rect> {
+    let (width, height) = crossterm::terminal::size().ok()?;
+    let screen = Rect::new(0, 0, width, height);
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(3),
+            Constraint::Min(3),
+            Constraint::Length(3),
+        ])
+        .split(screen);
+    let grid_chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(8),
+            Constraint::Min(6),
+            Constraint::Length(8),
+        ])
+        .split(chunks[1]);
+    let summary = grid_chunks[0];
+    let inner = Rect::new(summary.x + 1, summary.y + 1, summary.width - 2, summary.height - 2);
+    // The warning/config line is the 6th line (index 5) of the summary text.
+    Some(Rect::new(inner.x, inner.y + 5, inner.width, 1))
 }
 
 fn select_grid_cell_from_mouse(app: &mut App, column: u16, row: u16) {
@@ -3245,50 +3321,274 @@ fn render_market_picker(area: Rect, frame: &mut ratatui::Frame, app: &App) {
     );
 }
 
-/// Explicit Spot funding setup modal. The bot only submits Cross→PFS transfer; setting
-/// HOLD_AS_NON_COLLATERAL is owner-only and must be done manually in the Decibel UI/wallet.
-/// Nothing here runs automatically on a monitor refresh.
+/// Build the informational text shown in the Spot funding modal.
+/// Returns `None` when the required snapshot/subaccount data is not available.
+fn build_funding_instructions(app: &App) -> Option<String> {
+    let snapshot = app.snapshot.as_ref()?;
+    let funds = snapshot.account.spot_funds.as_ref()?;
+    let network = app.settings.network.trim();
+    let subaccount = app.settings.subaccount.trim();
+    if subaccount.is_empty() {
+        return None;
+    }
+    let package = decibel_grid_tui::package_for_network(network).ok()?;
+    let metadata = if network.eq_ignore_ascii_case("mainnet") {
+        app.settings
+            .spot_funding_metadata
+            .as_deref()
+            .unwrap_or("<set SPOT_FUNDING_METADATA>")
+    } else {
+        decibel_grid_tui::TESTNET_USDC_METADATA
+    };
+    let required = snapshot.plan.quote_required;
+    let pfs = funds.available_quote_for_bulk();
+    let cross = funds.quote_cross_balance();
+    let gap = (required - pfs).max(Decimal::ZERO);
+    let transfer = cross.min(gap);
+    let raw_transfer = (transfer * Decimal::from(1_000_000u64))
+        .floor()
+        .to_i64()
+        .unwrap_or(0);
+    let display_cross = if cross < USDC_CROSS_DUST {
+        Decimal::ZERO
+    } else {
+        cross
+    };
+    let mut lines = vec![
+        "Spot funding setup instructions".to_owned(),
+        String::new(),
+        format!("Grid quote required: {} USDC", format_decimal(required, 6)),
+        format!("PFS available for bulk: {} USDC", format_decimal(pfs, 6)),
+        format!("Cross USDC balance: {} USDC", format_decimal(display_cross, 6)),
+        format!("Funding gap: {} USDC", format_decimal(gap, 6)),
+        String::new(),
+        "Spot bulk orders use PFS funds. By default, Spot proceeds settle to Cross (perp collateral). The subaccount owner must call the function below so future Spot proceeds stay in PFS instead of moving to Cross.".to_owned(),
+        String::new(),
+        "Owner-only entry:".to_owned(),
+        format!(
+            "  {package}::dex_accounts_spot_entry::set_hold_as_non_collateral_for_subaccount({subaccount}, {metadata}, hold=true)"
+        ),
+        String::new(),
+        "Bot/delegate entry (after owner-only setup):".to_owned(),
+        format!(
+            "  {package}::dex_accounts_entry::transfer_assets_between_non_collateral_and_collateral({subaccount}, {metadata}, amount=-{raw_transfer})"
+        ),
+    ];
+    if cross < gap {
+        let deposit = gap - cross;
+        lines.push(String::new());
+        lines.push(format!(
+            "NOTE: Cross balance is {} USDC short of the gap; deposit {} USDC to PFS after the owner-only setup.",
+            format_decimal(deposit, 6),
+            format_decimal(deposit, 6)
+        ));
+    }
+    lines.push(String::new());
+    lines.push("C copy full instructions · drag to select/copy · Esc or Enter to close".to_owned());
+    Some(lines.join("\n"))
+}
+
+fn copy_text_to_clipboard(text: &str) -> Result<()> {
+    let mut clipboard = arboard::Clipboard::new().context("initialize system clipboard")?;
+    clipboard
+        .set_text(text.to_owned())
+        .context("copy text to system clipboard")?;
+    Ok(())
+}
+
+/// One visible row after char-wrapping the funding modal text.
+struct WrappedLine {
+    text: String,
+    /// Original logical line index this wrapped row belongs to.
+    original_line: u16,
+    /// Column offset within the original logical line.
+    original_start_col: u16,
+}
+
+/// Wrap funding modal text to a fixed character width so every visible row maps to a known
+/// substring. This makes mouse selection and vertical scrolling deterministic.
+fn wrap_funding_lines(text: &str, width: usize) -> Vec<WrappedLine> {
+    let mut result = Vec::new();
+    for (line_index, line) in text.lines().enumerate() {
+        if line.is_empty() {
+            result.push(WrappedLine {
+                text: String::new(),
+                original_line: line_index as u16,
+                original_start_col: 0,
+            });
+            continue;
+        }
+        let chars: Vec<char> = line.chars().collect();
+        for (chunk_index, chunk) in chars.chunks(width.max(1)).enumerate() {
+            result.push(WrappedLine {
+                text: chunk.iter().collect(),
+                original_line: line_index as u16,
+                original_start_col: (chunk_index * width) as u16,
+            });
+        }
+    }
+    result
+}
+
+/// Compute the funding modal popup, wrapped content, visible rows, and max scroll.
+fn funding_modal_layout(app: &App, area: Rect) -> Option<(Rect, Vec<WrappedLine>, u16, u16)> {
+    let text = app.funding_dialog.as_deref()?;
+    let popup_width = 90u16;
+    let content_width = popup_width.saturating_sub(2);
+    let wrapped = wrap_funding_lines(text, content_width as usize);
+    let content_height = wrapped.len() as u16;
+    let popup_height = (content_height + 2)
+        .min(area.height.saturating_sub(4))
+        .max(12);
+    let popup = centered_rect(popup_width, popup_height, area);
+    let visible = popup_height.saturating_sub(2);
+    let max_scroll = content_height.saturating_sub(visible);
+    Some((popup, wrapped, visible, max_scroll))
+}
+
+/// Map a mouse position to (wrapped_row, column) inside the funding modal content area.
+fn funding_modal_mouse_position(column: u16, row: u16, popup: Rect) -> Option<(u16, u16)> {
+    let content = Rect::new(popup.x + 1, popup.y + 1, popup.width - 2, popup.height - 2);
+    if column < content.x
+        || column >= content.right()
+        || row < content.y
+        || row >= content.bottom()
+    {
+        return None;
+    }
+    Some((row - content.y, column - content.x))
+}
+
+/// Map a wrapped row to the original (line, column) it represents.
+fn funding_original_position(
+    wrapped_lines: &[WrappedLine],
+    wrapped_row: u16,
+    column: u16,
+) -> Option<(u16, u16)> {
+    let line = wrapped_lines.get(wrapped_row as usize)?;
+    Some((
+        line.original_line,
+        line.original_start_col.saturating_add(column),
+    ))
+}
+
+fn normalize_funding_selection(selection: ((u16, u16), (u16, u16))) -> ((u16, u16), (u16, u16)) {
+    let ((l1, c1), (l2, c2)) = selection;
+    if l1 < l2 || (l1 == l2 && c1 <= c2) {
+        ((l1, c1), (l2, c2))
+    } else {
+        ((l2, c2), (l1, c1))
+    }
+}
+
+fn split_string_at_indices(s: &str, start: usize, end: usize) -> (String, String, String) {
+    let mut chars = s.chars();
+    let before: String = chars.by_ref().take(start).collect();
+    let selected: String = chars.by_ref().take(end.saturating_sub(start)).collect();
+    let after: String = chars.collect();
+    (before, selected, after)
+}
+
+/// Extract the currently selected text from the funding modal.
+fn selected_funding_text(app: &App) -> Option<String> {
+    let text = app.funding_dialog.as_deref()?;
+    let selection = app.funding_selection?;
+    let lines: Vec<&str> = text.lines().collect();
+    let ((start_line, start_col), (end_line, end_col)) = normalize_funding_selection(selection);
+    let mut result = String::new();
+    for line_idx in start_line..=end_line {
+        let line_idx = line_idx as usize;
+        if line_idx >= lines.len() {
+            break;
+        }
+        let line = lines[line_idx];
+        let line_len = line.chars().count() as u16;
+        let s = if line_idx as u16 == start_line {
+            start_col
+        } else {
+            0
+        };
+        let e = if line_idx as u16 == end_line {
+            end_col
+        } else {
+            line_len
+        };
+        let s = s.min(line_len);
+        let e = e.max(s).min(line_len);
+        let selected: String = line.chars().skip(s as usize).take((e - s) as usize).collect();
+        result.push_str(&selected);
+        if line_idx as u16 != end_line {
+            result.push('\n');
+        }
+    }
+    if result.is_empty() {
+        None
+    } else {
+        Some(result)
+    }
+}
+
+/// Render one wrapped row of the funding modal, highlighting the selected region if any.
+fn render_funding_wrapped_line(
+    wrapped: &WrappedLine,
+    width: u16,
+    selection: Option<((u16, u16), (u16, u16))>,
+) -> Line<'static> {
+    let selection = selection.map(normalize_funding_selection);
+    let Some(((start_line, start_col), (end_line, end_col))) = selection else {
+        return Line::from(wrapped.text.clone());
+    };
+    let line_index = wrapped.original_line;
+    if line_index < start_line || line_index > end_line {
+        return Line::from(wrapped.text.clone());
+    }
+    let segment_start = wrapped.original_start_col;
+    let segment_end = segment_start.saturating_add(width);
+    let sel_start = if line_index == start_line { start_col } else { 0 };
+    let sel_end = if line_index == end_line { end_col } else { u16::MAX };
+    let line_len = wrapped.text.chars().count() as u16;
+    let s = sel_start
+        .max(segment_start)
+        .saturating_sub(segment_start)
+        .min(line_len);
+    let e = sel_end
+        .min(segment_end)
+        .saturating_sub(segment_start)
+        .min(line_len);
+    if s >= e {
+        return Line::from(wrapped.text.clone());
+    }
+    let selected_style = Style::default().bg(Color::Blue).fg(Color::White);
+    let (before, selected, after) = split_string_at_indices(&wrapped.text, s as usize, e as usize);
+    Line::from(vec![
+        Span::raw(before),
+        Span::styled(selected, selected_style),
+        Span::raw(after),
+    ])
+}
+
+/// Informational Spot funding modal. It shows the two entry functions and their arguments.
+/// The bot does not submit HOLD_AS_NON_COLLATERAL (owner-only); it also does not submit the
+/// Cross→PFS transfer from this modal. Users can copy the instructions with C or by selecting
+/// text with the mouse.
 fn render_funding_modal(area: Rect, frame: &mut ratatui::Frame, app: &App) {
-    let Some(input) = app.funding_dialog.as_deref() else {
+    let Some((popup, wrapped, visible, max_scroll)) = funding_modal_layout(app, area) else {
         return;
     };
-    let popup = centered_rect(78, 13, area);
     frame.render_widget(Clear, popup);
-    let cross_line = app
-        .snapshot
-        .as_ref()
-        .and_then(|snapshot| snapshot.account.spot_funds.as_ref())
-        .map(|funds| {
-            format!(
-                "Cross USDC currently withdrawable: {}",
-                format_decimal(funds.quote_cross_balance(), 6)
-            )
-        })
-        .unwrap_or_else(|| "Cross USDC balance: refresh the monitor to load it".to_owned());
-    let lines = vec![
-        Line::from(Span::styled(
-            "Spot funding setup (testnet USDC)",
-            Style::default().add_modifier(Modifier::BOLD),
-        )),
-        Line::from(cross_line),
-        Line::from(
-            "NOTE: HOLD_AS_NON_COLLATERAL is owner-only; set it manually in the Decibel UI/wallet.",
-        ),
-        Line::from("Pressing Enter submits one on-chain action:"),
-        Line::from("  transfer the amount below from Cross into PFS (0 = skip the transfer)"),
-        Line::from(""),
-        Line::from(format!("Amount to move Cross → PFS (USDC): {input}_")),
-        Line::from(if app.funding_pending {
-            "Submitting... this may take up to a minute.".to_owned()
-        } else {
-            "Enter confirm and submit · Esc cancel · digits/. edit amount".to_owned()
-        }),
-    ];
+    let scroll = app.funding_scroll.min(max_scroll);
+    let content_width = popup.width.saturating_sub(2);
+    let lines: Vec<Line> = wrapped
+        .iter()
+        .skip(scroll as usize)
+        .take(visible as usize)
+        .map(|line| render_funding_wrapped_line(line, content_width, app.funding_selection))
+        .collect();
     frame.render_widget(
-        Paragraph::new(lines).wrap(Wrap { trim: true }).block(
+        Paragraph::new(lines).block(
             Block::default()
                 .borders(Borders::ALL)
-                .title("Fund Spot bulk orders from PFS"),
+                .title("Spot funding setup instructions"),
         ),
         popup,
     );
@@ -3732,17 +4032,36 @@ fn render_grid(area: Rect, frame: &mut ratatui::Frame, app: &App, config: Option
         )
     });
     let spot_funding_warning = if snapshot.market.product == Product::Spot {
-        snapshot
-            .account
-            .spot_funds
-            .as_ref()
-            .filter(|funds| funds.quote_cross_balance() > Decimal::ZERO)
-            .map(|funds| {
-                format!(
-                    "WARNING: {} USDC is in Cross; future Spot proceeds may route to Cross. Set HOLD_AS_NON_COLLATERAL manually as owner, then press U to move USDC → PFS.",
-                    format_decimal(funds.quote_cross_balance(), 6)
-                )
-            })
+        snapshot.account.spot_funds.as_ref().and_then(|funds| {
+            let required = snapshot.plan.quote_required;
+            let pfs = funds.available_quote_for_bulk();
+            let cross = funds.quote_cross_balance();
+            if pfs >= required {
+                return None;
+            }
+            let total = pfs + cross;
+            if total >= required {
+                let display_cross = if cross < USDC_CROSS_DUST {
+                    Decimal::ZERO
+                } else {
+                    cross
+                };
+                Some(format!(
+                    "WARNING: grid needs {} USDC in PFS but only {} available; {} USDC in Cross can cover the gap. Press U or click here for funding instructions.",
+                    format_decimal(required, 6),
+                    format_decimal(pfs, 6),
+                    format_decimal(display_cross, 6)
+                ))
+            } else {
+                Some(format!(
+                    "WARNING: grid needs {} USDC but PFS+Cross only has {} ({} PFS + {} Cross). Deposit more USDC to PFS.",
+                    format_decimal(required, 6),
+                    format_decimal(total, 6),
+                    format_decimal(pfs, 6),
+                    format_decimal(cross, 6)
+                ))
+            }
+        })
     } else {
         None
     };
@@ -3815,7 +4134,7 @@ fn render_grid(area: Rect, frame: &mut ratatui::Frame, app: &App, config: Option
         exposure_line,
         spot_funding_warning.unwrap_or_else(|| {
             if snapshot.market.product == Product::Spot {
-                "Spot funding routing: no Cross balance warning; press U to configure future proceeds and optional Cross→PFS transfer.".to_owned()
+                "Spot funding: PFS quote is sufficient for the current grid; press U or click here to view funding instructions.".to_owned()
             } else {
                 String::new()
             }

@@ -291,7 +291,7 @@ const TESTNET_PACKAGE: &str = "0xe7da2794b1d8af76532ed95f38bfdf1136abfd8ea3a2401
 pub const TESTNET_USDC_METADATA: &str =
     "0x5428acf5c112826d0c74ae1cd2de9030f53d1d01235e6c2621d967bf914ee1c8";
 
-fn package_for_network(network: &str) -> Result<&'static str> {
+pub fn package_for_network(network: &str) -> Result<&'static str> {
     match network.trim().to_ascii_lowercase().as_str() {
         "mainnet" => Ok(MAINNET_PACKAGE),
         "testnet" => Ok(TESTNET_PACKAGE),
