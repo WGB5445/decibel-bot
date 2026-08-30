@@ -47,6 +47,24 @@ cargo run -- run -e \
 
 所有 read-only 命令都不修改交易所状态。
 
+## 退出时资产策略
+
+`--exit-asset-policy` 控制进程收到退出信号或 TUI 按 `q`/`Ctrl+C` 时的处理方式，也可用环境变量 `EXIT_ASSET_POLICY` 设置：
+
+- `retain`（默认）：取消进程不会主动卖出 Spot base，也不会平 Perp 仓位；资产和仓位保留。
+- `sell`：仅在明确选择后执行退出清理。程序先取消当前市场的 bulk ladder；Spot 用 IOC 卖出可用 base；Perp 用 reduce-only IOC 订单平掉当前仓位。
+
+```bash
+# 默认保留资产
+cargo run -- run -e --exit-asset-policy retain ...
+
+# 明确退出时清理 Spot base / Perp 仓位
+cargo run -- run -e --exit-asset-policy sell ...
+# 或：EXIT_ASSET_POLICY=sell cargo run -- run -e ...
+```
+
+`sell` 使用有界 IOC 价格，不保证在极端流动性不足时完全成交；退出清理失败会保留错误并停止继续尝试，不会循环追单。使用前应确认私钥账户有足够 APT 支付取消和退出交易 gas。TUI Configure 页的 **Exit Asset Policy / 退出资产策略** 字段与 CLI 使用同一配置，并可通过 `Ctrl+S` 保存到 profile。
+
 ## 启动方式
 
 ```bash

@@ -67,6 +67,12 @@ pub enum PriceSource {
     Depth,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+pub enum ExitAssetPolicy {
+    Retain,
+    Sell,
+}
+
 #[derive(Clone, Debug)]
 pub enum RangeSpec {
     Bounds { lower: Decimal, upper: Decimal },
@@ -484,6 +490,200 @@ pub async fn execute_bulk_grid(
     })
 }
 
+/// Cancel the active bulk ladder and liquidate this market's inventory on explicit shutdown.
+/// This is deliberately opt-in; callers must only invoke it for `ExitAssetPolicy::Sell`.
+pub async fn exit_sell_assets(
+    network: &str,
+    api_key: &str,
+    private_key: &str,
+    subaccount: &str,
+    market: &Market,
+) -> Result<Vec<String>> {
+    let client = DecibelClient::new(network, api_key)?;
+    let account = client.account(Some(subaccount), market).await?;
+    let package = package_for_network(network)?;
+    let key = normalize_private_key(private_key)?;
+    let signer =
+        Ed25519Account::from_private_key_hex(&key).context("invalid Aptos Ed25519 private key")?;
+    let subaccount_addr: AccountAddress =
+        subaccount.parse().context("invalid subaccount address")?;
+    let market_addr: AccountAddress = market.address.parse().context("invalid market address")?;
+    let aptos = Aptos::new(if network.eq_ignore_ascii_case("mainnet") {
+        AptosConfig::mainnet()
+    } else {
+        AptosConfig::testnet()
+    })?;
+    let gas_price = aptos
+        .fullnode()
+        .estimate_gas_price()
+        .await?
+        .data
+        .recommended();
+    if gas_price == 0 {
+        bail!("Aptos returned a zero gas unit price")
+    }
+    let max_gas_amount = 50_000_000u64 / gas_price;
+    let chain_id = aptos.ensure_chain_id().await?;
+    let mut sequence = aptos.get_sequence_number(signer.address()).await?;
+    let mut hashes = Vec::new();
+
+    let cancel_entry = match market.product {
+        Product::Spot => {
+            format!("{package}::dex_accounts_spot_entry::cancel_spot_bulk_order_to_subaccount")
+        }
+        Product::Perp => format!("{package}::dex_accounts_entry::cancel_bulk_order_to_subaccount"),
+    };
+    let cancel_payload = InputEntryFunctionData::new(&cancel_entry)
+        .arg(subaccount_addr)
+        .arg(market_addr)
+        .build()
+        .context("build exit bulk cancellation transaction")?;
+    let raw = TransactionBuilder::new()
+        .sender(signer.address())
+        .sequence_number(sequence)
+        .payload(cancel_payload)
+        .max_gas_amount(max_gas_amount)
+        .gas_unit_price(gas_price)
+        .chain_id(chain_id)
+        .expiration_from_now(600)
+        .build()?;
+    let response = aptos
+        .submit_and_wait(
+            &sign_transaction(&raw, &signer)?,
+            Some(Duration::from_secs(60)),
+        )
+        .await?;
+    sequence = sequence.saturating_add(1);
+    if response
+        .data
+        .get("success")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        hashes.push(
+            response
+                .data
+                .get("hash")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_owned(),
+        );
+    } else {
+        println!(
+            "Exit cleanup: bulk cancellation failed; continuing with liquidation: {}",
+            response
+                .data
+                .get("vm_status")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown status")
+        );
+    }
+
+    let book = client.order_book(market, 1).await?;
+    match market.product {
+        Product::Spot => {
+            let Some(funds) = account.spot_funds else {
+                return Ok(hashes);
+            };
+            let quantity = round_down(funds.available_base(), market.lot_size);
+            if quantity >= market.min_size {
+                let bid = book
+                    .asks
+                    .first()
+                    .or_else(|| book.bids.first())
+                    .ok_or_else(|| anyhow!("cannot liquidate Spot: order book is empty"))?;
+                let price = round_down(bid.price * Decimal::new(997, 3), market.tick_size);
+                let hash = submit_spot_ioc_order(
+                    network,
+                    private_key,
+                    subaccount,
+                    market,
+                    price,
+                    quantity,
+                    false,
+                )
+                .await?;
+                hashes.push(hash);
+            }
+        }
+        Product::Perp => {
+            let position = account.position.size;
+            if position != Decimal::ZERO {
+                let reference = if position.is_sign_negative() {
+                    book.asks.first()
+                } else {
+                    book.bids.first()
+                }
+                .ok_or_else(|| anyhow!("cannot close Perp: executable book side is empty"))?;
+                let price = if position.is_sign_negative() {
+                    round_up(reference.price * Decimal::new(1003, 3), market.tick_size)
+                } else {
+                    round_down(reference.price * Decimal::new(997, 3), market.tick_size)
+                };
+                let entry = format!("{package}::dex_accounts_entry::place_order_to_subaccount");
+                let payload = InputEntryFunctionData::new(&entry)
+                    .arg(subaccount_addr)
+                    .arg(market_addr)
+                    .arg(scale_chain_amount(price, market.px_decimals)?)
+                    .arg(scale_chain_amount(position.abs(), market.sz_decimals)?)
+                    .arg(position.is_sign_negative())
+                    .arg(2u8)
+                    .arg(true)
+                    .arg_raw(move_none())
+                    .arg_raw(move_none())
+                    .arg_raw(move_none())
+                    .arg_raw(move_none())
+                    .arg_raw(move_none())
+                    .arg_raw(move_none())
+                    .arg_raw(move_none())
+                    .arg_raw(move_none())
+                    .build()
+                    .context("build reduce-only Perp exit transaction")?;
+                let raw = TransactionBuilder::new()
+                    .sender(signer.address())
+                    .sequence_number(sequence)
+                    .payload(payload)
+                    .max_gas_amount(max_gas_amount)
+                    .gas_unit_price(gas_price)
+                    .chain_id(chain_id)
+                    .expiration_from_now(600)
+                    .build()?;
+                let response = aptos
+                    .submit_and_wait(
+                        &sign_transaction(&raw, &signer)?,
+                        Some(Duration::from_secs(60)),
+                    )
+                    .await?;
+                if response
+                    .data
+                    .get("success")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false)
+                {
+                    hashes.push(
+                        response
+                            .data
+                            .get("hash")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                            .to_owned(),
+                    );
+                } else {
+                    bail!(
+                        "Perp exit transaction failed: {}",
+                        response
+                            .data
+                            .get("vm_status")
+                            .and_then(Value::as_str)
+                            .unwrap_or("unknown status")
+                    );
+                }
+            }
+        }
+    }
+    Ok(hashes)
+}
+
 /// Bounded taker-buy sizing for the Spot base inventory a grid's ask side needs.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SpotTakerFunding {
@@ -617,13 +817,14 @@ pub async fn fund_spot_base_for_grid(
             );
             break;
         }
-        let hash = submit_spot_ioc_bid(
+        let hash = submit_spot_ioc_order(
             network,
             private_key,
             subaccount,
             market,
             funding.limit_price,
             funding.quantity,
+            true,
         )
         .await?;
         println!(
@@ -748,13 +949,14 @@ pub fn compute_spot_funding_plan(
 
 /// Submit the official eight-argument Spot ABI with the requested time-in-force.
 /// `2` is IOC: it immediately takes available asks and leaves no resting order.
-async fn submit_spot_ioc_bid(
+async fn submit_spot_ioc_order(
     network: &str,
     private_key: &str,
     subaccount: &str,
     market: &Market,
     price: Decimal,
     quantity: Decimal,
+    is_buy: bool,
 ) -> Result<String> {
     const IOC: u8 = 2;
     const MAX_GAS_OCTAS: u64 = 50_000_000;
@@ -781,7 +983,7 @@ async fn submit_spot_ioc_bid(
         .arg(market_addr)
         .arg(scale_chain_amount(price, market.px_decimals)?)
         .arg(scale_chain_amount(quantity, market.sz_decimals)?)
-        .arg(true)
+        .arg(is_buy)
         .arg(IOC)
         .arg_raw(move_none())
         .arg_raw(move_none())

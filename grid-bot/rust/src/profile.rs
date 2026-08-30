@@ -121,6 +121,9 @@ pub struct ProfileData {
     pub preview_leverage: String,
     pub refresh_seconds: String,
     pub price_source: String,
+    /// How to handle assets on exit: "retain" or "sell".
+    #[serde(default)]
+    pub exit_asset_policy: String,
     /// Argon2id + XChaCha20-Poly1305 envelopes. `None` when a credential has not been saved.
     pub encrypted_api_key: Option<EncryptedSecret>,
     pub encrypted_aptos_private_key: Option<EncryptedSecret>,

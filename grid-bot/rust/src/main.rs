@@ -346,6 +346,15 @@ struct Args {
         default_value = "prices"
     )]
     price_source: PriceSource,
+    /// How to handle assets when the bot exits (retain or sell).
+    #[arg(
+        long,
+        global = true,
+        env = "EXIT_ASSET_POLICY",
+        value_enum,
+        default_value = "retain"
+    )]
+    exit_asset_policy: ExitAssetPolicy,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -383,6 +392,8 @@ struct Settings {
     price_source: PriceSource,
     /// Optional USDC metadata override for Spot funding instructions on mainnet.
     spot_funding_metadata: Option<String>,
+    /// How to handle Spot base + Perp position on exit.
+    exit_asset_policy: ExitAssetPolicy,
 }
 
 impl From<&Args> for Settings {
@@ -425,6 +436,7 @@ impl From<&Args> for Settings {
             refresh_seconds: args.refresh_seconds.to_string(),
             price_source: args.price_source,
             spot_funding_metadata: args.spot_funding_metadata.clone(),
+            exit_asset_policy: args.exit_asset_policy,
         }
     }
 }
@@ -453,6 +465,7 @@ impl Settings {
             refresh_seconds: "3".to_owned(),
             price_source: PriceSource::Prices,
             spot_funding_metadata: None,
+            exit_asset_policy: ExitAssetPolicy::Retain,
         }
     }
 
@@ -488,6 +501,7 @@ impl Settings {
             preview_leverage: self.preview_leverage.clone(),
             refresh_seconds: self.refresh_seconds.clone(),
             price_source: format!("{:?}", self.price_source).to_lowercase(),
+            exit_asset_policy: format!("{:?}", self.exit_asset_policy).to_lowercase(),
             encrypted_api_key: None,
             encrypted_aptos_private_key: None,
         }
@@ -537,6 +551,11 @@ impl Settings {
         match data.price_source.as_str() {
             "prices" => self.price_source = PriceSource::Prices,
             "depth" => self.price_source = PriceSource::Depth,
+            _ => {}
+        }
+        match data.exit_asset_policy.as_str() {
+            "retain" => self.exit_asset_policy = ExitAssetPolicy::Retain,
+            "sell" => self.exit_asset_policy = ExitAssetPolicy::Sell,
             _ => {}
         }
         if self.product == Product::Spot {
@@ -628,8 +647,9 @@ enum Field {
     PreviewLeverage,
     RefreshSeconds,
     PriceSource,
+    ExitAssetPolicy,
 }
-const FIELDS: [Field; 18] = [
+const FIELDS: [Field; 19] = [
     Field::ApiKey,
     Field::AptosPrivateKey,
     Field::Language,
@@ -648,6 +668,7 @@ const FIELDS: [Field; 18] = [
     Field::PreviewLeverage,
     Field::RefreshSeconds,
     Field::PriceSource,
+    Field::ExitAssetPolicy,
 ];
 
 impl Field {
@@ -673,6 +694,7 @@ impl Field {
                 Self::PreviewLeverage => TKey::FieldPreviewLeverage,
                 Self::RefreshSeconds => TKey::FieldRefreshSeconds,
                 Self::PriceSource => TKey::FieldPriceSource,
+                Self::ExitAssetPolicy => TKey::FieldExitAssetPolicy,
             },
         )
     }
@@ -1041,6 +1063,7 @@ impl App {
             Field::PreviewLeverage => self.settings.preview_leverage.clone(),
             Field::RefreshSeconds => self.settings.refresh_seconds.clone(),
             Field::PriceSource => format!("{:?}", self.settings.price_source),
+            Field::ExitAssetPolicy => format!("{:?}", self.settings.exit_asset_policy),
         }
     }
     fn editable_value_mut(&mut self, field: Field) -> Option<&mut String> {
@@ -1141,6 +1164,14 @@ impl App {
                 } else {
                     PriceSource::Prices
                 }
+            }
+            Field::ExitAssetPolicy => {
+                self.settings.exit_asset_policy =
+                    if self.settings.exit_asset_policy == ExitAssetPolicy::Retain {
+                        ExitAssetPolicy::Sell
+                    } else {
+                        ExitAssetPolicy::Retain
+                    }
             }
             _ => return,
         };
@@ -1291,7 +1322,8 @@ impl SubaccountRunLock {
         let path = lock_dir.join(format!("subaccount-{digest}.lock"));
         let mut lock = fslock::LockFile::open(&path)
             .with_context(|| format!("could not open subaccount lock {}", path.display()))?;
-        if !lock.try_lock()
+        if !lock
+            .try_lock()
             .with_context(|| format!("could not acquire subaccount lock {}", path.display()))?
         {
             anyhow::bail!(
@@ -1854,6 +1886,7 @@ async fn run_cli(settings: Settings, execute: bool, confirm_mainnet: Option<&str
     // replacement because the sequence number changes, so comparing those IDs would falsely
     // classify every replacement as a fill.
     let mut last_seen_trade_ms: Option<i64> = None;
+    let mut last_market: Option<Market> = None;
 
     loop {
         let cycle_start = tokio::time::Instant::now();
@@ -1868,6 +1901,7 @@ async fn run_cli(settings: Settings, execute: bool, confirm_mainnet: Option<&str
         // Rebuild the plan without trade-history markers. Historical fills are a UI hint and
         // must not suppress a future desired order during reconciliation or execution.
         let mut snapshot = snapshot;
+        last_market = Some(snapshot.market.clone());
         // Trade history is returned newest-first. A newly observed trade is a strong trigger for
         // replacement; a small price-only drift is not. Seed the cursor on the first cycle so
         // historical fills from before this process started do not cause an immediate refresh.
@@ -2116,8 +2150,35 @@ async fn run_cli(settings: Settings, execute: bool, confirm_mainnet: Option<&str
         }
         let elapsed = cycle_start.elapsed();
         let wait = config.refresh.saturating_sub(elapsed);
-        tokio::time::sleep(wait).await;
+        tokio::select! {
+            _ = tokio::time::sleep(wait) => {}
+            _ = tokio::signal::ctrl_c() => {
+                println!("Shutdown requested.");
+                break;
+            }
+        }
     }
+
+    if execute && settings.exit_asset_policy == ExitAssetPolicy::Sell {
+        if let Some(market) = last_market {
+            println!("Exit policy is SELL: cancelling the ladder and liquidating assets...");
+            exit_sell_assets(
+                &settings.network,
+                &settings.api_key,
+                &settings.aptos_private_key,
+                &settings.subaccount,
+                &market,
+            )
+            .await?;
+        } else {
+            println!(
+                "Exit policy is SELL, but no market snapshot was loaded; nothing was liquidated."
+            );
+        }
+    } else if execute {
+        println!("Exit policy is RETAIN: assets and positions were left untouched.");
+    }
+    Ok(())
 }
 
 fn optional_subaccount(settings: &Settings) -> Option<&str> {
@@ -2513,6 +2574,20 @@ async fn tui_loop(
         };
         terminal.draw(|frame| render(frame.area(), frame, &app, config.as_ref()))?;
         if event::poll(Duration::from_millis(120))? && handle_event(&mut app)? {
+            if app.settings.exit_asset_policy == ExitAssetPolicy::Sell
+                && !app.settings.aptos_private_key.trim().is_empty()
+                && let Some(snapshot) = app.snapshot.as_ref()
+            {
+                println!("Exit policy is SELL: cancelling the ladder and liquidating assets...");
+                let _ = exit_sell_assets(
+                    &app.settings.network,
+                    &app.settings.api_key,
+                    &app.settings.aptos_private_key,
+                    &app.settings.subaccount,
+                    &snapshot.market,
+                )
+                .await;
+            }
             return Ok(());
         }
     }
@@ -2683,7 +2758,8 @@ fn handle_event(app: &mut App) -> Result<bool> {
             KeyCode::PageDown => {
                 let (width, height) = crossterm::terminal::size()?;
                 let area = Rect::new(0, 0, width, height);
-                if let Some((_popup, _wrapped, visible, max_scroll)) = funding_modal_layout(app, area)
+                if let Some((_popup, _wrapped, visible, max_scroll)) =
+                    funding_modal_layout(app, area)
                 {
                     app.funding_scroll = (app.funding_scroll + visible).min(max_scroll);
                 }
@@ -2868,9 +2944,7 @@ fn handle_event(app: &mut App) -> Result<bool> {
                         funding_modal_mouse_position(mouse.column, mouse.row, popup),
                     ) {
                         let content_row = row + app.funding_scroll;
-                        if let Some(orig) =
-                            funding_original_position(&wrapped, content_row, col)
-                        {
+                        if let Some(orig) = funding_original_position(&wrapped, content_row, col) {
                             app.funding_selection = Some((start, orig));
                         }
                     }
@@ -3006,7 +3080,12 @@ fn spot_funding_line_area() -> Option<Rect> {
         ])
         .split(chunks[1]);
     let summary = grid_chunks[0];
-    let inner = Rect::new(summary.x + 1, summary.y + 1, summary.width - 2, summary.height - 2);
+    let inner = Rect::new(
+        summary.x + 1,
+        summary.y + 1,
+        summary.width - 2,
+        summary.height - 2,
+    );
     // The warning/config line is the 6th line (index 5) of the summary text.
     Some(Rect::new(inner.x, inner.y + 5, inner.width, 1))
 }
@@ -3449,10 +3528,7 @@ fn funding_modal_layout(app: &App, area: Rect) -> Option<(Rect, Vec<WrappedLine>
 /// Map a mouse position to (wrapped_row, column) inside the funding modal content area.
 fn funding_modal_mouse_position(column: u16, row: u16, popup: Rect) -> Option<(u16, u16)> {
     let content = Rect::new(popup.x + 1, popup.y + 1, popup.width - 2, popup.height - 2);
-    if column < content.x
-        || column >= content.right()
-        || row < content.y
-        || row >= content.bottom()
+    if column < content.x || column >= content.right() || row < content.y || row >= content.bottom()
     {
         return None;
     }
@@ -3515,7 +3591,11 @@ fn selected_funding_text(app: &App) -> Option<String> {
         };
         let s = s.min(line_len);
         let e = e.max(s).min(line_len);
-        let selected: String = line.chars().skip(s as usize).take((e - s) as usize).collect();
+        let selected: String = line
+            .chars()
+            .skip(s as usize)
+            .take((e - s) as usize)
+            .collect();
         result.push_str(&selected);
         if line_idx as u16 != end_line {
             result.push('\n');
@@ -3544,8 +3624,16 @@ fn render_funding_wrapped_line(
     }
     let segment_start = wrapped.original_start_col;
     let segment_end = segment_start.saturating_add(width);
-    let sel_start = if line_index == start_line { start_col } else { 0 };
-    let sel_end = if line_index == end_line { end_col } else { u16::MAX };
+    let sel_start = if line_index == start_line {
+        start_col
+    } else {
+        0
+    };
+    let sel_end = if line_index == end_line {
+        end_col
+    } else {
+        u16::MAX
+    };
     let line_len = wrapped.text.chars().count() as u16;
     let s = sel_start
         .max(segment_start)
@@ -3827,6 +3915,9 @@ fn field_explanation(app: &App, field: Field) -> String {
         Field::PriceSource => {
             "Prices uses mid_px and works when depth is unavailable. Depth uses best bid/ask and is better for execution."
         }
+        Field::ExitAssetPolicy => {
+            "Retain leaves Spot base and Perp positions untouched. Sell cancels the bot ladder, sells available Spot base with bounded IOC orders, and submits a reduce-only Perp close."
+        }
         Field::ApiKey => {
             "Decibel API key for market/account reads. It is masked and can be encrypted in the profile with Ctrl+S."
         }
@@ -3869,6 +3960,9 @@ fn field_explanation(app: &App, field: Field) -> String {
             "用于真实下单的 Aptos Ed25519 私钥。只有确认执行计划后才会使用,并会加密保存。"
         }
         Field::Subaccount => "可选地址,用于读取仓位、挂单、余额和成交历史。",
+        Field::ExitAssetPolicy => {
+            "Retain：退出时不处理资产。Sell：退出时取消 bot 挂单，用 IOC 卖出可用 Spot base，并提交 reduce-only Perp 平仓。"
+        }
     };
     let mut text = if language == Language::Chinese {
         chinese
