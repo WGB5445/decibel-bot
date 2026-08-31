@@ -5,6 +5,10 @@ use std::{
     panic::{self, PanicHookInfo},
     path::{Path, PathBuf},
     str::FromStr,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     time::Duration,
 };
 
@@ -1887,8 +1891,25 @@ async fn run_cli(settings: Settings, execute: bool, confirm_mainnet: Option<&str
     // classify every replacement as a fill.
     let mut last_seen_trade_ms: Option<i64> = None;
     // Retained so the shutdown path can act on the market without re-fetching after Ctrl+C.
-    #[allow(unused_assignments)]
     let mut last_market: Option<Market> = None;
+    // A shared cancellation token so every long `.await` in the loop body can bail promptly
+    // on Ctrl+C rather than only checking between sleep-drain cycles.
+    let cancel = Arc::new(AtomicBool::new(false));
+    {
+        let cancel = Arc::clone(&cancel);
+        tokio::spawn(async move {
+            tokio::signal::ctrl_c().await.ok();
+            cancel.store(true, Ordering::Relaxed);
+            println!("\nShutdown requested.");
+        });
+    }
+    macro_rules! check_cancel {
+        () => {
+            if cancel.load(Ordering::Relaxed) {
+                break;
+            }
+        };
+    }
 
     loop {
         let cycle_start = tokio::time::Instant::now();
@@ -1896,10 +1917,12 @@ async fn run_cli(settings: Settings, execute: bool, confirm_mainnet: Option<&str
             Ok(s) => s,
             Err(e) => {
                 eprintln!("grid refresh failed: {e:#}");
+                check_cancel!();
                 tokio::time::sleep(config.refresh).await;
                 continue;
             }
         };
+        check_cancel!();
         // Rebuild the plan without trade-history markers. Historical fills are a UI hint and
         // must not suppress a future desired order during reconciliation or execution.
         let mut snapshot = snapshot;
@@ -1931,10 +1954,12 @@ async fn run_cli(settings: Settings, execute: bool, confirm_mainnet: Option<&str
                 Ok(orders) => orders,
                 Err(e) => {
                     eprintln!("reconciliation failed (open_orders): {e:#}; skipping cycle");
+                    check_cancel!();
                     tokio::time::sleep(config.refresh).await;
                     continue;
                 }
             };
+            check_cancel!();
             // Compare the complete configured plan with current PFS plus the active bulk
             // escrow. Try this at most once per process: retrying after a sell fill would buy
             // inventory back at the ask and return the captured spread plus taker fees.
@@ -1957,6 +1982,7 @@ async fn run_cli(settings: Settings, execute: bool, confirm_mainnet: Option<&str
                     &snapshot.plan,
                 )
                 .await;
+                check_cancel!();
                 match &funding_result {
                     Ok(funding) if funding.bought_base > rust_decimal::Decimal::ZERO => {
                         println!(
@@ -1979,6 +2005,7 @@ async fn run_cli(settings: Settings, execute: bool, confirm_mainnet: Option<&str
                         eprintln!("  balance refresh after funding failed: {error:#}")
                     }
                 }
+                check_cancel!();
             }
             actual_for_execution = Some(actual);
         }
@@ -2152,13 +2179,8 @@ async fn run_cli(settings: Settings, execute: bool, confirm_mainnet: Option<&str
         }
         let elapsed = cycle_start.elapsed();
         let wait = config.refresh.saturating_sub(elapsed);
-        tokio::select! {
-            _ = tokio::time::sleep(wait) => {}
-            _ = tokio::signal::ctrl_c() => {
-                println!("Shutdown requested.");
-                break;
-            }
-        }
+        tokio::time::sleep(wait).await;
+        check_cancel!();
     }
 
     if execute && settings.exit_asset_policy == ExitAssetPolicy::Sell {
