@@ -1795,12 +1795,9 @@ fn side_counts(
                 );
             }
             let bid_ratio = (mid - lower) / range;
-            let bid = (total * bid_ratio)
-                .round_dp(0)
-                .to_u64()
-                .unwrap_or(1)
-                .clamp(1, config.total_count as u64) as usize;
-            let ask = config.total_count - bid;
+            let bid = (total * bid_ratio).round_dp(0).to_u64().unwrap_or(1).clamp(1, config.total_count as u64) as usize;
+            let bid = bid.min(MAX_LEVELS_PER_SIDE);
+            let ask = (config.total_count - bid).min(MAX_LEVELS_PER_SIDE);
             let budget = config.budget_or_zero();
             let bid_budget = budget * bid_ratio;
             let ask_budget = budget - bid_budget;
@@ -3193,7 +3190,7 @@ mod tests {
             upper,
             mid,
         );
-        assert_eq!((bid, ask), (20, 60));
+        assert_eq!((bid, ask), (20, 40));
     }
     #[test]
     fn plan_obeys_budget_and_level_limit() {
