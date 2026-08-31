@@ -104,6 +104,14 @@ pub struct GridConfig {
 }
 
 impl GridConfig {
+    /// Returns the total budget from `Allocation::TotalBudget`, or zero for `FixedSize`.
+    pub fn budget_or_zero(&self) -> Decimal {
+        match self.allocation {
+            Allocation::TotalBudget(v) => v,
+            Allocation::FixedSize(_) => Decimal::ZERO,
+        }
+    }
+
     pub fn validate(&self) -> Result<()> {
         if !(2..=MAX_LEVELS_PER_SIDE * 2).contains(&self.total_count) {
             bail!("grid count must be between 2 and 80")
@@ -1679,11 +1687,12 @@ pub fn build_plan(config: &GridConfig, market: &Market, mid: Decimal) -> Result<
     if mid <= Decimal::ZERO {
         bail!("market mid price must be positive")
     }
-    let (bid_count, ask_count) = side_counts(config);
-    let (lower, upper) = resolve_range(config, mid, bid_count.max(ask_count))?;
+    // Resolve range first so side_counts knows where mid sits in the interval.
+    let (lower, upper) = resolve_range(config, mid, config.total_count)?;
     if !(lower < mid && mid < upper) {
         bail!("mid price {mid} is outside grid range [{lower}, {upper}]")
     }
+    let (bid_count, ask_count, bid_budget, ask_budget) = side_counts(config, lower, upper, mid);
 
     let bids = prices(
         config,
@@ -1703,7 +1712,7 @@ pub fn build_plan(config: &GridConfig, market: &Market, mid: Decimal) -> Result<
         ask_count,
         market.tick_size,
     )?;
-    let (bid_size, ask_size) = derive_sizes(config, mid, &bids, &asks, market)?;
+    let (bid_size, ask_size) = derive_sizes(config, &bids, &asks, market, bid_budget, ask_budget)?;
 
     let bid_levels = bids
         .into_iter()
@@ -1752,14 +1761,51 @@ pub fn build_plan(config: &GridConfig, market: &Market, mid: Decimal) -> Result<
     })
 }
 
-fn side_counts(config: &GridConfig) -> (usize, usize) {
+fn side_counts(
+    config: &GridConfig,
+    lower: Decimal,
+    upper: Decimal,
+    mid: Decimal,
+) -> (usize, usize, Decimal, Decimal) {
+    let total = Decimal::from(config.total_count);
     match (config.product, config.perp_mode) {
-        (Product::Perp, PerpMode::Long) => (config.total_count, 1),
-        (Product::Perp, PerpMode::Short) => (1, config.total_count),
-        _ => (
-            config.total_count / 2,
-            config.total_count - config.total_count / 2,
+        (Product::Perp, PerpMode::Long) => (
+            config.total_count,
+            1,
+            config.budget_or_zero(),
+            Decimal::ZERO,
         ),
+        (Product::Perp, PerpMode::Short) => (
+            1,
+            config.total_count,
+            Decimal::ZERO,
+            config.budget_or_zero(),
+        ),
+        _ => {
+            let mid = mid.clamp(lower, upper);
+            let range = upper - lower;
+            if range <= Decimal::ZERO {
+                let half = config.total_count / 2;
+                let budget = config.budget_or_zero();
+                return (
+                    half,
+                    config.total_count - half,
+                    budget / Decimal::TWO,
+                    budget / Decimal::TWO,
+                );
+            }
+            let bid_ratio = (mid - lower) / range;
+            let bid = (total * bid_ratio)
+                .round_dp(0)
+                .to_u64()
+                .unwrap_or(1)
+                .clamp(1, config.total_count as u64) as usize;
+            let ask = config.total_count - bid;
+            let budget = config.budget_or_zero();
+            let bid_budget = budget * bid_ratio;
+            let ask_budget = budget - bid_budget;
+            (bid, ask, bid_budget, ask_budget)
+        }
     }
 }
 
@@ -1820,16 +1866,16 @@ fn prices(
 
 fn derive_sizes(
     config: &GridConfig,
-    _mid: Decimal,
     bids: &[Decimal],
     asks: &[Decimal],
     market: &Market,
+    bid_budget: Decimal,
+    ask_budget: Decimal,
 ) -> Result<(Decimal, Decimal)> {
     let (mut bid, mut ask) = match config.allocation {
         Allocation::FixedSize(size) => (size, size),
-        Allocation::TotalBudget(budget) => match config.product {
+        Allocation::TotalBudget(_) => match config.product {
             Product::Spot => {
-                let half = budget / Decimal::TWO;
                 let bid_denominator: Decimal =
                     bids.iter().sum::<Decimal>() * (Decimal::ONE + config.maker_fee_rate);
                 let ask_denominator: Decimal = asks.iter().sum();
@@ -1837,12 +1883,12 @@ fn derive_sizes(
                     if bids.is_empty() {
                         Decimal::ZERO
                     } else {
-                        half / bid_denominator
+                        bid_budget / bid_denominator
                     },
                     if asks.is_empty() {
                         Decimal::ZERO
                     } else {
-                        half / ask_denominator
+                        ask_budget / ask_denominator
                     },
                 )
             }
@@ -1854,6 +1900,7 @@ fn derive_sizes(
                 if per_base <= Decimal::ZERO {
                     bail!("cannot derive size from an empty grid")
                 }
+                let budget = bid_budget + ask_budget;
                 let size = budget / per_base;
                 (size, size)
             }
@@ -3119,14 +3166,34 @@ mod tests {
 
     #[test]
     fn total_count_splits_between_sides() {
-        assert_eq!(side_counts(&config()), (20, 20));
-        assert_eq!(
-            side_counts(&GridConfig {
+        // With mid at 50 in a [0, 100] range, allocation is 50/50.
+        let lower = dec!(0);
+        let upper = dec!(100);
+        let mid = dec!(50);
+        let (bid, ask, _, _) = side_counts(&config(), lower, upper, mid);
+        assert_eq!((bid, ask), (20, 20));
+        let (bid, ask, _, _) = side_counts(
+            &GridConfig {
                 total_count: 41,
                 ..config()
-            }),
-            (20, 21)
+            },
+            lower,
+            upper,
+            mid,
         );
+        assert_eq!((bid, ask), (20, 21));
+        // With mid at 25 in [0, 100], 75 % of levels go to the bid side.
+        let mid = dec!(25);
+        let (bid, ask, _, _) = side_counts(
+            &GridConfig {
+                total_count: 80,
+                ..config()
+            },
+            lower,
+            upper,
+            mid,
+        );
+        assert_eq!((bid, ask), (20, 60));
     }
     #[test]
     fn plan_obeys_budget_and_level_limit() {
