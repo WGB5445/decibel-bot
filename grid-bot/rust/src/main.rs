@@ -1960,52 +1960,46 @@ async fn run_cli(settings: Settings, execute: bool, confirm_mainnet: Option<&str
                 }
             };
             check_cancel!();
-            // Funding is one-shot per process: buy enough APT to cover the *configured* ask
-            // side, but only when no bulk is resting (the first cycle).  The plan at this point
-            // is the ideal pre-shrink plan, so `base_required` matches the full ask side.  The
-            // actual funding call is deferred until after `fit_spot_snapshot_to_pfs` shrinks the
-            // plan to what PFS can afford, avoiding the 'overspend then starve bid side' trap.
+            // Funding is one-shot per process: buy enough APT to cover the ask side, but only
+            // when no bulk is resting (first cycle).  This runs BEFORE fit_spot_snapshot_to_pfs
+            // so the plan still reflects the full configured (pre-shrink) base_required.
+            if !spot_base_funded_this_run
+                && snapshot.market.product == Product::Spot
+                && let Some(funds) = &snapshot.account.spot_funds
+                && funds.available_base_for_bulk() < snapshot.plan.base_required
+                && decibel_grid_tui::reconcile::blocking_orders(&actual).is_empty()
+            {
+                spot_base_funded_this_run = true;
+                let funding_result = decibel_grid_tui::fund_spot_base_for_grid(
+                    &settings.network,
+                    &settings.api_key,
+                    &settings.aptos_private_key,
+                    &settings.subaccount,
+                    &snapshot.market,
+                    &snapshot.plan,
+                )
+                .await;
+                check_cancel!();
+                match &funding_result {
+                    Ok(funding) if funding.bought_base > Decimal::ZERO => {
+                        println!("Spot base funded: bought {} to cover a {} shortfall.", funding.bought_base, funding.base_gap_before);
+                    }
+                    Ok(_) => {}
+                    Err(error) => eprintln!("Spot base funding skipped: {error:#}"),
+                }
+                // Re-read balances after the IOC attempt — refinancing the plan with up-to-date
+                // PFS balances is better than using stale pre-funding data.
+                match api.account(Some(&settings.subaccount), &snapshot.market).await {
+                    Ok(account) => snapshot.account = account,
+                    Err(error) => eprintln!("  balance refresh after funding failed: {error:#}"),
+                }
+            }
             check_cancel!();
             actual_for_execution = Some(actual);
         }
 
         if let Some(adjustment) = fit_spot_snapshot_to_pfs(&mut snapshot)? {
             println!("Spot PFS limited the grid: {adjustment}");
-        }
-        // Spot base funding: one-shot per process, run after shrinking so the plan's
-        // base_required already reflects what the ask side actually needs.
-        if execute && !spot_base_funded_this_run
-            && snapshot.market.product == Product::Spot
-            && let Some(funds) = &snapshot.account.spot_funds
-            && funds.available_base_for_bulk() < snapshot.plan.base_required
-            && decibel_grid_tui::reconcile::blocking_orders(&actual_for_execution.as_ref().unwrap_or(&vec![])).is_empty()
-        {
-            spot_base_funded_this_run = true;
-            let funding_result = decibel_grid_tui::fund_spot_base_for_grid(
-                &settings.network,
-                &settings.api_key,
-                &settings.aptos_private_key,
-                &settings.subaccount,
-                &snapshot.market,
-                &snapshot.plan,
-            )
-            .await;
-            check_cancel!();
-            match &funding_result {
-                Ok(funding) if funding.bought_base > Decimal::ZERO => {
-                    println!("Spot base funded: bought {} to cover a {} shortfall.", funding.bought_base, funding.base_gap_before);
-                }
-                Ok(_) => {}
-                Err(error) => eprintln!("Spot base funding skipped: {error:#}"),
-            }
-            // Re-read balances after the IOC attempt.
-            match api
-                .account(Some(&settings.subaccount), &snapshot.market)
-                .await
-            {
-                Ok(account) => snapshot.account = account,
-                Err(error) => eprintln!("  balance refresh after funding failed: {error:#}"),
-            }
         }
         print_snapshot(&snapshot, &config);
         if let Some(journal) = &journal {
