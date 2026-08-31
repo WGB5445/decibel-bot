@@ -1886,6 +1886,8 @@ async fn run_cli(settings: Settings, execute: bool, confirm_mainnet: Option<&str
     // replacement because the sequence number changes, so comparing those IDs would falsely
     // classify every replacement as a fill.
     let mut last_seen_trade_ms: Option<i64> = None;
+    // Retained so the shutdown path can act on the market without re-fetching after Ctrl+C.
+    #[allow(unused_assignments)]
     let mut last_market: Option<Market> = None;
 
     loop {
@@ -2162,14 +2164,22 @@ async fn run_cli(settings: Settings, execute: bool, confirm_mainnet: Option<&str
     if execute && settings.exit_asset_policy == ExitAssetPolicy::Sell {
         if let Some(market) = last_market {
             println!("Exit policy is SELL: cancelling the ladder and liquidating assets...");
-            exit_sell_assets(
+            match exit_sell_assets(
                 &settings.network,
                 &settings.api_key,
                 &settings.aptos_private_key,
                 &settings.subaccount,
                 &market,
             )
-            .await?;
+            .await
+            {
+                Ok(hashes) => println!(
+                    "Exit cleanup completed: {} transaction(s): {:?}",
+                    hashes.len(),
+                    hashes
+                ),
+                Err(error) => eprintln!("Exit cleanup failed: {error:#}"),
+            }
         } else {
             println!(
                 "Exit policy is SELL, but no market snapshot was loaded; nothing was liquidated."
@@ -2579,14 +2589,22 @@ async fn tui_loop(
                 && let Some(snapshot) = app.snapshot.as_ref()
             {
                 println!("Exit policy is SELL: cancelling the ladder and liquidating assets...");
-                let _ = exit_sell_assets(
+                match exit_sell_assets(
                     &app.settings.network,
                     &app.settings.api_key,
                     &app.settings.aptos_private_key,
                     &app.settings.subaccount,
                     &snapshot.market,
                 )
-                .await;
+                .await
+                {
+                    Ok(hashes) => println!(
+                        "Exit cleanup completed: {} transaction(s): {:?}",
+                        hashes.len(),
+                        hashes
+                    ),
+                    Err(error) => eprintln!("Exit cleanup failed: {error:#}"),
+                }
             }
             return Ok(());
         }

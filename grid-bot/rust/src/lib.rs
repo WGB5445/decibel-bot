@@ -27,6 +27,8 @@ pub mod profile;
 pub mod reconcile;
 
 pub const MAX_LEVELS_PER_SIDE: usize = 40;
+const EXIT_SETTLE_POLL_ATTEMPTS: usize = 6;
+const EXIT_SETTLE_POLL_INTERVAL: Duration = Duration::from_secs(2);
 
 /// Validate only properties that are true for every Decibel bearer API key.
 ///
@@ -490,6 +492,19 @@ pub async fn execute_bulk_grid(
     })
 }
 
+/// Amount this market's exit path would liquidate right now: free Spot base, or |Perp position|.
+/// Used only to watch cancelled escrow settle back into the subaccount before selling.
+fn exit_liquidatable_amount(account: &AccountOverview, market: &Market) -> Decimal {
+    match market.product {
+        Product::Spot => account
+            .spot_funds
+            .as_ref()
+            .map(SpotFunds::available_base)
+            .unwrap_or(Decimal::ZERO),
+        Product::Perp => account.position.size.abs(),
+    }
+}
+
 /// Cancel the active bulk ladder and liquidate this market's inventory on explicit shutdown.
 /// This is deliberately opt-in; callers must only invoke it for `ExitAssetPolicy::Sell`.
 pub async fn exit_sell_assets(
@@ -500,7 +515,6 @@ pub async fn exit_sell_assets(
     market: &Market,
 ) -> Result<Vec<String>> {
     let client = DecibelClient::new(network, api_key)?;
-    let account = client.account(Some(subaccount), market).await?;
     let package = package_for_network(network)?;
     let key = normalize_private_key(private_key)?;
     let signer =
@@ -527,6 +541,9 @@ pub async fn exit_sell_assets(
     let mut sequence = aptos.get_sequence_number(signer.address()).await?;
     let mut hashes = Vec::new();
 
+    println!(
+        "Exit cleanup: cancelling the resting bulk ladder... (this sends transactions; do not press Ctrl+C again)"
+    );
     let cancel_entry = match market.product {
         Product::Spot => {
             format!("{package}::dex_accounts_spot_entry::cancel_spot_bulk_order_to_subaccount")
@@ -552,7 +569,8 @@ pub async fn exit_sell_assets(
             &sign_transaction(&raw, &signer)?,
             Some(Duration::from_secs(60)),
         )
-        .await?;
+        .await
+        .context("submit exit bulk cancellation transaction")?;
     sequence = sequence.saturating_add(1);
     if response
         .data
@@ -579,36 +597,82 @@ pub async fn exit_sell_assets(
         );
     }
 
-    let book = client.order_book(market, 1).await?;
+    // Cancelling a ladder releases its escrow asynchronously: the indexer keeps reporting the
+    // pre-cancel balance for a short while after the transaction commits. Reading once here would
+    // see the still-escrowed (much smaller) free balance and silently skip the sale, so poll until
+    // the released inventory stops growing.
+    println!("Exit cleanup: waiting for cancelled escrow to settle back into the subaccount...");
+    let mut account = client
+        .account(Some(subaccount), market)
+        .await
+        .context("refresh account state for exit cleanup")?;
+    for attempt in 1..=EXIT_SETTLE_POLL_ATTEMPTS {
+        let observed = exit_liquidatable_amount(&account, market);
+        tokio::time::sleep(EXIT_SETTLE_POLL_INTERVAL).await;
+        let refreshed = client
+            .account(Some(subaccount), market)
+            .await
+            .context("refresh account state for exit cleanup")?;
+        let settled = exit_liquidatable_amount(&refreshed, market);
+        account = refreshed;
+        if settled <= observed && settled > Decimal::ZERO {
+            break;
+        }
+        println!(
+            "  settle poll {attempt}/{EXIT_SETTLE_POLL_ATTEMPTS}: {observed} -> {settled} released"
+        );
+    }
+    let book = client
+        .order_book(market, 1)
+        .await
+        .context("refresh order book for exit cleanup")?;
     match market.product {
         Product::Spot => {
             let Some(funds) = account.spot_funds else {
+                println!(
+                    "Exit cleanup: no Spot balances were returned for this subaccount; nothing to sell."
+                );
                 return Ok(hashes);
             };
             let quantity = round_down(funds.available_base(), market.lot_size);
-            if quantity >= market.min_size {
-                let bid = book
-                    .asks
-                    .first()
-                    .or_else(|| book.bids.first())
-                    .ok_or_else(|| anyhow!("cannot liquidate Spot: order book is empty"))?;
-                let price = round_down(bid.price * Decimal::new(997, 3), market.tick_size);
-                let hash = submit_spot_ioc_order(
-                    network,
-                    private_key,
-                    subaccount,
-                    market,
-                    price,
-                    quantity,
-                    false,
-                )
-                .await?;
-                hashes.push(hash);
+            if quantity < market.min_size {
+                println!(
+                    "Exit cleanup: sellable {} is {}, below the {} minimum order size; nothing to sell.",
+                    funds.base_symbol, quantity, market.min_size
+                );
+                return Ok(hashes);
             }
+            // Selling crosses into the bid side of the book. Falling back to the ask only keeps a
+            // reference price when the bid side is momentarily empty.
+            let reference = book
+                .bids
+                .first()
+                .or_else(|| book.asks.first())
+                .ok_or_else(|| anyhow!("cannot liquidate Spot: order book is empty"))?;
+            let price = round_down(reference.price * Decimal::new(997, 3), market.tick_size);
+            println!(
+                "Exit cleanup: selling {} {} with an IOC order at {} {}...",
+                quantity, funds.base_symbol, price, funds.quote_symbol
+            );
+            let hash = submit_spot_ioc_order(
+                network,
+                private_key,
+                subaccount,
+                market,
+                price,
+                quantity,
+                false,
+            )
+            .await
+            .context("submit Spot IOC liquidation order")?;
+            println!("Exit cleanup: Spot liquidation submitted in tx {hash}");
+            hashes.push(hash);
         }
         Product::Perp => {
             let position = account.position.size;
-            if position != Decimal::ZERO {
+            if position == Decimal::ZERO {
+                println!("Exit cleanup: Perp position is already flat; nothing to close.");
+            } else {
                 let reference = if position.is_sign_negative() {
                     book.asks.first()
                 } else {
