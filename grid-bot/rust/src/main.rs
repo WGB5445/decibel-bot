@@ -1960,53 +1960,13 @@ async fn run_cli(settings: Settings, execute: bool, confirm_mainnet: Option<&str
                 }
             };
             check_cancel!();
-            // Compare the complete configured plan with current PFS plus the active bulk
-            // escrow. Try this at most once per process: retrying after a sell fill would buy
-            // inventory back at the ask and return the captured spread plus taker fees.
-            let needs_spot_base = !spot_base_funded_this_run
-                && snapshot.market.product == Product::Spot
-                && decibel_grid_tui::reconcile::blocking_orders(&actual).is_empty();
-            if needs_spot_base
-                && let Some(funds) = &snapshot.account.spot_funds
-                && funds.available_base_for_bulk() < snapshot.plan.base_required
-            {
-                // Consume the one-shot attempt before submitting, including on failure; a later
-                // refresh must not turn a transient funding problem into repeated taker buys.
-                spot_base_funded_this_run = true;
-                let funding_result = decibel_grid_tui::fund_spot_base_for_grid(
-                    &settings.network,
-                    &settings.api_key,
-                    &settings.aptos_private_key,
-                    &settings.subaccount,
-                    &snapshot.market,
-                    &snapshot.plan,
-                )
-                .await;
-                check_cancel!();
-                match &funding_result {
-                    Ok(funding) if funding.bought_base > rust_decimal::Decimal::ZERO => {
-                        println!(
-                            "Spot base funded: bought {} to cover a {} shortfall.",
-                            funding.bought_base, funding.base_gap_before
-                        );
-                    }
-                    Ok(_) => {}
-                    Err(error) => eprintln!("Spot base funding skipped: {error:#}"),
-                }
-                // Always re-read balances after the funding attempt. IOC can partially fill
-                // before returning an error; fitting against the pre-funding snapshot would
-                // discard the newly bought inventory for this cycle.
-                match api
-                    .account(Some(&settings.subaccount), &snapshot.market)
-                    .await
-                {
-                    Ok(account) => snapshot.account = account,
-                    Err(error) => {
-                        eprintln!("  balance refresh after funding failed: {error:#}")
-                    }
-                }
-                check_cancel!();
-            }
+            // Funding is deliberately skipped: when ask-side APT is insufficient the grid
+            // shrinks the ask levels rather than buying base at the market.  Buying back APT
+            // at the ask after a fill would return every captured spread plus taker fees on
+            // every round trip, and an IOC buy at launch can consume the entire PFS quote
+            // budget before it can be deployed as bid-side orders.
+            spot_base_funded_this_run = true;
+            check_cancel!();
             actual_for_execution = Some(actual);
         }
 
