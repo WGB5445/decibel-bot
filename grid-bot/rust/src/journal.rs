@@ -10,7 +10,7 @@ use anyhow::{Context, Result, anyhow};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use crate::reconcile::ActualOrder;
+use crate::{GridPlan, reconcile::ActualOrder};
 
 /// Irreversible fingerprint used in place of the raw subaccount address in durable storage,
 /// so a leaked event log cannot identify the on-chain account.
@@ -70,6 +70,14 @@ pub enum JournalEvent {
         at: DateTime<Utc>,
         error: String,
     },
+    SpotFill {
+        at: DateTime<Utc>,
+        market: String,
+        price: String,
+        size: String,
+        side: Option<String>,
+        event_uid: String,
+    },
     RiskRejected {
         at: DateTime<Utc>,
         reason: String,
@@ -90,8 +98,19 @@ pub struct ReconciliationSummary {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SpotRuntimeState {
+    /// The exact pinned geometry last accepted for this strategy. Restoring it prevents a restart
+    /// from silently rebuilding a different range around the then-current mid price.
+    pub pinned_plan: GridPlan,
+    pub last_seen_trade_ms: Option<i64>,
+    pub base_funded: bool,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct RunState {
     pub metadata: RunMetadata,
+    #[serde(default)]
+    pub spot_runtime: Option<SpotRuntimeState>,
     pub last_reconciliation: Option<ReconciliationSummary>,
     pub plan_generation: u64,
     pub submitted_orders: u64,
@@ -104,6 +123,7 @@ impl RunState {
         Self {
             last_event_at: metadata.started_at,
             metadata,
+            spot_runtime: None,
             last_reconciliation: None,
             plan_generation: 0,
             submitted_orders: 0,
@@ -211,16 +231,50 @@ impl Journal {
     }
 }
 
+/// Deterministic storage key for a logical strategy. The raw subaccount never appears in the
+/// directory name, allowing a restarted process to load the exact prior state without leaking the
+/// account address through the filesystem.
+pub fn persistent_run_id(network: &str, subaccount: &str, market: &str) -> String {
+    use sha3::{Digest, Sha3_256};
+    let canonical_subaccount = subaccount
+        .trim()
+        .trim_start_matches("0x")
+        .trim_start_matches('0')
+        .to_ascii_lowercase();
+    let material = format!(
+        "{}|{}|{}",
+        network.trim().to_ascii_lowercase(),
+        if canonical_subaccount.is_empty() {
+            "0"
+        } else {
+            &canonical_subaccount
+        },
+        market.trim().to_ascii_uppercase(),
+    );
+    let digest = hex::encode(Sha3_256::digest(material.as_bytes()));
+    format!("spot_{}", &digest[..24])
+}
+
+/// Retained for non-resumable monitor/shadow sessions.
 pub fn generate_run_id() -> String {
     use rand::Rng;
     let suffix: u32 = rand::thread_rng().r#gen();
-    format!("run_{:08x}", suffix)
+    format!("run_{suffix:08x}")
 }
 
 #[cfg(test)]
 mod tests {
-    use super::RunMetadata;
+    use super::{RunMetadata, persistent_run_id};
     use chrono::Utc;
+
+    #[test]
+    fn persistent_run_id_is_stable_and_hides_the_subaccount() {
+        let first = persistent_run_id("mainnet", "0x0000AbCd", "BTC/USDC");
+        let second = persistent_run_id("MAINNET", "0xabcd", "btc/usdc");
+        assert_eq!(first, second);
+        assert!(!first.contains("abcd"));
+        assert_ne!(first, persistent_run_id("mainnet", "0xabce", "BTC/USDC"));
+    }
 
     #[test]
     fn fingerprint_subaccount_replaces_the_raw_address() {

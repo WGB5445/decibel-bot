@@ -117,6 +117,10 @@ pub struct ProfileData {
     pub grid_count: String,
     pub allocation_kind: String,
     pub allocation_value: String,
+    #[serde(default)]
+    pub total_quote_budget: Option<String>,
+    #[serde(default)]
+    pub total_base_budget: Option<String>,
     pub maker_fee_rate: String,
     pub preview_leverage: String,
     pub refresh_seconds: String,
@@ -124,6 +128,32 @@ pub struct ProfileData {
     /// How to handle assets on exit: "retain" or "sell".
     #[serde(default)]
     pub exit_asset_policy: String,
+    #[serde(default)]
+    pub min_net_margin_bps: String,
+    #[serde(default)]
+    pub reconciliation_interval_ms: String,
+    #[serde(default)]
+    pub ws_reconnect_backoff_ms: String,
+    #[serde(default)]
+    pub range_breakout_action: String,
+    #[serde(default)]
+    pub auto_convert_missing_base: String,
+    #[serde(default)]
+    pub entry_max_slippage_bps: String,
+    #[serde(default)]
+    pub exit_max_slippage_bps: String,
+    #[serde(default)]
+    pub entry_exit_max_attempts: String,
+    #[serde(default)]
+    pub entry_exit_retry_backoff_ms: String,
+    #[serde(default)]
+    pub entry_exit_timeout_ms: String,
+    #[serde(default)]
+    pub entry_min_fill_ratio: String,
+    #[serde(default)]
+    pub price_buffer_bps: String,
+    #[serde(default)]
+    pub max_consecutive_bulk_failures: String,
     /// Argon2id + XChaCha20-Poly1305 envelopes. `None` when a credential has not been saved.
     pub encrypted_api_key: Option<EncryptedSecret>,
     pub encrypted_aptos_private_key: Option<EncryptedSecret>,
