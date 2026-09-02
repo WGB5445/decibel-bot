@@ -481,16 +481,68 @@ func formatInventoryAlert(tr *i18n.Telegram, snap botstate.Snapshot, maxInventor
 	)
 }
 
+// ── Status ───────────────────────────────────────────────────────────────────
+
+// formatStatus renders the unified /status panel: pause state, spread, inventory,
+// margin usage, and (if applicable) how long inventory has been stuck at the limit
+// relative to the forced-IOC-close deadline.
+func formatStatus(tr *i18n.Telegram, snap botstate.Snapshot, maxInventory, maxMarginUsage, flattenForceSeconds float64) string {
+	var sb strings.Builder
+	sb.WriteString(fmt.Sprintf(tr.StatusTitleFmt, escapeMarkdown(snap.TargetMarketName)))
+
+	switch {
+	case !snap.Paused:
+		sb.WriteString(tr.StatusRunningLine)
+	case snap.PauseCancelResting:
+		sb.WriteString(tr.StatusPausedCancelAllLine)
+	default:
+		sb.WriteString(tr.StatusPausedNewOnlyLine)
+	}
+
+	sb.WriteString(fmt.Sprintf(tr.StatusEquityFmt, snap.Equity))
+	sb.WriteString(fmt.Sprintf(tr.StatusSpreadFmt, snap.EffectiveSpread*100))
+	sb.WriteString(fmt.Sprintf(tr.StatusInventoryFmt, snap.Inventory, maxInventory))
+	sb.WriteString(fmt.Sprintf(tr.StatusMarginFmt, snap.MarginUsage*100, maxMarginUsage*100))
+
+	if snap.FlattenStuckSeconds > 0 {
+		sb.WriteString(fmt.Sprintf(tr.StatusStuckFmt, snap.FlattenStuckSeconds, flattenForceSeconds))
+	} else {
+		sb.WriteString(tr.StatusNotStuckLine)
+	}
+	if snap.ForceCloseCount > 0 {
+		sb.WriteString(fmt.Sprintf(tr.StatusForceCloseCountFmt, snap.ForceCloseCount))
+	}
+
+	sb.WriteString(fmt.Sprintf("\n_%s_", cycleAge(tr, snap.LastCycleAt)))
+	return sb.String()
+}
+
+// ── Margin alert ─────────────────────────────────────────────────────────────
+
+func formatMarginAlert(tr *i18n.Telegram, marginUsage, maxMarginUsage float64) string {
+	return tr.MarginAlertTitle + fmt.Sprintf(tr.MarginAlertBodyFmt, marginUsage*100, maxMarginUsage*100)
+}
+
+// ── Forced-close alert ───────────────────────────────────────────────────────
+
+func formatForceCloseAlert(tr *i18n.Telegram, marketName string, inventory float64, forceCloseCount int) string {
+	return fmt.Sprintf(tr.ForceCloseAlertTitleFmt, escapeMarkdown(marketName)) +
+		fmt.Sprintf(tr.ForceCloseAlertBodyFmt, inventory, forceCloseCount)
+}
+
 // ── Help ─────────────────────────────────────────────────────────────────────
 
 func formatHelp(cfg Config, tr *i18n.Telegram) string {
 	var sb strings.Builder
 	sb.WriteString(tr.HelpTitle)
 	sb.WriteString(tr.HelpCmdHeader)
+	sb.WriteString(tr.HelpCmdStatus)
 	sb.WriteString(tr.HelpCmdBalance)
 	sb.WriteString(tr.HelpCmdGas)
 	sb.WriteString(tr.HelpCmdPositions)
 	sb.WriteString(tr.HelpCmdTrades)
+	sb.WriteString(tr.HelpCmdPause)
+	sb.WriteString(tr.HelpCmdResume)
 	sb.WriteString(tr.HelpCmdHelp)
 	sb.WriteString(tr.HelpButtonsHint)
 

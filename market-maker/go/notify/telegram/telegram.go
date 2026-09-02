@@ -26,6 +26,9 @@ type Config struct {
 	AdminID                int64
 	AlertInventory         bool
 	AlertInventoryInterval int // minutes
+	// SummaryEnabled pushes a periodic /status-equivalent digest.
+	SummaryEnabled     bool
+	SummaryIntervalMin int // minutes
 	// Locale is "zh" (default) or "en"; from main/config (-locale / LOCALE / BOT_LOCALE).
 	Locale string
 }
@@ -63,6 +66,11 @@ func (t *TelegramNotifier) Run(ctx context.Context) error {
 
 	if t.cfg.AlertInventory {
 		go t.runInventoryAlertLoop(ctx)
+	}
+	go t.runMarginAlertLoop(ctx)
+	go t.runForceCloseAlertLoop(ctx)
+	if t.cfg.SummaryEnabled {
+		go t.runSummaryLoop(ctx)
 	}
 
 	u := tgbotapi.NewUpdate(0)
@@ -260,7 +268,51 @@ func (t *TelegramNotifier) handleCallback(ctx context.Context, cb *tgbotapi.Call
 
 	case "inv":
 		t.handleInventoryCallback(ctx, cb, param)
+
+	case "status":
+		snap, err := t.info.FetchLiveSnapshot(ctx)
+		if err != nil {
+			slog.Warn("tgbot: fetch live snapshot for status callback failed", "err", err)
+			t.editPlain(chatID, msgID, fmt.Sprintf(t.tr.ErrRefreshFmt, err), t.statusKeyboard())
+			return
+		}
+		t.edit(chatID, msgID, formatStatus(t.tr, snap, t.info.MaxInventory(), t.info.MaxMarginUsage(), t.info.FlattenForceSeconds()), t.statusKeyboard())
+
+	case "pause":
+		t.handlePauseCallback(ctx, chatID, msgID, param)
+
+	case "resume":
+		t.handleResumeCallback(chatID, msgID)
 	}
+}
+
+// handlePauseCallback dispatches the pause-menu button presses.
+func (t *TelegramNotifier) handlePauseCallback(ctx context.Context, chatID int64, msgID int, action string) {
+	switch action {
+	case "menu":
+		t.edit(chatID, msgID, t.tr.PausePromptTitle, t.pauseMenuKeyboard())
+	case "abort":
+		t.edit(chatID, msgID, t.tr.PauseCancelledAction, t.helpKeyboard())
+	case "new", "cancelall":
+		cancelResting := action == "cancelall"
+		if err := t.info.PauseTrading(ctx, cancelResting); err != nil {
+			t.editPlain(chatID, msgID, fmt.Sprintf(t.tr.ErrQueryFmt, err), t.helpKeyboard())
+			return
+		}
+		msg := t.tr.PausedNewOnlyMsg
+		if cancelResting {
+			msg = t.tr.PausedCancelAllMsg
+		}
+		t.edit(chatID, msgID, msg, t.helpKeyboard())
+	default:
+		slog.Warn("tgbot: unknown pause callback", "param", action)
+	}
+}
+
+// handleResumeCallback clears the pause and confirms.
+func (t *TelegramNotifier) handleResumeCallback(chatID int64, msgID int) {
+	t.info.ResumeTrading()
+	t.edit(chatID, msgID, t.tr.ResumedMsg, t.helpKeyboard())
 }
 
 // pollTradeHistoryByOrder retries trade_history until rows appear or attempts exhaust.
@@ -372,6 +424,32 @@ func (t *TelegramNotifier) balanceKeyboard() *tgbotapi.InlineKeyboardMarkup {
 	return &kb
 }
 
+func (t *TelegramNotifier) statusKeyboard() *tgbotapi.InlineKeyboardMarkup {
+	kb := tgbotapi.NewInlineKeyboardMarkup(
+		tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData(t.tr.BtnRefresh, "status:refresh"),
+			tgbotapi.NewInlineKeyboardButtonData(t.tr.BtnBack, "menu:help"),
+		),
+	)
+	return &kb
+}
+
+// pauseMenuKeyboard offers the two pause modes plus a cancel action.
+func (t *TelegramNotifier) pauseMenuKeyboard() *tgbotapi.InlineKeyboardMarkup {
+	kb := tgbotapi.NewInlineKeyboardMarkup(
+		tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData(t.tr.BtnPauseNewOnly, "pause:new"),
+		),
+		tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData(t.tr.BtnPauseCancelAll, "pause:cancelall"),
+		),
+		tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData(t.tr.BtnCancelAction, "pause:abort"),
+		),
+	)
+	return &kb
+}
+
 func (t *TelegramNotifier) gasKeyboard() *tgbotapi.InlineKeyboardMarkup {
 	kb := tgbotapi.NewInlineKeyboardMarkup(
 		tgbotapi.NewInlineKeyboardRow(
@@ -391,6 +469,11 @@ func (t *TelegramNotifier) helpKeyboard() *tgbotapi.InlineKeyboardMarkup {
 		tgbotapi.NewInlineKeyboardRow(
 			tgbotapi.NewInlineKeyboardButtonData(t.tr.BtnPositions, "positions:help"),
 			tgbotapi.NewInlineKeyboardButtonData(t.tr.BtnTrades, "trades:help"),
+		),
+		tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData(t.tr.BtnStatus, "status:help"),
+			tgbotapi.NewInlineKeyboardButtonData(t.tr.BtnPause, "pause:menu"),
+			tgbotapi.NewInlineKeyboardButtonData(t.tr.BtnResume, "resume:go"),
 		),
 	)
 	return &kb

@@ -157,6 +157,150 @@ func (t *TelegramNotifier) handleInventoryCallback(ctx context.Context, cb *tgbo
 	}
 }
 
+// runMarginAlertLoop periodically checks margin usage against the configured limit,
+// mirroring the inventory alert loop's edit-in-place pattern. Runs whenever Telegram
+// is enabled (not gated behind AlertInventory) since it's a critical safety alert.
+func (t *TelegramNotifier) runMarginAlertLoop(ctx context.Context) {
+	defer func() {
+		if r := recover(); r != nil {
+			slog.Error("tgbot: margin alert loop panic", "err", r)
+		}
+	}()
+
+	interval := time.Duration(t.cfg.AlertInventoryInterval) * time.Minute
+	if interval <= 0 {
+		interval = 30 * time.Minute
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	as := &alertState{chatID: t.cfg.AdminID}
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			t.checkMarginAlert(as)
+		}
+	}
+}
+
+func (t *TelegramNotifier) checkMarginAlert(as *alertState) {
+	snap := t.info.GetSnapshot()
+	maxMargin := t.info.MaxMarginUsage()
+	exceeded := maxMargin > 0 && snap.MarginUsage > maxMargin
+
+	as.mu.Lock()
+	activeMsgID := as.activeMsgID
+	as.mu.Unlock()
+
+	if !exceeded {
+		if activeMsgID != 0 {
+			edit := tgbotapi.NewEditMessageText(as.chatID, activeMsgID, t.tr.MarginRecovered)
+			if _, err := t.api.Send(edit); err != nil && !isTelegramMessageNotModified(err) {
+				slog.Warn("tgbot: failed to update margin alert (recovery)", "err", err)
+			}
+			as.mu.Lock()
+			as.activeMsgID = 0
+			as.mu.Unlock()
+		}
+		return
+	}
+
+	text := formatMarginAlert(t.tr, snap.MarginUsage, maxMargin)
+	if activeMsgID == 0 {
+		m := tgbotapi.NewMessage(as.chatID, text)
+		m.ParseMode = tgbotapi.ModeMarkdown
+		if sent, err := t.api.Send(m); err == nil {
+			as.mu.Lock()
+			as.activeMsgID = sent.MessageID
+			as.mu.Unlock()
+		} else {
+			slog.Warn("tgbot: failed to send margin alert", "err", err)
+		}
+	} else {
+		edit := tgbotapi.NewEditMessageText(as.chatID, activeMsgID, text)
+		edit.ParseMode = tgbotapi.ModeMarkdown
+		if _, err := t.api.Send(edit); err != nil && !isTelegramMessageNotModified(err) {
+			slog.Warn("tgbot: failed to refresh margin alert", "err", err)
+		}
+	}
+}
+
+// forceCloseAlertPollInterval is deliberately short (cheap local-state read, no
+// network call unless a new forced close is detected) so the CRITICAL notification
+// reaches the operator promptly rather than waiting for the next alert-interval tick.
+const forceCloseAlertPollInterval = 15 * time.Second
+
+// runForceCloseAlertLoop watches botstate.Snapshot.ForceCloseCount for increases and
+// pushes a one-shot alert per forced close (does not edit-in-place; each is a distinct
+// event worth its own message). Runs whenever Telegram is enabled.
+func (t *TelegramNotifier) runForceCloseAlertLoop(ctx context.Context) {
+	defer func() {
+		if r := recover(); r != nil {
+			slog.Error("tgbot: force-close alert loop panic", "err", r)
+		}
+	}()
+
+	ticker := time.NewTicker(forceCloseAlertPollInterval)
+	defer ticker.Stop()
+
+	lastCount := t.info.GetSnapshot().ForceCloseCount
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			snap := t.info.GetSnapshot()
+			if snap.ForceCloseCount > lastCount {
+				text := formatForceCloseAlert(t.tr, snap.TargetMarketName, snap.Inventory, snap.ForceCloseCount)
+				m := tgbotapi.NewMessage(t.cfg.AdminID, text)
+				m.ParseMode = tgbotapi.ModeMarkdown
+				t.send(m)
+			}
+			lastCount = snap.ForceCloseCount
+		}
+	}
+}
+
+// runSummaryLoop periodically pushes a /status-equivalent digest so the operator
+// doesn't need to watch logs. Each tick is a new message (not edited in place) so
+// the chat history reads as a timeline.
+func (t *TelegramNotifier) runSummaryLoop(ctx context.Context) {
+	defer func() {
+		if r := recover(); r != nil {
+			slog.Error("tgbot: summary loop panic", "err", r)
+		}
+	}()
+
+	interval := time.Duration(t.cfg.SummaryIntervalMin) * time.Minute
+	if interval <= 0 {
+		interval = 60 * time.Minute
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			snap, err := t.info.FetchLiveSnapshot(ctx)
+			if err != nil {
+				slog.Warn("tgbot: summary loop fetch live snapshot failed", "err", err)
+				continue
+			}
+			text := formatStatus(t.tr, snap, t.info.MaxInventory(), t.info.MaxMarginUsage(), t.info.FlattenForceSeconds())
+			m := tgbotapi.NewMessage(t.cfg.AdminID, text)
+			m.ParseMode = tgbotapi.ModeMarkdown
+			m.ReplyMarkup = t.statusKeyboard()
+			t.send(m)
+		}
+	}
+}
+
 // inventoryAlertKeyboard builds the inline keyboard for the inventory alert.
 func (t *TelegramNotifier) inventoryAlertKeyboard(showClose bool) *tgbotapi.InlineKeyboardMarkup {
 	var row []tgbotapi.InlineKeyboardButton

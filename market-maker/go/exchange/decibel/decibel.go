@@ -31,6 +31,13 @@ type DecibelExchange struct {
 	walletAddr  string
 	dryRun      bool
 
+	// txSubmitter is used for all SubmitEntryFunction calls. Defaults to aptosNode
+	// itself (single-market: live sequence-number fetch per call, unchanged behavior).
+	// Multi-market mode (see NewShared) injects a shared *aptos.TxSubmitter instead, so
+	// concurrent instances trading from the same account don't race on the live
+	// on-chain sequence number.
+	txSubmitter aptos.EntryFunctionSubmitter
+
 	// bulkSeq is the last sequence_number used in a live place_bulk_orders call (or max from
 	// GET /bulk_orders after sync). Each live PlaceBulkOrders does bulkSeq++ before submit.
 	// It is never decremented so retries never reuse a consumed or ambiguous seq.
@@ -62,9 +69,33 @@ func New(cfg *config.Config) (*DecibelExchange, error) {
 		apiClient:   apiClient,
 		aptosNode:   aptosNode,
 		aptosSigner: aptosSigner,
+		txSubmitter: aptosNode, // *aptos.NodeClient satisfies EntryFunctionSubmitter
 		walletAddr:  addr.String(),
 		dryRun:      cfg.DryRun,
 	}, nil
+}
+
+// NewShared builds a DecibelExchange from already-constructed shared components,
+// for multi-market mode: N markets trade from one REST client, one Aptos account, and
+// one aptos.TxSubmitter (which serializes submissions so they don't race on the
+// account's on-chain sequence number), instead of each market creating its own.
+func NewShared(
+	cfg *config.Config,
+	apiClient *api.Client,
+	aptosNode *aptos.NodeClient,
+	aptosSigner *aptossdk.Account,
+	submitter aptos.EntryFunctionSubmitter,
+) *DecibelExchange {
+	addr := aptosSigner.AccountAddress()
+	return &DecibelExchange{
+		cfg:         cfg,
+		apiClient:   apiClient,
+		aptosNode:   aptosNode,
+		aptosSigner: aptosSigner,
+		txSubmitter: submitter,
+		walletAddr:  addr.String(),
+		dryRun:      cfg.DryRun,
+	}
 }
 
 // ── exchange.Exchange implementation ─────────────────────────────────────────
@@ -184,7 +215,7 @@ func (d *DecibelExchange) PlaceOrder(ctx context.Context, req exchange.PlaceOrde
 	}
 
 	fn := d.cfg.PackageAddress + "::dex_accounts_entry::place_order_to_subaccount"
-	result, err := d.aptosNode.SubmitEntryFunction(ctx, d.aptosSigner, fn, nil,
+	result, err := d.txSubmitter.SubmitEntryFunction(ctx, d.aptosSigner, fn, nil,
 		buildPlaceOrderArgs(
 			d.cfg.SubaccountAddress,
 			d.market.MarketID,
@@ -333,7 +364,7 @@ func (d *DecibelExchange) PlaceBulkOrders(ctx context.Context, bids, asks []exch
 	slog.Info("submitting bulk orders",
 		logctx.AppendAttrs(ctx, "bids", len(bids), "asks", len(asks), "bulk_seq", d.bulkSeq)...,
 	)
-	result, err := d.aptosNode.SubmitEntryFunction(ctx, d.aptosSigner, fn, nil, []any{
+	result, err := d.txSubmitter.SubmitEntryFunction(ctx, d.aptosSigner, fn, nil, []any{
 		d.cfg.SubaccountAddress, //  1. subaccount
 		d.market.MarketID,       //  2. market
 		d.bulkSeq,               //  3. sequence_number (u64)
@@ -417,7 +448,7 @@ func (d *DecibelExchange) CancelBulkOrders(ctx context.Context) error {
 
 	fn := d.cfg.PackageAddress + "::dex_accounts_entry::cancel_bulk_order_to_subaccount"
 	slog.Info("submitting cancel bulk orders")
-	result, err := d.aptosNode.SubmitEntryFunction(ctx, d.aptosSigner, fn, nil, []any{
+	result, err := d.txSubmitter.SubmitEntryFunction(ctx, d.aptosSigner, fn, nil, []any{
 		d.cfg.SubaccountAddress,
 		d.market.MarketID,
 	})
@@ -473,7 +504,7 @@ func (d *DecibelExchange) CancelOrder(ctx context.Context, orderID string) error
 		)...,
 	)
 
-	result, err := d.aptosNode.SubmitEntryFunction(ctx, d.aptosSigner, fn, nil, []any{
+	result, err := d.txSubmitter.SubmitEntryFunction(ctx, d.aptosSigner, fn, nil, []any{
 		d.cfg.SubaccountAddress,
 		orderID,
 		d.market.MarketID,

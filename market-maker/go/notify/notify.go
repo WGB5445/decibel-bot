@@ -55,6 +55,22 @@ type InfoProvider interface {
 	// MarketDisplayName resolves a market address to a human-readable name from
 	// the cached /markets catalog; falls back to a shortened address when unknown.
 	MarketDisplayName(marketAddr string) string
+
+	// FlattenForceSeconds returns the configured forced-IOC-close deadline for the
+	// auto-flatten escalation (0 = disabled). Used to render "stuck Xs / limit Ys".
+	FlattenForceSeconds() float64
+
+	// MaxMarginUsage returns the configured margin-usage pause threshold (0-1).
+	MaxMarginUsage() float64
+
+	// PauseTrading stops placing new bulk quotes starting from the next cycle. Risk
+	// controls (margin guard, inventory-limit auto-flatten and its escalation) keep
+	// running regardless of pause state. When cancelResting is true, also cancels any
+	// resting bulk quotes immediately.
+	PauseTrading(ctx context.Context, cancelResting bool) error
+
+	// ResumeTrading clears a previously-set pause, allowing quoting to resume.
+	ResumeTrading()
 }
 
 // ShortAddrForDisplay is a fallback label when MarketDisplayName has no mapping.

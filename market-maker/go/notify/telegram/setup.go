@@ -53,10 +53,13 @@ func (t *TelegramNotifier) SetBotCommands(ctx context.Context) error {
 
 	scope := tgbotapi.NewBotCommandScopeAllPrivateChats()
 	cmd := tgbotapi.NewSetMyCommandsWithScope(scope,
+		tgbotapi.BotCommand{Command: "status", Description: t.tr.CmdStatusDesc},
 		tgbotapi.BotCommand{Command: "balance", Description: t.tr.CmdBalanceDesc},
 		tgbotapi.BotCommand{Command: "gas", Description: t.tr.CmdGasDesc},
 		tgbotapi.BotCommand{Command: "positions", Description: t.tr.CmdPositionsDesc},
 		tgbotapi.BotCommand{Command: "trade_history", Description: t.tr.CmdTradeHistDesc},
+		tgbotapi.BotCommand{Command: "pause", Description: t.tr.CmdPauseDesc},
+		tgbotapi.BotCommand{Command: "resume", Description: t.tr.CmdResumeDesc},
 		tgbotapi.BotCommand{Command: "help", Description: t.tr.CmdHelpDesc},
 	)
 

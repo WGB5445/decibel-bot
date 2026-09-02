@@ -1,0 +1,28 @@
+[project]
+name = "decibel-grid-bot"
+version = "0.1.0"
+description = "Spot and perpetual grid bots for Decibel"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "decibel-python-sdk>=0.3.0",
+    "python-dotenv>=1.0.0",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.24",
+    "ruff>=0.8",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]

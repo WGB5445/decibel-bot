@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
 	"testing"
 	"time"
 
@@ -766,7 +767,7 @@ func TestFlattenDeviationPostTickClampBuy(t *testing.T) {
 	ex := &mockExchange{}
 	mm := New(cfg, ex, mkt)
 	ctx := context.Background()
-	if _, err := mm.placeFlattenOrder(ctx, -0.002, mid); err != nil {
+	if _, err := mm.placeFlattenOrder(ctx, -0.002, mid, cfg.FlattenAggression); err != nil {
 		t.Fatalf("placeFlattenOrder: %v", err)
 	}
 	if len(ex.placed) != 1 {
@@ -790,7 +791,7 @@ func TestFlattenDeviationPostTickClampSell(t *testing.T) {
 	ex := &mockExchange{}
 	mm := New(cfg, ex, mkt)
 	ctx := context.Background()
-	if _, err := mm.placeFlattenOrder(ctx, 0.002, mid); err != nil {
+	if _, err := mm.placeFlattenOrder(ctx, 0.002, mid, cfg.FlattenAggression); err != nil {
 		t.Fatalf("placeFlattenOrder: %v", err)
 	}
 	if len(ex.placed) != 1 {
@@ -1249,5 +1250,222 @@ func TestRun_OnContextCancelRunsCleanup(t *testing.T) {
 	}
 	if ex.cancelOrderCalls != 0 {
 		t.Errorf("shutdown must not call CancelOrder, got %d calls", ex.cancelOrderCalls)
+	}
+}
+
+// ── Tests: Flatten escalation / forced IOC close ──────────────────────────────
+
+// escalatedFlattenAggression must shrink linearly from FlattenAggression toward 0
+// as elapsed approaches FlattenForceSeconds.
+func TestEscalatedFlattenAggressionShrinksLinearly(t *testing.T) {
+	cfg := testConfig()
+	cfg.FlattenAggression = 0.001
+	cfg.FlattenForceSeconds = 100
+	mm := New(cfg, &mockExchange{}, testMarket())
+
+	cases := []struct {
+		elapsed time.Duration
+		want    float64
+	}{
+		{0, 0.001},
+		{25 * time.Second, 0.00075},
+		{50 * time.Second, 0.0005},
+		{75 * time.Second, 0.00025},
+		{100 * time.Second, 0}, // progress >= 1
+		{150 * time.Second, 0}, // past the limit, still clamped to 0
+	}
+	for _, c := range cases {
+		got := mm.escalatedFlattenAggression(c.elapsed)
+		if diff := math.Abs(got - c.want); diff > 1e-9 {
+			t.Errorf("elapsed=%v: got aggression %v, want %v", c.elapsed, got, c.want)
+		}
+	}
+}
+
+// FlattenForceSeconds <= 0 must disable escalation entirely (always base aggression).
+func TestEscalatedFlattenAggressionDisabledWhenForceSecondsZero(t *testing.T) {
+	cfg := testConfig()
+	cfg.FlattenAggression = 0.002
+	cfg.FlattenForceSeconds = 0
+	mm := New(cfg, &mockExchange{}, testMarket())
+
+	if got := mm.escalatedFlattenAggression(10 * time.Hour); got != 0.002 {
+		t.Errorf("expected base aggression 0.002 with escalation disabled, got %v", got)
+	}
+}
+
+// Once stuck past FlattenForceSeconds, handleAutoFlattenAtLimit must cancel any resting
+// POST_ONLY flatten order and submit a marketable reduce-only IOC order instead.
+func TestForceCloseFlattenSubmitsIOCPastDeadline(t *testing.T) {
+	cfg := testConfig()
+	cfg.AutoFlatten = true
+	cfg.FlattenAggression = 0.001
+	cfg.FlattenForceSeconds = 60
+	cfg.FlattenForceDeviation = 0.05
+	mid := 100_000.0
+	mkt := testMarket()
+
+	restingOrder := exchange.OpenOrder{OrderID: "resting-1"}
+	ex := &mockExchange{state: exchange.StateSnapshot{
+		Inventory: -0.02, // short position (over MaxInventory) → force-close should buy
+		Mid:       ptr(mid),
+	}}
+	mm := New(cfg, ex, mkt)
+	mm.lastFlattenOrderID = restingOrder.OrderID
+	mm.flattenStuckSince = time.Now().Add(-90 * time.Second) // already past the 60s deadline
+
+	if err := mm.handleAutoFlattenAtLimit(context.Background(), 1, mid, ex.state.Inventory, []exchange.OpenOrder{restingOrder}); err != nil {
+		t.Fatalf("handleAutoFlattenAtLimit: %v", err)
+	}
+
+	if ex.cancelOrderCalls != 1 {
+		t.Errorf("expected the resting flatten order to be cancelled, got %d CancelOrder calls", ex.cancelOrderCalls)
+	}
+	if len(ex.placed) != 1 {
+		t.Fatalf("expected exactly 1 forced IOC order placed, got %d", len(ex.placed))
+	}
+	got := ex.placed[0]
+	if got.TimeInForce != exchange.TimeInForceIOC {
+		t.Errorf("expected TimeInForce=IOC, got %d", got.TimeInForce)
+	}
+	if !got.ReduceOnly {
+		t.Error("expected ReduceOnly=true for forced close")
+	}
+	if !got.IsBuy {
+		t.Error("expected IsBuy=true to cover a short position")
+	}
+	wantPrice := mid * (1.0 + cfg.FlattenForceDeviation)
+	if math.Abs(got.Price-wantPrice) > 1e-6 {
+		t.Errorf("forced buy price = %v, want ~%v (mid*(1+deviation))", got.Price, wantPrice)
+	}
+	if mm.lastFlattenOrderID != "" {
+		t.Errorf("expected lastFlattenOrderID cleared after force close, got %q", mm.lastFlattenOrderID)
+	}
+}
+
+// FlattenForceSeconds <= 0 must never force-close, even if stuck indefinitely — legacy
+// passive-only behavior is preserved.
+func TestForceCloseNeverTriggersWhenForceSecondsZero(t *testing.T) {
+	cfg := testConfig()
+	cfg.AutoFlatten = true
+	cfg.FlattenForceSeconds = 0
+	mid := 100_000.0
+	ex := &mockExchange{state: exchange.StateSnapshot{Inventory: -0.02, Mid: ptr(mid)}}
+	mm := New(cfg, ex, testMarket())
+	mm.flattenStuckSince = time.Now().Add(-24 * time.Hour) // arbitrarily long
+
+	if err := mm.handleAutoFlattenAtLimit(context.Background(), 1, mid, ex.state.Inventory, nil); err != nil {
+		t.Fatalf("handleAutoFlattenAtLimit: %v", err)
+	}
+
+	if len(ex.placed) != 1 {
+		t.Fatalf("expected exactly 1 order placed, got %d", len(ex.placed))
+	}
+	if ex.placed[0].TimeInForce != exchange.TimeInForcePostOnly {
+		t.Errorf("expected passive POST_ONLY order when force-close is disabled, got TimeInForce=%d", ex.placed[0].TimeInForce)
+	}
+}
+
+// flattenStuckSince must only be reset by inventory recovery in runCycle, not by
+// individual reprice attempts — verified indirectly via the public runCycle path.
+func TestFlattenStuckSinceResetsOnInventoryRecovery(t *testing.T) {
+	cfg := testConfig()
+	cfg.AutoFlatten = true
+	cfg.MaxInventory = 0.01
+	mid := 100_000.0
+	mkt := testMarket()
+	ex := &mockExchange{state: exchange.StateSnapshot{Inventory: 0.02, Mid: ptr(mid)}}
+	mm := New(cfg, ex, mkt)
+
+	if err := mm.runCycle(context.Background(), 1); err != nil {
+		t.Fatalf("runCycle (at limit): %v", err)
+	}
+	if mm.flattenStuckSince.IsZero() {
+		t.Fatal("expected flattenStuckSince to be set while at limit")
+	}
+
+	// Inventory recovers below MaxInventory.
+	ex.state.Inventory = 0.001
+	if err := mm.runCycle(context.Background(), 2); err != nil {
+		t.Fatalf("runCycle (recovered): %v", err)
+	}
+	if !mm.flattenStuckSince.IsZero() {
+		t.Error("expected flattenStuckSince to reset after inventory recovered below MaxInventory")
+	}
+}
+
+// ── Tests: Pause / resume ─────────────────────────────────────────────────────
+
+// While paused (without cancelling resting orders), normal bulk quoting must be
+// skipped, but risk controls (auto-flatten at the inventory limit) must still run.
+func TestPauseSkipsBulkPlacementButAllowsFlatten(t *testing.T) {
+	cfg := testConfig()
+	cfg.AutoFlatten = true
+	cfg.MaxInventory = 0.01
+	mid := 100_000.0
+	ex := &mockExchange{state: exchange.StateSnapshot{Inventory: 0.02, Mid: ptr(mid)}}
+	mm := New(cfg, ex, testMarket())
+
+	if err := mm.Pause(context.Background(), false); err != nil {
+		t.Fatalf("Pause: %v", err)
+	}
+
+	if err := mm.runCycle(context.Background(), 1); err != nil {
+		t.Fatalf("runCycle: %v", err)
+	}
+
+	if len(ex.bulkBids) != 0 || len(ex.bulkAsks) != 0 {
+		t.Error("expected no bulk quotes placed while paused (n/a here since inventory is over limit, but guards against regressions)")
+	}
+	if len(ex.placed) != 1 {
+		t.Fatalf("expected auto-flatten to still place a reduce-only order while paused, got %d placed", len(ex.placed))
+	}
+	if !ex.placed[0].ReduceOnly {
+		t.Error("expected the flatten order placed while paused to be reduce-only")
+	}
+}
+
+// Pause must skip normal bulk quote placement when inventory is within limits
+// (the actual "stop new quoting" case), while Resume must re-enable it.
+func TestPauseBlocksNormalQuotingResumeReenables(t *testing.T) {
+	cfg := testConfig()
+	mid := 100_000.0
+	ex := &mockExchange{state: exchange.StateSnapshot{Inventory: 0.0, Mid: ptr(mid)}}
+	mm := New(cfg, ex, testMarket())
+
+	if err := mm.Pause(context.Background(), false); err != nil {
+		t.Fatalf("Pause: %v", err)
+	}
+	if err := mm.runCycle(context.Background(), 1); err != nil {
+		t.Fatalf("runCycle (paused): %v", err)
+	}
+	if len(ex.bulkBids) != 0 {
+		t.Errorf("expected no bulk quotes while paused, got %d", len(ex.bulkBids))
+	}
+
+	mm.Resume()
+	if err := mm.runCycle(context.Background(), 2); err != nil {
+		t.Fatalf("runCycle (resumed): %v", err)
+	}
+	if len(ex.bulkBids) != 1 {
+		t.Errorf("expected bulk quotes placed after resume, got %d", len(ex.bulkBids))
+	}
+}
+
+// Pausing with cancelResting=true must immediately cancel resting bulk quotes.
+func TestPauseWithCancelRestingCancelsBulkOrders(t *testing.T) {
+	cfg := testConfig()
+	ex := &mockExchange{}
+	mm := New(cfg, ex, testMarket())
+
+	if err := mm.Pause(context.Background(), true); err != nil {
+		t.Fatalf("Pause: %v", err)
+	}
+	if ex.bulkCancelCalls != 1 {
+		t.Errorf("expected 1 CancelBulkOrders call when pausing with cancelResting=true, got %d", ex.bulkCancelCalls)
+	}
+	paused, cancelResting := mm.PauseState()
+	if !paused || !cancelResting {
+		t.Errorf("expected PauseState() = (true, true), got (%v, %v)", paused, cancelResting)
 	}
 }

@@ -40,6 +40,12 @@ type BotState struct {
 
 	entryPrices map[string]float64 // normalised market ID -> estimated VWAP entry
 	lastCycleAt time.Time
+
+	effectiveSpread     float64
+	paused              bool
+	pauseCancelResting  bool
+	flattenStuckSeconds float64 // 0 = not currently stuck at the inventory limit
+	forceCloseCount     int     // cumulative count of forced IOC flatten closes
 }
 
 // Snapshot is a value-copy of BotState, safe to read without holding the lock.
@@ -54,6 +60,18 @@ type Snapshot struct {
 	TargetMarketName string
 	TargetMarketID   string
 	LastCycleAt      time.Time
+
+	// EffectiveSpread is the current adaptive-spread value (as of the last cycle).
+	EffectiveSpread float64
+	// Paused is true when trading has been manually paused (e.g. via Telegram /pause).
+	Paused bool
+	// PauseCancelResting reports whether the active pause also cancelled resting bulk quotes.
+	PauseCancelResting bool
+	// FlattenStuckSeconds is how long (as of the last cycle) inventory has been stuck at
+	// the limit awaiting a flatten; 0 when not currently stuck.
+	FlattenStuckSeconds float64
+	// ForceCloseCount is the cumulative number of forced IOC flatten closes so far.
+	ForceCloseCount int
 }
 
 // StateUpdate contains the values the strategy pushes each cycle.
@@ -64,6 +82,12 @@ type StateUpdate struct {
 	Mid           *float64
 	AllPositions  []Position
 	PrevInventory float64 // inventory from the PREVIOUS cycle (for VWAP estimator)
+
+	EffectiveSpread     float64
+	Paused              bool
+	PauseCancelResting  bool
+	FlattenStuckSeconds float64
+	ForceCloseCount     int
 }
 
 // New creates a zeroed BotState for the given target market.
@@ -86,6 +110,11 @@ func (s *BotState) Update(u StateUpdate) {
 	s.mid = u.Mid
 	s.allPositions = u.AllPositions
 	s.lastCycleAt = time.Now()
+	s.effectiveSpread = u.EffectiveSpread
+	s.paused = u.Paused
+	s.pauseCancelResting = u.PauseCancelResting
+	s.flattenStuckSeconds = u.FlattenStuckSeconds
+	s.forceCloseCount = u.ForceCloseCount
 
 	key := normalizeID(s.targetMarketID)
 	s.entryPrices[key] = estimateEntryPrice(
@@ -117,6 +146,12 @@ func (s *BotState) Get() Snapshot {
 		TargetMarketName: s.targetMarketName,
 		TargetMarketID:   s.targetMarketID,
 		LastCycleAt:      s.lastCycleAt,
+
+		EffectiveSpread:     s.effectiveSpread,
+		Paused:              s.paused,
+		PauseCancelResting:  s.pauseCancelResting,
+		FlattenStuckSeconds: s.flattenStuckSeconds,
+		ForceCloseCount:     s.forceCloseCount,
 	}
 }
 

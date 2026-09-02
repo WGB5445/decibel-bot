@@ -42,6 +42,15 @@ type Config struct {
 	Network string // "testnet" | "mainnet"
 
 	// ── Trading parameters ────────────────────────────────────────────────────
+	// Markets, when non-empty, switches into multi-market mode: one MarketMaker
+	// instance per entry, all trading concurrently from the same account via a shared
+	// aptos.TxSubmitter (so concurrent submissions don't race on the on-chain sequence
+	// number). All entries share the same trading parameters below (Spread, OrderSize,
+	// MaxInventory, etc.) — per-market overrides are not supported yet. Parsed from
+	// MARKETS (comma-separated, e.g. "BTC/USD,ETH/USD,SOL/USD"); env var only, no CLI
+	// flag or config-file support yet. Empty (default) runs the legacy single-market
+	// path using MarketName below.
+	Markets         []string
 	MarketName      string
 	Spread          float64
 	OrderSize       float64
@@ -65,7 +74,14 @@ type Config struct {
 	// for this many consecutive cycles, cancel it and place again (same aggression, new mid).
 	// 0 disables this behavior (legacy: single resting flatten until fill or external cancel).
 	FlattenRepriceStallCycles int
-	DryRun                    bool
+	// FlattenForceSeconds: wall-clock seconds since inventory first hit the limit (not reset
+	// by repricing) after which the resting POST_ONLY flatten is cancelled and replaced with
+	// a marketable IOC reduce-only order to guarantee exit. 0 disables forced IOC escalation.
+	FlattenForceSeconds float64
+	// FlattenForceDeviation: price offset from mid for the forced IOC close (e.g. 0.05 = 5%),
+	// large enough to cross available book depth. Falls back to FlattenMaxDeviation if 0.
+	FlattenForceDeviation float64
+	DryRun                bool
 
 	// ── Adaptive spread ───────────────────────────────────────────────────────
 	AutoSpread         bool
@@ -111,6 +127,24 @@ type Config struct {
 	TGAlertInventory         bool   // TG_ALERT_INVENTORY or -tg-alert-inventory
 	TGAlertInventoryInterval int    // TG_ALERT_INVENTORY_INTERVAL_MIN or -tg-alert-interval
 	TGStrictStart            bool   // TG_STRICT_START or -tg-strict-start
+	// TGSummaryEnabled pushes a periodic /status-equivalent digest so the operator
+	// doesn't need to watch logs. TG_SUMMARY_ENABLED or -tg-summary-enabled.
+	TGSummaryEnabled bool
+	// TGSummaryIntervalMin is the minutes between periodic summary pushes.
+	// TG_SUMMARY_INTERVAL_MIN or -tg-summary-interval.
+	TGSummaryIntervalMin int
+
+	// ── Web UI (optional monitoring/control dashboard) ────────────────────────
+	// WebUIEnabled starts a local HTTP server exposing a read-only status page
+	// plus pause/resume/flatten controls, gated by WebUIToken. WEB_UI_ENABLED or -web-ui-enabled.
+	WebUIEnabled bool
+	// WebUIBind is the listen address, e.g. "127.0.0.1:8090". Defaults to loopback-only;
+	// binding to a non-loopback address is logged as a loud warning (no auth beyond the
+	// shared token — do not expose this directly to the public internet). WEB_UI_BIND or -web-ui-bind.
+	WebUIBind string
+	// WebUIToken is a shared secret required on every request (header or query param).
+	// Required when WebUIEnabled is true. WEB_UI_TOKEN or -web-ui-token; visible in process list.
+	WebUIToken string
 }
 
 // TelegramEnabled reports whether the Telegram bot should be started.
@@ -160,6 +194,16 @@ func (c *Config) validate() error {
 
 	if c.FlattenRepriceStallCycles < 0 {
 		return fmt.Errorf("FLATTEN_REPRICE_STALL_CYCLES (-flatten-reprice-stall-cycles) must be >= 0, got %d", c.FlattenRepriceStallCycles)
+	}
+	if c.FlattenForceSeconds < 0 {
+		return fmt.Errorf("FLATTEN_FORCE_SECONDS (-flatten-force-seconds) must be >= 0, got %v", c.FlattenForceSeconds)
+	}
+	if c.FlattenForceDeviation < 0 {
+		return fmt.Errorf("FLATTEN_FORCE_DEVIATION (-flatten-force-deviation) must be >= 0, got %v", c.FlattenForceDeviation)
+	}
+
+	if c.WebUIEnabled && strings.TrimSpace(c.WebUIToken) == "" {
+		return fmt.Errorf("WEB_UI_TOKEN (-web-ui-token) is required when WEB_UI_ENABLED is true")
 	}
 
 	if c.ShutdownCancelTimeoutS <= 0 {
@@ -259,6 +303,8 @@ var boolCLIFlagNames = map[string]struct{}{
 	"log-verbose":        {},
 	"tg-alert-inventory": {},
 	"tg-strict-start":    {},
+	"tg-summary-enabled": {},
+	"web-ui-enabled":     {},
 }
 
 // normalizeBoolCLIArgs returns a copy of args with "-boolflag literal" rewritten
@@ -351,6 +397,27 @@ func envStr(key, def string) string {
 		return v
 	}
 	return def
+}
+
+// envStringList reads a comma-separated env var into a trimmed, non-empty-entry slice.
+// Returns def when the var is unset/empty or contains no non-empty entries.
+func envStringList(key string, def []string) []string {
+	v := strings.TrimSpace(os.Getenv(key))
+	if v == "" {
+		return def
+	}
+	parts := strings.Split(v, ",")
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		p = strings.TrimSpace(p)
+		if p != "" {
+			out = append(out, p)
+		}
+	}
+	if len(out) == 0 {
+		return def
+	}
+	return out
 }
 
 func envFloat(key string, def float64) float64 {

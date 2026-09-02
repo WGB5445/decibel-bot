@@ -1,0 +1,186 @@
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Decibel MM Bot · 状态面板</title>
+<style>
+  :root { color-scheme: dark; }
+  body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; background:#0f1115; color:#e6e6e6; margin:0; padding:16px; }
+  h1 { font-size:18px; margin:0 0 12px; }
+  .card { background:#1a1d24; border:1px solid #2a2e38; border-radius:10px; padding:14px 16px; margin-bottom:12px; }
+  .grid { display:grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap:10px; }
+  .stat-label { font-size:12px; color:#9aa0ab; margin-bottom:2px; }
+  .stat-value { font-size:18px; font-weight:600; }
+  .stat-value.warn { color:#f5a623; }
+  .stat-value.bad { color:#ff5c5c; }
+  .stat-value.ok { color:#3ddc84; }
+  .row { display:flex; gap:8px; flex-wrap:wrap; margin-top:10px; }
+  button { background:#2a2e38; color:#e6e6e6; border:1px solid #3a3f4b; border-radius:8px; padding:8px 14px; font-size:14px; cursor:pointer; }
+  button:hover { background:#343a46; }
+  button.danger { border-color:#7a2b2b; }
+  button.danger:hover { background:#3a2222; }
+  input[type=text] { background:#0f1115; border:1px solid #3a3f4b; color:#e6e6e6; border-radius:6px; padding:8px 10px; width:260px; }
+  table { width:100%; border-collapse: collapse; font-size:13px; }
+  th, td { text-align:left; padding:6px 8px; border-bottom:1px solid #2a2e38; }
+  #tokenBar { margin-bottom:14px; display:flex; gap:8px; align-items:center; }
+  #err { color:#ff5c5c; font-size:13px; margin-top:8px; white-space:pre-wrap; }
+  .muted { color:#9aa0ab; font-size:12px; }
+</style>
+</head>
+<body>
+  <h1>📟 Decibel MM Bot</h1>
+
+  <div id="tokenBar">
+    <input id="token" type="text" placeholder="Web UI token">
+    <button onclick="saveToken()">保存 Token</button>
+    <span class="muted">Token 只存在本机浏览器 localStorage，不会发到别处。</span>
+  </div>
+
+  <div class="card">
+    <div class="grid" id="statusGrid"></div>
+    <div class="row">
+      <button onclick="doPause(false)">⏸ 只停新报价</button>
+      <button class="danger" onclick="doPause(true)">⏸ 停报价并撤单</button>
+      <button onclick="doResume()">▶️ 恢复</button>
+      <button class="danger" onclick="doFlatten()">❌ 立即平仓</button>
+      <button onclick="refresh()">🔄 刷新</button>
+    </div>
+    <div id="err"></div>
+    <div class="muted" id="lastUpdated"></div>
+  </div>
+
+  <div class="card">
+    <div class="stat-label">持仓（所有市场）</div>
+    <table id="positionsTable">
+      <thead><tr><th>市场</th><th>方向</th><th>数量</th><th>开仓价</th><th>标记价</th><th>预估盈亏</th><th>杠杆</th></tr></thead>
+      <tbody></tbody>
+    </table>
+  </div>
+
+<script>
+function getToken() { return localStorage.getItem('webui_token') || ''; }
+function saveToken() {
+  const v = document.getElementById('token').value.trim();
+  localStorage.setItem('webui_token', v);
+  refresh();
+}
+document.getElementById('token').value = getToken();
+
+function authedFetch(path, opts) {
+  opts = opts || {};
+  const sep = path.includes('?') ? '&' : '?';
+  return fetch(path + sep + 'token=' + encodeURIComponent(getToken()), opts);
+}
+
+function statCard(label, value, cls) {
+  return '<div><div class="stat-label">' + label + '</div><div class="stat-value ' + (cls||'') + '">' + value + '</div></div>';
+}
+
+function fmtPct(x) { return (x*100).toFixed(2) + '%'; }
+
+async function refresh() {
+  const errEl = document.getElementById('err');
+  errEl.textContent = '';
+  try {
+    const res = await authedFetch('/api/status');
+    if (!res.ok) { throw new Error('HTTP ' + res.status + ': ' + (await res.text())); }
+    const s = await res.json();
+    renderStatus(s);
+    const posRes = await authedFetch('/api/positions');
+    if (posRes.ok) { renderPositions(await posRes.json()); }
+  } catch (e) {
+    errEl.textContent = '请求失败: ' + e.message;
+  }
+}
+
+function renderStatus(s) {
+  const grid = document.getElementById('statusGrid');
+  let pauseLabel = '▶️ 运行中', pauseCls = 'ok';
+  if (s.paused) {
+    pauseLabel = s.pause_cancel_resting ? '⏸ 已暂停(已撤单)' : '⏸ 已暂停(只停新单)';
+    pauseCls = 'warn';
+  }
+  const invCls = Math.abs(s.inventory) >= s.max_inventory ? 'bad' : '';
+  const marginCls = s.margin_usage >= s.max_margin_usage ? 'bad' : '';
+  let stuckHtml = statCard('库存卡住', '无', 'ok');
+  if (s.flatten_stuck_seconds > 0) {
+    const cls = s.flatten_stuck_seconds >= s.flatten_force_seconds * 0.75 ? 'bad' : 'warn';
+    stuckHtml = statCard('库存卡住', s.flatten_stuck_seconds.toFixed(0) + 's / ' + s.flatten_force_seconds.toFixed(0) + 's', cls);
+  }
+  grid.innerHTML = [
+    statCard('市场', s.market_name),
+    statCard('状态', pauseLabel, pauseCls),
+    statCard('权益', '$' + s.equity.toFixed(2)),
+    statCard('标记价', s.mid ? ('$' + s.mid.toFixed(2)) : '—'),
+    statCard('价差(生效)', fmtPct(s.effective_spread)),
+    statCard('库存', s.inventory.toFixed(5) + ' / ' + s.max_inventory.toFixed(5), invCls),
+    statCard('保证金占用', fmtPct(s.margin_usage) + ' / ' + fmtPct(s.max_margin_usage), marginCls),
+    stuckHtml,
+    statCard('累计强平次数', s.force_close_count, s.force_close_count > 0 ? 'warn' : ''),
+    statCard('模式', s.dry_run ? 'DRY RUN' : '实盘', s.dry_run ? 'warn' : ''),
+  ].join('');
+  document.getElementById('lastUpdated').textContent = '数据周期: ' + (s.last_cycle_at || '获取中...');
+}
+
+function renderPositions(list) {
+  const tbody = document.querySelector('#positionsTable tbody');
+  tbody.innerHTML = '';
+  if (!list || list.length === 0) {
+    tbody.innerHTML = '<tr><td colspan="7" class="muted">暂无持仓</td></tr>';
+    return;
+  }
+  for (const p of list) {
+    if (Math.abs(p.size) < 1e-9) continue;
+    const dir = p.size < 0 ? '空 ▼' : '多 ▲';
+    let pnlStr = '—';
+    if (p.has_mark && p.entry_price > 0) {
+      const pnl = (p.mark - p.entry_price) * p.size;
+      pnlStr = (pnl >= 0 ? '+' : '') + '$' + pnl.toFixed(2);
+    }
+    const tr = document.createElement('tr');
+    tr.innerHTML = '<td>' + p.market_name + '</td><td>' + dir + '</td><td>' + Math.abs(p.size).toFixed(5) +
+      '</td><td>$' + p.entry_price.toFixed(2) + '</td><td>' + (p.has_mark ? '$' + p.mark.toFixed(2) : '—') +
+      '</td><td>' + pnlStr + '</td><td>' + p.user_leverage.toFixed(0) + 'x</td>';
+    tbody.appendChild(tr);
+  }
+}
+
+async function doPause(cancelResting) {
+  if (cancelResting && !confirm('确定要暂停并撤销所有挂单吗？')) return;
+  const errEl = document.getElementById('err');
+  try {
+    const res = await authedFetch('/api/pause', {
+      method: 'POST',
+      headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({cancel_resting: cancelResting}),
+    });
+    if (!res.ok) throw new Error('HTTP ' + res.status + ': ' + (await res.text()));
+    await refresh();
+  } catch (e) { errEl.textContent = '暂停失败: ' + e.message; }
+}
+
+async function doResume() {
+  const errEl = document.getElementById('err');
+  try {
+    const res = await authedFetch('/api/resume', {method: 'POST'});
+    if (!res.ok) throw new Error('HTTP ' + res.status + ': ' + (await res.text()));
+    await refresh();
+  } catch (e) { errEl.textContent = '恢复失败: ' + e.message; }
+}
+
+async function doFlatten() {
+  if (!confirm('确定要立即市价平仓当前目标市场仓位吗？这个操作不可撤销。')) return;
+  const errEl = document.getElementById('err');
+  try {
+    const res = await authedFetch('/api/flatten', {method: 'POST'});
+    if (!res.ok) throw new Error('HTTP ' + res.status + ': ' + (await res.text()));
+    await refresh();
+  } catch (e) { errEl.textContent = '平仓失败: ' + e.message; }
+}
+
+refresh();
+setInterval(refresh, 5000);
+</script>
+</body>
+</html>

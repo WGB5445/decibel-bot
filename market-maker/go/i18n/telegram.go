@@ -90,6 +90,38 @@ type Telegram struct {
 	CmdPositionsDesc                            string
 	CmdTradeHistDesc                            string
 	CmdHelpDesc                                 string
+
+	// ── Status / pause / resume ──────────────────────────────────────────────
+	BtnStatus, BtnPause, BtnResume     string
+	BtnPauseNewOnly, BtnPauseCancelAll string
+	BtnCancelAction                    string
+	StatusTitleFmt                     string // market name
+	StatusRunningLine                  string
+	StatusPausedNewOnlyLine            string
+	StatusPausedCancelAllLine          string
+	StatusSpreadFmt                    string // effective spread (as %)
+	StatusInventoryFmt                 string // current, max
+	StatusMarginFmt                    string // current %, max %
+	StatusStuckFmt                     string // elapsed s, limit s
+	StatusNotStuckLine                 string
+	StatusForceCloseCountFmt           string // count
+	StatusEquityFmt                    string // equity
+	PausePromptTitle                   string
+	PausedNewOnlyMsg                   string
+	PausedCancelAllMsg                 string
+	ResumedMsg                         string
+	PauseCancelledAction               string
+	MarginAlertTitle                   string
+	MarginAlertBodyFmt                 string // usage%, max%
+	MarginRecovered                    string
+	ForceCloseAlertTitleFmt            string // market
+	ForceCloseAlertBodyFmt             string // inventory, deviation, order_id
+	CmdStatusDesc                      string
+	CmdPauseDesc                       string
+	CmdResumeDesc                      string
+	HelpCmdStatus                      string
+	HelpCmdPause                       string
+	HelpCmdResume                      string
 }
 
 // Bundle returns the Telegram string table for the given locale.
@@ -155,6 +187,33 @@ var telegramZH = Telegram{
 	CycleAgeFetching: "正在获取...", CycleAgeUpdatedPrefix: "更新于 ",
 	CmdBalanceDesc: "查看账户余额", CmdGasDesc: "查看钱包 APT 余额", CmdPositionsDesc: "查看当前仓位",
 	CmdTradeHistDesc: "成交历史 trade_history（每页5条，可翻页）", CmdHelpDesc: "显示帮助",
+	BtnStatus: "📟 状态", BtnPause: "⏸ 暂停", BtnResume: "▶️ 恢复",
+	BtnPauseNewOnly: "⏸ 只停新报价", BtnPauseCancelAll: "⏸ 停报价并撤单", BtnCancelAction: "取消",
+	StatusTitleFmt:            "*📟 状态* · `%s`\n\n",
+	StatusRunningLine:         "▶️ 运行中\n",
+	StatusPausedNewOnlyLine:   "⏸ 已暂停（只停新报价，风控照常）\n",
+	StatusPausedCancelAllLine: "⏸ 已暂停（已撤单，风控照常）\n",
+	StatusSpreadFmt:           "价差(当前生效): `%.4f%%`\n",
+	StatusInventoryFmt:        "库存: `%.5f` / 上限 `%.5f`\n",
+	StatusMarginFmt:           "保证金占用: `%.1f%%` / 上限 `%.1f%%`\n",
+	StatusStuckFmt:            "⚠️ 卡在库存上限: `%.0fs` / 强平阈值 `%.0fs`\n",
+	StatusNotStuckLine:        "库存正常，无需平仓\n",
+	StatusForceCloseCountFmt:  "累计强平次数: `%d`\n",
+	StatusEquityFmt:           "权益: `$%.2f`\n",
+	PausePromptTitle:          "选择暂停方式：",
+	PausedNewOnlyMsg:          "⏸ 已暂停：只停新报价，风控（保证金/止损升级）照常运行。",
+	PausedCancelAllMsg:        "⏸ 已暂停：已撤销所有挂单，风控照常运行。",
+	ResumedMsg:                "▶️ 已恢复正常报价。",
+	PauseCancelledAction:      "已取消。",
+	MarginAlertTitle:          "⚠️ *保证金占用过高*\n",
+	MarginAlertBodyFmt:        "当前占用: `%.1f%%`（上限 `%.1f%%`）\n新报价已暂停，直到恢复正常。",
+	MarginRecovered:           "✅ 保证金占用已恢复正常。",
+	ForceCloseAlertTitleFmt:   "🚨 *强制平仓触发* · `%s`\n",
+	ForceCloseAlertBodyFmt:    "库存持续卡在上限超过设定时限，已撤单并用 IOC 吃单强平。\n当前库存: `%.5f`\n累计强平次数: `%d`",
+	CmdStatusDesc:             "查看统一状态面板", CmdPauseDesc: "暂停报价", CmdResumeDesc: "恢复报价",
+	HelpCmdStatus: "/status — 统一状态面板（库存/价差/保证金/暂停状态）\n",
+	HelpCmdPause:  "/pause — 暂停报价（可选是否撤单）\n",
+	HelpCmdResume: "/resume — 恢复报价\n",
 }
 
 var telegramEN = Telegram{
@@ -212,4 +271,31 @@ var telegramEN = Telegram{
 	CycleAgeFetching: "Fetching…", CycleAgeUpdatedPrefix: "Updated ",
 	CmdBalanceDesc: "Account balance", CmdGasDesc: "Wallet APT balance", CmdPositionsDesc: "Open positions",
 	CmdTradeHistDesc: "Recent fills (5 per page)", CmdHelpDesc: "Show help",
+	BtnStatus: "📟 Status", BtnPause: "⏸ Pause", BtnResume: "▶️ Resume",
+	BtnPauseNewOnly: "⏸ Pause new quotes only", BtnPauseCancelAll: "⏸ Pause + cancel resting", BtnCancelAction: "Cancel",
+	StatusTitleFmt:            "*📟 Status* · `%s`\n\n",
+	StatusRunningLine:         "▶️ Running\n",
+	StatusPausedNewOnlyLine:   "⏸ Paused (new quotes only, risk controls still active)\n",
+	StatusPausedCancelAllLine: "⏸ Paused (resting orders cancelled, risk controls still active)\n",
+	StatusSpreadFmt:           "Spread (effective): `%.4f%%`\n",
+	StatusInventoryFmt:        "Inventory: `%.5f` / limit `%.5f`\n",
+	StatusMarginFmt:           "Margin usage: `%.1f%%` / limit `%.1f%%`\n",
+	StatusStuckFmt:            "⚠️ Stuck at inventory limit: `%.0fs` / force-close deadline `%.0fs`\n",
+	StatusNotStuckLine:        "Inventory within limits, nothing to flatten\n",
+	StatusForceCloseCountFmt:  "Forced closes so far: `%d`\n",
+	StatusEquityFmt:           "Equity: `$%.2f`\n",
+	PausePromptTitle:          "Choose how to pause:",
+	PausedNewOnlyMsg:          "⏸ Paused: new quotes stopped; risk controls (margin/flatten escalation) keep running.",
+	PausedCancelAllMsg:        "⏸ Paused: resting orders cancelled; risk controls keep running.",
+	ResumedMsg:                "▶️ Resumed normal quoting.",
+	PauseCancelledAction:      "Cancelled.",
+	MarginAlertTitle:          "⚠️ *Margin usage too high*\n",
+	MarginAlertBodyFmt:        "Current usage: `%.1f%%` (limit `%.1f%%`)\nNew quoting is paused until it recovers.",
+	MarginRecovered:           "✅ Margin usage back within limits.",
+	ForceCloseAlertTitleFmt:   "🚨 *Forced close triggered* · `%s`\n",
+	ForceCloseAlertBodyFmt:    "Inventory stayed stuck at the limit past the configured deadline — cancelled and force-closed with an IOC order.\nCurrent inventory: `%.5f`\nForced closes so far: `%d`",
+	CmdStatusDesc:             "Unified status panel", CmdPauseDesc: "Pause quoting", CmdResumeDesc: "Resume quoting",
+	HelpCmdStatus: "/status — unified status panel (inventory/spread/margin/pause state)\n",
+	HelpCmdPause:  "/pause — pause quoting (optionally cancel resting orders)\n",
+	HelpCmdResume: "/resume — resume quoting\n",
 }

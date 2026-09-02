@@ -74,6 +74,26 @@ type MarketMaker struct {
 	// flattenStallCycles counts consecutive cycles where lastFlattenOrderID is still resting
 	// and we skipped placing; used when FlattenRepriceStallCycles > 0 to trigger cancel+re-place.
 	flattenStallCycles int
+
+	// flattenStuckSince records when the current at-limit auto-flatten episode began (first
+	// cycle inventory hit the limit and needed a flatten order). Zero means not currently stuck.
+	// Reset only when inventory recovers below MaxInventory (see runCycle) — NOT on individual
+	// reprice/force-close attempts, so a partially-filled forced close keeps escalating instead
+	// of getting a fresh grace period. Drives FlattenForceSeconds escalation: resting POST_ONLY
+	// aggression shrinks toward 0 as elapsed approaches the limit, then a marketable IOC
+	// reduce-only order is forced to guarantee exit.
+	flattenStuckSince time.Time
+
+	// forceCloseCount is the cumulative number of forced IOC flatten closes. Only ever
+	// mutated on the runCycle goroutine; safe to read here because it is copied into
+	// botstate.BotState (itself mutex-protected) at the end of each cycle.
+	forceCloseCount int
+
+	// pauseMu guards paused/pauseCancelResting, which are written from a different
+	// goroutine (e.g. the Telegram command handler) and read every cycle.
+	pauseMu            sync.RWMutex
+	paused             bool
+	pauseCancelResting bool
 }
 
 // New creates a MarketMaker with the given exchange and market config.
@@ -113,7 +133,41 @@ func (m *MarketMaker) FlattenPosition(ctx context.Context) (exchange.PlaceOrderO
 		return exchange.PlaceOrderOutcome{}, ErrNoPositionToFlatten
 	}
 
-	return m.placeFlattenOrder(ctx, inv, *state.Mid)
+	return m.placeFlattenOrder(ctx, inv, *state.Mid, m.cfg.FlattenAggression)
+}
+
+// Pause stops placing new bulk quotes starting from the next cycle. Risk controls
+// (margin guard, inventory-limit auto-flatten and its escalation) keep running
+// regardless of pause state — pause only affects normal two-sided quoting.
+// When cancelResting is true, also cancels any resting bulk quotes immediately.
+func (m *MarketMaker) Pause(ctx context.Context, cancelResting bool) error {
+	m.pauseMu.Lock()
+	m.paused = true
+	m.pauseCancelResting = cancelResting
+	m.pauseMu.Unlock()
+
+	if cancelResting {
+		if err := m.ex.CancelBulkOrders(ctx); err != nil {
+			return fmt.Errorf("pause: cancel bulk orders: %w", err)
+		}
+	}
+	return nil
+}
+
+// Resume clears a previously-set pause, allowing normal quoting to resume next cycle.
+func (m *MarketMaker) Resume() {
+	m.pauseMu.Lock()
+	defer m.pauseMu.Unlock()
+	m.paused = false
+	m.pauseCancelResting = false
+}
+
+// PauseState reports whether trading is currently paused and, if so, whether the
+// pause also cancelled resting bulk quotes.
+func (m *MarketMaker) PauseState() (paused, cancelResting bool) {
+	m.pauseMu.RLock()
+	defer m.pauseMu.RUnlock()
+	return m.paused, m.pauseCancelResting
 }
 
 // Run starts the main market-making loop. Blocks until ctx is cancelled.
@@ -229,13 +283,26 @@ func (m *MarketMaker) runCycle(ctx context.Context, cycle uint64) error {
 	slog.Info("state_snapshot", ss...)
 
 	// Share state with notification layer before lastInventory is updated this cycle.
+	// EffectiveSpread/FlattenStuckSeconds reflect the end of the PREVIOUS cycle (this
+	// cycle's adjustments/escalation happen further below) — an acceptable ~1-cycle lag
+	// for a monitoring display, matching the existing PrevInventory convention above.
+	flattenStuckSeconds := 0.0
+	if !m.flattenStuckSince.IsZero() {
+		flattenStuckSeconds = time.Since(m.flattenStuckSince).Seconds()
+	}
+	paused, pauseCancelResting := m.PauseState()
 	m.state.Update(botstate.StateUpdate{
-		Equity:        state.Equity,
-		MarginUsage:   state.MarginUsage,
-		Inventory:     state.Inventory,
-		Mid:           state.Mid,
-		AllPositions:  exchangePositionsToBotstate(state.AllPositions),
-		PrevInventory: m.lastInventory,
+		Equity:              state.Equity,
+		MarginUsage:         state.MarginUsage,
+		Inventory:           state.Inventory,
+		Mid:                 state.Mid,
+		AllPositions:        exchangePositionsToBotstate(state.AllPositions),
+		PrevInventory:       m.lastInventory,
+		EffectiveSpread:     m.effectiveSpread,
+		Paused:              paused,
+		PauseCancelResting:  pauseCancelResting,
+		FlattenStuckSeconds: flattenStuckSeconds,
+		ForceCloseCount:     m.forceCloseCount,
 	})
 
 	if math.Abs(state.Inventory) < m.cfg.MaxInventory {
@@ -244,6 +311,7 @@ func (m *MarketMaker) runCycle(ctx context.Context, cycle uint64) error {
 			// re-arm for the next limit event and allow a fresh flatten if needed.
 			m.lastFlattenOrderID = ""
 			m.flattenStallCycles = 0
+			m.flattenStuckSince = time.Time{}
 		}
 		m.invLimitBulkCancelDone = false
 	}
@@ -394,6 +462,14 @@ func (m *MarketMaker) runCycle(ctx context.Context, cycle uint64) error {
 	slog.Info("computed quotes",
 		"cycle", cycle, "bid", quotes.Bid, "ask", quotes.Ask, "size", quotes.Size)
 
+	// ── 4b. Pause guard: skip new quote placement while paused ────────────────
+	// Risk controls (margin guard above, auto-flatten escalation in the quotes==nil
+	// branch above) are NOT gated by pause — only normal two-sided quoting is.
+	if paused, _ := m.PauseState(); paused {
+		slog.Info("paused: skipping bulk quote placement", "cycle", cycle)
+		return nil
+	}
+
 	// ── 5. Atomically replace bulk quotes (bid + ask in one transaction) ──────
 
 	// Circuit breaker: if we're in a backoff window, skip placing and warn.
@@ -504,12 +580,33 @@ func (m *MarketMaker) shouldSkipFlatten(openOrders []exchange.OpenOrder) bool {
 	return false
 }
 
-// handleAutoFlattenAtLimit maintains a single reduce-only POST_ONLY flatten while at
-// inventory / quoting limits. When FlattenRepriceStallCycles > 0, after that many
-// consecutive cycles with the same order still resting, it cancels and re-places
-// (same FlattenAggression, current mid). N == 0 preserves legacy behavior (never cancel for reprice).
+// handleAutoFlattenAtLimit maintains a reduce-only flatten while at inventory / quoting
+// limits, escalating over wall-clock time (see flattenStuckSince):
+//
+//  1. Reprice: when FlattenRepriceStallCycles > 0, after that many consecutive cycles
+//     with the same resting POST_ONLY order, cancel and re-place at the current mid.
+//     N == 0 preserves legacy behavior (never cancel for reprice).
+//  2. Escalate: each reprice uses an aggression that shrinks linearly from
+//     FlattenAggression toward 0 as elapsed time approaches FlattenForceSeconds, so the
+//     resting order creeps closer to mid (higher fill probability) the longer we're stuck.
+//  3. Force: once stuck for FlattenForceSeconds, cancel the resting order and submit a
+//     marketable IOC reduce-only order (FlattenForceDeviation from mid) to guarantee exit,
+//     accepting taker fee + slippage. Repeats every cycle until inventory recovers.
+//
+// FlattenForceSeconds == 0 disables step 3 (legacy: passive-only, may stay stuck indefinitely).
 func (m *MarketMaker) handleAutoFlattenAtLimit(ctx context.Context, cycle uint64, mid, inventory float64, openOrders []exchange.OpenOrder) error {
+	if m.flattenStuckSince.IsZero() {
+		m.flattenStuckSince = time.Now()
+	}
+	elapsed := time.Since(m.flattenStuckSince)
+
+	if m.cfg.FlattenForceSeconds > 0 && elapsed.Seconds() >= m.cfg.FlattenForceSeconds {
+		return m.forceCloseFlatten(ctx, cycle, mid, inventory, openOrders, elapsed)
+	}
+
 	n := m.cfg.FlattenRepriceStallCycles
+	aggression := m.escalatedFlattenAggression(elapsed)
+
 	if m.shouldSkipFlatten(openOrders) {
 		if n <= 0 {
 			slog.Info("flatten order already resting, skipping",
@@ -520,11 +617,13 @@ func (m *MarketMaker) handleAutoFlattenAtLimit(ctx context.Context, cycle uint64
 		if m.flattenStallCycles < n {
 			slog.Info("flatten order resting, awaiting stall cycles before reprice",
 				"cycle", cycle, "order_id", m.lastFlattenOrderID,
-				"stall_cycles", m.flattenStallCycles, "stall_limit", n)
+				"stall_cycles", m.flattenStallCycles, "stall_limit", n,
+				"stuck_seconds", elapsed.Seconds())
 			return nil
 		}
 		slog.Info("flatten reprice: cancel resting order after stall cycles",
-			"cycle", cycle, "order_id", m.lastFlattenOrderID, "stall_limit", n)
+			"cycle", cycle, "order_id", m.lastFlattenOrderID, "stall_limit", n,
+			"escalated_aggression", aggression, "stuck_seconds", elapsed.Seconds())
 		oid := m.lastFlattenOrderID
 		if err := m.ex.CancelOrder(ctx, oid); err != nil {
 			slog.Warn("flatten reprice: cancel order failed",
@@ -534,7 +633,7 @@ func (m *MarketMaker) handleAutoFlattenAtLimit(ctx context.Context, cycle uint64
 		m.lastFlattenOrderID = ""
 		m.flattenStallCycles = 0
 	}
-	outcome, err := m.placeFlattenOrder(ctx, inventory, mid)
+	outcome, err := m.placeFlattenOrder(ctx, inventory, mid, aggression)
 	if err != nil && !errors.Is(err, ErrNoPositionToFlatten) {
 		return fmt.Errorf("flatten order: %w", err)
 	}
@@ -545,7 +644,95 @@ func (m *MarketMaker) handleAutoFlattenAtLimit(ctx context.Context, cycle uint64
 	return nil
 }
 
-func (m *MarketMaker) placeFlattenOrder(ctx context.Context, inventory, mid float64) (exchange.PlaceOrderOutcome, error) {
+// escalatedFlattenAggression linearly shrinks FlattenAggression toward 0 as elapsed
+// approaches FlattenForceSeconds, so resting flatten orders creep toward mid (higher
+// fill probability) the longer inventory stays stuck, right up to the forced IOC close.
+// FlattenForceSeconds <= 0 disables escalation (always returns the base aggression).
+func (m *MarketMaker) escalatedFlattenAggression(elapsed time.Duration) float64 {
+	base := m.cfg.FlattenAggression
+	if m.cfg.FlattenForceSeconds <= 0 {
+		return base
+	}
+	progress := elapsed.Seconds() / m.cfg.FlattenForceSeconds
+	if progress <= 0 {
+		return base
+	}
+	if progress >= 1 {
+		return 0
+	}
+	return base * (1 - progress)
+}
+
+// forceCloseFlatten cancels any resting POST_ONLY flatten order and submits a marketable
+// IOC reduce-only order to guarantee exit after FlattenForceSeconds of being stuck at the
+// inventory limit. Logged at Error level (CRITICAL) since this is an unplanned taker exit —
+// worth surfacing even without watching logs. Does not reset flattenStuckSince itself: a
+// partial fill (still over the limit next cycle) will force-close again immediately rather
+// than getting a fresh grace period; only the top-of-cycle inventory-recovery check clears it.
+func (m *MarketMaker) forceCloseFlatten(ctx context.Context, cycle uint64, mid, inventory float64, openOrders []exchange.OpenOrder, elapsed time.Duration) error {
+	if m.lastFlattenOrderID != "" {
+		for _, o := range openOrders {
+			if o.OrderID == m.lastFlattenOrderID {
+				if err := m.ex.CancelOrder(ctx, m.lastFlattenOrderID); err != nil {
+					slog.Warn("force close: cancel resting flatten order failed",
+						"cycle", cycle, "order_id", m.lastFlattenOrderID, "err", err)
+				}
+				break
+			}
+		}
+		m.lastFlattenOrderID = ""
+		m.flattenStallCycles = 0
+	}
+
+	dev := m.cfg.FlattenForceDeviation
+	if dev <= 0 {
+		dev = m.cfg.FlattenMaxDeviation
+	}
+
+	isBuy := inventory < 0
+	absInv := math.Abs(inventory)
+	size := math.Round(absInv/m.market.LotSize) * m.market.LotSize
+	if size <= 0 || size < m.market.MinSize {
+		return nil
+	}
+
+	var rawPrice float64
+	if isBuy {
+		rawPrice = math.Ceil(mid*(1.0+dev)/m.market.TickSize) * m.market.TickSize
+	} else {
+		rawPrice = math.Floor(mid*(1.0-dev)/m.market.TickSize) * m.market.TickSize
+	}
+
+	slog.Error("CRITICAL: forced IOC flatten — stuck at inventory limit past FLATTEN_FORCE_SECONDS, taking liquidity to guarantee exit",
+		"cycle", cycle,
+		"inventory", inventory,
+		"mid", mid,
+		"stuck_seconds", elapsed.Seconds(),
+		"force_seconds_limit", m.cfg.FlattenForceSeconds,
+		"price", rawPrice,
+		"size", size,
+		"deviation", dev,
+	)
+
+	outcome, err := m.ex.PlaceOrder(ctx, exchange.PlaceOrderRequest{
+		MarketID:    m.market.MarketID,
+		Price:       rawPrice,
+		Size:        size,
+		IsBuy:       isBuy,
+		TimeInForce: exchange.TimeInForceIOC,
+		ReduceOnly:  true,
+	})
+	if err != nil {
+		slog.Error("forced IOC flatten failed", "cycle", cycle, "err", err)
+		return fmt.Errorf("forced IOC flatten: %w", err)
+	}
+
+	slog.Warn("forced IOC flatten submitted", "cycle", cycle, "order_id", outcome.OrderID, "tx_hash", outcome.TxHash)
+	m.forceCloseCount++
+	return nil
+}
+
+func (m *MarketMaker) placeFlattenOrder(ctx context.Context, inventory, mid, aggression float64) (exchange.PlaceOrderOutcome, error) {
 	isBuy := inventory < 0
 	absInv := math.Abs(inventory)
 
@@ -554,7 +741,7 @@ func (m *MarketMaker) placeFlattenOrder(ctx context.Context, inventory, mid floa
 	// Long → sell above mid; short → buy below mid.
 	var rawPrice float64
 	if isBuy {
-		p := mid * (1.0 - m.cfg.FlattenAggression)
+		p := mid * (1.0 - aggression)
 		if m.cfg.FlattenMaxDeviation > 0 {
 			floor := mid * (1.0 - m.cfg.FlattenMaxDeviation)
 			if p < floor {
@@ -566,7 +753,7 @@ func (m *MarketMaker) placeFlattenOrder(ctx context.Context, inventory, mid floa
 		}
 		rawPrice = math.Floor(p/m.market.TickSize) * m.market.TickSize
 	} else {
-		p := mid * (1.0 + m.cfg.FlattenAggression)
+		p := mid * (1.0 + aggression)
 		if m.cfg.FlattenMaxDeviation > 0 {
 			cap := mid * (1.0 + m.cfg.FlattenMaxDeviation)
 			if p > cap {
@@ -611,7 +798,7 @@ func (m *MarketMaker) placeFlattenOrder(ctx context.Context, inventory, mid floa
 			"is_buy", isBuy,
 			"tif", exchange.TimeInForcePostOnly,
 			"reduce_only", true,
-			"flatten_aggression", m.cfg.FlattenAggression,
+			"flatten_aggression", aggression,
 			"flatten_max_deviation", m.cfg.FlattenMaxDeviation,
 			"market", m.market.MarketName,
 			"market_id", api.AddrSuffix(m.market.MarketID),

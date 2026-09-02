@@ -29,6 +29,7 @@ import (
 	"decibel-mm-bot/notify"
 	"decibel-mm-bot/notify/telegram"
 	"decibel-mm-bot/strategy"
+	"decibel-mm-bot/webui"
 )
 
 func main() {
@@ -67,6 +68,14 @@ func main() {
 	// Graceful shutdown on SIGINT / SIGTERM.
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+
+	if len(cfg.Markets) > 0 {
+		if err := runMultiMarket(ctx, cfg); err != nil {
+			slog.Error("multi-market run exited with error", "err", err)
+			os.Exit(1)
+		}
+		return
+	}
 
 	var logTee io.WriteCloser
 	defer func() {
@@ -149,15 +158,30 @@ func main() {
 	mm := strategy.New(cfg, ex, market)
 
 	// ── 3. Notification layer (optional) ─────────────────────────────────────
+	// Shared by both Telegram and the Web UI so they read one consistent state
+	// and expose the same control actions (pause/resume/flatten).
+	info := &infoAdapter{mm: mm, ex: ex, cfg: cfg, apiClient: apiCatalog, marketNames: nameLookup}
+
+	if cfg.WebUIEnabled {
+		webCfg := webui.Config{Bind: cfg.WebUIBind, Token: cfg.WebUIToken}
+		webSrv := webui.New(webCfg, info)
+		go func() {
+			if err := webSrv.Run(ctx); err != nil && ctx.Err() == nil {
+				slog.Error("webui exited with error", "err", err)
+			}
+		}()
+	}
+
 	if cfg.TelegramEnabled() {
 		tgCfg := telegram.Config{
 			BotToken:               cfg.TGBotToken,
 			AdminID:                cfg.TGAdminID,
 			AlertInventory:         cfg.TGAlertInventory,
 			AlertInventoryInterval: cfg.TGAlertInventoryInterval,
+			SummaryEnabled:         cfg.TGSummaryEnabled,
+			SummaryIntervalMin:     cfg.TGSummaryIntervalMin,
 			Locale:                 cfg.Locale,
 		}
-		info := &infoAdapter{mm: mm, ex: ex, cfg: cfg, apiClient: apiCatalog, marketNames: nameLookup}
 		tg, err := telegram.New(tgCfg, info)
 		if err != nil {
 			if cfg.TGStrictStart {
@@ -195,6 +219,95 @@ func main() {
 		slog.Error("strategy exited with error", "err", err)
 		os.Exit(1)
 	}
+}
+
+// runMultiMarket runs one MarketMaker instance per cfg.Markets entry concurrently,
+// all trading from the same account. A shared api.Client, aptos.NodeClient, and
+// aptos.TxSubmitter are used across all instances: the REST client is safe to share
+// (per-call market params, cached /markets read), and the TxSubmitter serializes
+// on-chain submissions so concurrent instances don't race on the account's sequence
+// number (see aptos.TxSubmitter doc comment).
+//
+// Known limitation: Telegram and the Web UI are single-market-target-scoped today
+// (notify.InfoProvider assumes one MarketMaker/cfg). Rather than show misleading
+// single-market data while claiming to represent all markets, both are disabled in
+// multi-market mode until they're redesigned to be market-aware.
+func runMultiMarket(ctx context.Context, cfg *config.Config) error {
+	if cfg.TelegramEnabled() || cfg.WebUIEnabled {
+		slog.Warn("multi-market mode: Telegram/Web UI are not yet multi-market aware; disabling them for this run (trading runs normally across all configured markets)")
+	}
+
+	slog.Info("starting Decibel Market Maker (multi-market mode)",
+		"markets", cfg.Markets,
+		"spread", cfg.Spread,
+		"order_size", cfg.OrderSize,
+		"max_inventory", cfg.MaxInventory,
+		"dry_run", cfg.DryRun,
+	)
+
+	if perpGlobal, err := aptos.CreatePerpEngineGlobalAddress(cfg.PackageAddress); err != nil {
+		slog.Warn("could not derive GlobalPerpEngine address for logging", "err", err)
+	} else {
+		slog.Info("perp engine global (derived)", "address", perpGlobal)
+	}
+
+	apiClient := api.NewClient(cfg.RestAPIBase, cfg.BearerToken, api.WithRESTVerbose(cfg.LogVerbose))
+
+	aptosNode, err := aptos.NewNodeClient(cfg.AptosFullnodeURL, cfg.NodeKey(), aptos.ChainIDForNetwork(cfg.Network))
+	if err != nil {
+		return fmt.Errorf("create aptos node client: %w", err)
+	}
+	aptosSigner, err := aptos.ParseAccount(cfg.PrivateKey)
+	if err != nil {
+		return fmt.Errorf("parse aptos signing account: %w", err)
+	}
+	submitter := aptos.NewTxSubmitter(aptosNode)
+
+	addr := aptosSigner.AccountAddress()
+	slog.Info("derived sender address", "address", addr.String())
+	slog.Info("using subaccount", "address", cfg.SubaccountAddress)
+
+	type runner struct {
+		name string
+		mm   *strategy.MarketMaker
+	}
+	runners := make([]runner, 0, len(cfg.Markets))
+
+	for _, name := range cfg.Markets {
+		marketCfg := *cfg // shallow copy: shares all trading params, differs only in MarketName below
+		marketCfg.MarketName = name
+
+		ex := decibelExchange.NewShared(&marketCfg, apiClient, aptosNode, aptosSigner, submitter)
+
+		market, err := ex.FindMarket(ctx, name)
+		if err != nil {
+			return fmt.Errorf("discover market %q: %w", name, err)
+		}
+		ex.SetMarket(market)
+
+		slog.Info("market config loaded",
+			"market", name,
+			"market_id", market.MarketID,
+			"tick_size", market.TickSize,
+			"lot_size", market.LotSize,
+			"px_decimals", market.PxDecimals,
+			"sz_decimals", market.SzDecimals,
+		)
+
+		mm := strategy.New(&marketCfg, ex, market)
+		runners = append(runners, runner{name: name, mm: mm})
+	}
+
+	g, gctx := errgroup.WithContext(ctx)
+	for _, r := range runners {
+		g.Go(func() error {
+			if err := r.mm.Run(gctx); err != nil {
+				return fmt.Errorf("market %s: %w", r.name, err)
+			}
+			return nil
+		})
+	}
+	return g.Wait()
 }
 
 // resolveLogTeePath returns an absolute or cwd-relative log file path, or "" if tee is disabled.
@@ -281,6 +394,12 @@ func (a *infoAdapter) FetchLiveSnapshot(ctx context.Context) (botstate.Snapshot,
 		TargetMarketName: base.TargetMarketName,
 		TargetMarketID:   base.TargetMarketID,
 		LastCycleAt:      time.Now(),
+
+		EffectiveSpread:     base.EffectiveSpread,
+		Paused:              base.Paused,
+		PauseCancelResting:  base.PauseCancelResting,
+		FlattenStuckSeconds: base.FlattenStuckSeconds,
+		ForceCloseCount:     base.ForceCloseCount,
 	}, nil
 }
 
@@ -404,6 +523,22 @@ func (a *infoAdapter) WalletAddress() string {
 
 func (a *infoAdapter) MaxInventory() float64 {
 	return a.cfg.MaxInventory
+}
+
+func (a *infoAdapter) FlattenForceSeconds() float64 {
+	return a.cfg.FlattenForceSeconds
+}
+
+func (a *infoAdapter) MaxMarginUsage() float64 {
+	return a.cfg.MaxMarginUsage
+}
+
+func (a *infoAdapter) PauseTrading(ctx context.Context, cancelResting bool) error {
+	return a.mm.Pause(ctx, cancelResting)
+}
+
+func (a *infoAdapter) ResumeTrading() {
+	a.mm.Resume()
 }
 
 func (a *infoAdapter) MarketDisplayName(addr string) string {
