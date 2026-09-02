@@ -1,0 +1,934 @@
+//! Interactive attach panel.
+//!
+//! The screen is a single, full-page scrollable status view. It uses the alternate screen so a
+//! live redraw cannot corrupt the normal terminal buffer. Press `c` to copy the complete
+//! (unscrolled) snapshot to the macOS clipboard.
+
+use crate::{
+    client::{ClientCommand, EngineClient},
+    control::{EngineStatus, ExitMode, LadderLevel},
+};
+use anyhow::{Context, Result};
+use crossterm::{
+    cursor::{Hide, Show},
+    event::{DisableMouseCapture, Event, EventStream, KeyCode, KeyEventKind, KeyModifiers},
+    execute,
+    terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
+};
+use futures_util::StreamExt;
+use ratatui::{
+    Terminal,
+    backend::CrosstermBackend,
+    layout::{Constraint, Direction, Layout, Rect},
+    style::{Color, Modifier, Style},
+    text::{Line, Span},
+    widgets::{Block, Borders, Clear, Paragraph, Wrap},
+};
+use rust_decimal::Decimal;
+use std::{
+    io::{self, Stdout, Write},
+    panic,
+    process::{Command, Stdio},
+    str::FromStr,
+    sync::Once,
+    time::{Duration, Instant},
+};
+use tokio::time::MissedTickBehavior;
+
+static PANIC_HOOK: Once = Once::new();
+
+/// Bound rendering so a trackpad gesture cannot produce one terminal redraw per input event.
+const FRAME_INTERVAL: Duration = Duration::from_millis(33);
+const INPUT_RETRY_DELAY: Duration = Duration::from_secs(1);
+const MAX_RENDERED_EVENTS: usize = 10;
+fn restore_terminal() {
+    let _ = disable_raw_mode();
+    let mut stdout = io::stdout();
+    // Do not clear or purge the main screen here: those operations destroy the user's
+    // scrollback. Returning from the alternate screen should leave the original buffer intact.
+    let _ = execute!(stdout, Show, DisableMouseCapture, LeaveAlternateScreen);
+}
+/// Owns the terminal's raw-mode and alternate-screen lifecycle.
+///
+/// The alternate screen is intentional. A continuously redrawn TUI cannot safely coexist with
+/// native terminal text selection in the main buffer; `c` copies the full current snapshot
+/// without requiring the user to select a transient frame.
+pub struct TerminalGuard {
+    terminal: Terminal<CrosstermBackend<Stdout>>,
+}
+
+impl TerminalGuard {
+    pub fn enter() -> Result<Self> {
+        PANIC_HOOK.call_once(|| {
+            let previous = panic::take_hook();
+            panic::set_hook(Box::new(move |info| {
+                restore_terminal();
+                previous(info);
+            }));
+        });
+
+        enable_raw_mode()?;
+        let mut stdout = io::stdout();
+        // Attach intentionally never captures the mouse: wheel input remains owned by the host
+        // terminal. Do not clear or purge the main buffer here; it belongs to the user.
+        if let Err(error) = execute!(stdout, DisableMouseCapture, EnterAlternateScreen, Hide) {
+            restore_terminal();
+            return Err(error.into());
+        }
+        match Terminal::new(CrosstermBackend::new(stdout)) {
+            Ok(mut terminal) => {
+                // This clears only the alternate screen so the first draw starts clean.
+                if let Err(error) = terminal.clear() {
+                    restore_terminal();
+                    return Err(error.into());
+                }
+                Ok(Self { terminal })
+            }
+            Err(error) => {
+                restore_terminal();
+                Err(error.into())
+            }
+        }
+    }
+
+    fn height(&self) -> Result<u16> {
+        Ok(self.terminal.size()?.height)
+    }
+
+    fn draw(&mut self, app: &mut App) -> Result<()> {
+        let terminal_height = self.height()?;
+        let viewport_height = terminal_height.saturating_sub(10) as usize;
+        let content = snapshot_lines(&app.status);
+        let max_scroll = content.len().saturating_sub(viewport_height.max(1));
+        app.update_scroll_bounds(max_scroll);
+        self.terminal
+            .draw(|frame| render(frame, app, &content, max_scroll))?;
+        Ok(())
+    }
+}
+
+impl Drop for TerminalGuard {
+    fn drop(&mut self) {
+        restore_terminal();
+    }
+}
+
+#[derive(Default)]
+struct App {
+    status: EngineStatus,
+    scroll: usize,
+    max_scroll: usize,
+    follow_latest: bool,
+    confirm_liquidate: bool,
+    connected: bool,
+    subscribed: bool,
+    received_snapshot: bool,
+    live_sequence: u64,
+    notice: String,
+}
+
+impl App {
+    fn update_scroll_bounds(&mut self, max_scroll: usize) {
+        self.max_scroll = max_scroll;
+        self.scroll = if self.follow_latest {
+            max_scroll
+        } else {
+            self.scroll.min(max_scroll)
+        };
+        self.follow_latest = self.scroll == max_scroll;
+    }
+
+    fn scroll_up(&mut self, amount: usize) {
+        self.scroll = self.scroll.saturating_sub(amount);
+        self.follow_latest = self.scroll == self.max_scroll;
+    }
+
+    fn scroll_down(&mut self, amount: usize) {
+        self.scroll = self.scroll.saturating_add(amount).min(self.max_scroll);
+        self.follow_latest = self.scroll == self.max_scroll;
+    }
+
+    fn scroll_to(&mut self, offset: usize) {
+        self.scroll = offset.min(self.max_scroll);
+        self.follow_latest = self.scroll == self.max_scroll;
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum EventOutcome {
+    Continue,
+    Redraw,
+    Quit,
+}
+
+pub async fn run(client: EngineClient) -> Result<()> {
+    let mut guard = TerminalGuard::enter()?;
+
+    // Manual acceptance hook: validates terminal restoration before the panic report is printed.
+    if std::env::var("GRID_ATTACH_PANIC_TEST").as_deref() == Ok("1") {
+        panic!("intentional attach TUI panic test");
+    }
+
+    let mut updates: Option<tokio::sync::mpsc::Receiver<Result<EngineStatus>>> = None;
+    let mut reconnect_at = Instant::now();
+    let mut reconnect_backoff = Duration::from_secs(1);
+    let mut input = Some(EventStream::new());
+    let mut input_retry_at = None;
+    let mut tick = tokio::time::interval(FRAME_INTERVAL);
+    tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    let mut app = App {
+        notice: "Live updates disconnected; reconnecting...".to_owned(),
+        ..Default::default()
+    };
+    let mut needs_redraw = true;
+
+    loop {
+        tokio::select! {
+            biased;
+            _ = tick.tick() => {
+                let now = Instant::now();
+                if updates.is_none() && now >= reconnect_at {
+                    match client.subscribe_updates().await {
+                        Ok(receiver) => {
+                            updates = Some(receiver);
+                            reconnect_backoff = Duration::from_secs(1);
+                            app.connected = true;
+                            app.subscribed = false;
+                            app.notice = "Connected; waiting for the initial snapshot...".to_owned();
+                            needs_redraw = true;
+                        }
+                        Err(error) => {
+                            app.connected = false;
+                            app.subscribed = false;
+                            app.notice = format!(
+                                "Live updates disconnected; retrying in {}s: {error:#}",
+                                reconnect_backoff.as_secs(),
+                            );
+                            reconnect_at = now + reconnect_backoff;
+                            reconnect_backoff = (reconnect_backoff * 2).min(Duration::from_secs(30));
+                            needs_redraw = true;
+                        }
+                    }
+                }
+                if input.is_none() && input_retry_at.is_some_and(|retry_at| now >= retry_at) {
+                    input = Some(EventStream::new());
+                    input_retry_at = None;
+                    app.notice = "Terminal input restored.".to_owned();
+                    needs_redraw = true;
+                }
+                if needs_redraw {
+                    guard.draw(&mut app)?;
+                    needs_redraw = false;
+                }
+            }
+            update = async {
+                match &mut updates {
+                    Some(receiver) => receiver.recv().await,
+                    None => std::future::pending().await,
+                }
+            } => match update {
+                Some(Ok(status)) => {
+                    // Keep the last complete snapshot during later reconnects. This update is
+                    // the authoritative initial snapshot or a subsequent full state broadcast.
+                    app.status = status;
+                    app.connected = true;
+                    app.subscribed = true;
+                    app.received_snapshot = true;
+                    app.live_sequence = app.live_sequence.saturating_add(1);
+                    app.notice.clear();
+                    needs_redraw = true;
+                }
+                Some(Err(error)) => {
+                    updates = None;
+                    app.connected = false;
+                    app.subscribed = false;
+                    app.notice = format!("Live updates disconnected; reconnecting: {error:#}");
+                    reconnect_at = Instant::now() + reconnect_backoff;
+                    reconnect_backoff = (reconnect_backoff * 2).min(Duration::from_secs(30));
+                    needs_redraw = true;
+                }
+                None => {
+                    updates = None;
+                    app.connected = false;
+                    app.subscribed = false;
+                    app.notice = "Live updates disconnected; reconnecting...".to_owned();
+                    reconnect_at = Instant::now() + reconnect_backoff;
+                    reconnect_backoff = (reconnect_backoff * 2).min(Duration::from_secs(30));
+                    needs_redraw = true;
+                }
+            },
+            event = async {
+                match &mut input {
+                    Some(stream) => stream.next().await,
+                    None => std::future::pending().await,
+                }
+            } => match event {
+                // Mouse capture is disabled, but some terminal multiplexers can still forward
+                // wheel reports. Ignore them without querying terminal size or requesting a draw.
+                Some(Ok(Event::Mouse(_))) => {}
+                Some(Ok(event)) => {
+                    let term_height = guard.height()?;
+                    match handle_event(event, &mut app, &client, term_height).await? {
+                        EventOutcome::Quit => break,
+                        EventOutcome::Redraw => needs_redraw = true,
+                        EventOutcome::Continue => {}
+                    }
+                }
+                Some(Err(error)) => {
+                    input = None;
+                    input_retry_at = Some(Instant::now() + INPUT_RETRY_DELAY);
+                    app.notice = format!("Terminal input failed; retrying in 1s: {error}");
+                    needs_redraw = true;
+                }
+                None => {
+                    input = None;
+                    input_retry_at = Some(Instant::now() + INPUT_RETRY_DELAY);
+                    app.notice = "Terminal input stream closed; retrying in 1s.".to_owned();
+                    needs_redraw = true;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn handle_event(
+    event: Event,
+    app: &mut App,
+    client: &EngineClient,
+    term_height: u16,
+) -> Result<EventOutcome> {
+    let outcome = match event {
+        Event::Key(key) if key.kind == KeyEventKind::Press => match key.code {
+            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                EventOutcome::Quit
+            }
+            KeyCode::Char('q') | KeyCode::Esc if !app.confirm_liquidate => EventOutcome::Quit,
+            KeyCode::Char('s') if !app.confirm_liquidate => {
+                app.confirm_liquidate = true;
+                EventOutcome::Redraw
+            }
+            KeyCode::Char('y') if app.confirm_liquidate => {
+                app.notice = client
+                    .send_command(ClientCommand::Stop {
+                        exit_mode: ExitMode::Liquidate,
+                    })
+                    .await?;
+                app.confirm_liquidate = false;
+                EventOutcome::Redraw
+            }
+            KeyCode::Char('n') | KeyCode::Esc if app.confirm_liquidate => {
+                app.confirm_liquidate = false;
+                EventOutcome::Redraw
+            }
+            KeyCode::Char('c') if !app.confirm_liquidate => {
+                app.notice = match copy_snapshot_to_clipboard(&app.status) {
+                    Ok(()) => "Copied the complete snapshot to the clipboard.".to_owned(),
+                    Err(error) => format!("Could not copy snapshot: {error:#}"),
+                };
+                EventOutcome::Redraw
+            }
+            // Content starts at the top when scroll=0. Going down means a larger offset.
+            KeyCode::Up => {
+                app.scroll_up(1);
+                EventOutcome::Redraw
+            }
+            KeyCode::Down => {
+                app.scroll_down(1);
+                EventOutcome::Redraw
+            }
+            KeyCode::PageUp => {
+                app.scroll_up(page_step(term_height));
+                EventOutcome::Redraw
+            }
+            KeyCode::PageDown => {
+                app.scroll_down(page_step(term_height));
+                EventOutcome::Redraw
+            }
+            KeyCode::Home | KeyCode::Char('g') => {
+                app.scroll_to(0);
+                EventOutcome::Redraw
+            }
+            KeyCode::End | KeyCode::Char('G') => {
+                app.scroll_to(app.max_scroll);
+                EventOutcome::Redraw
+            }
+            _ => EventOutcome::Continue,
+        },
+        // Do not capture mouse-wheel input. It remains available to the host terminal, as users
+        // expect for terminal scrollback and selection behavior.
+        Event::Mouse(_) => EventOutcome::Continue,
+        Event::Resize(_, _) => EventOutcome::Redraw,
+        _ => EventOutcome::Continue,
+    };
+    Ok(outcome)
+}
+
+fn page_step(term_height: u16) -> usize {
+    (term_height.saturating_sub(10) as usize).max(1)
+}
+
+fn snapshot_lines(status: &EngineStatus) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+    let base_symbol = status.pfs_base_symbol.as_deref().unwrap_or("BASE");
+    let base_balance = status.pfs_base_balance.as_deref().unwrap_or("-");
+    let quote_symbol = status.pfs_quote_symbol.as_deref().unwrap_or("QUOTE");
+    let quote_balance = status.pfs_quote_balance.as_deref().unwrap_or("-");
+
+    lines.push(Line::from(vec![
+        Span::styled("PFS balances  ", Style::default().fg(Color::DarkGray)),
+        Span::styled(
+            format!("{base_symbol}: {base_balance}"),
+            Style::default().add_modifier(Modifier::BOLD),
+        ),
+        Span::raw("   "),
+        Span::styled(
+            format!("{quote_symbol}: {quote_balance}"),
+            Style::default().add_modifier(Modifier::BOLD),
+        ),
+        Span::raw("   "),
+        Span::styled("Realized PnL: ", Style::default().fg(Color::DarkGray)),
+        Span::raw(
+            status
+                .realized_pnl
+                .as_deref()
+                .unwrap_or("unavailable")
+                .to_owned(),
+        ),
+    ]));
+    lines.push(Line::from(vec![
+        Span::styled("Reconcile     ", Style::default().fg(Color::DarkGray)),
+        Span::raw(format!(
+            "matched={}  missing={}  unmanaged={}",
+            status
+                .matched
+                .map_or_else(|| "-".to_owned(), |count| count.to_string()),
+            status
+                .missing
+                .map_or_else(|| "-".to_owned(), |count| count.to_string()),
+            status
+                .unmanaged
+                .map_or_else(|| "-".to_owned(), |count| count.to_string()),
+        )),
+    ]));
+    if let Some(error) = &status.last_error {
+        lines.push(Line::from(vec![
+            Span::styled(
+                "Last engine error: ",
+                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(error.clone(), Style::default().fg(Color::Red)),
+        ]));
+    }
+
+    lines.push(Line::raw(""));
+    lines.push(Line::styled(
+        format!("GRID LEVELS ({})", status.ladder.len()),
+        Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD),
+    ));
+    lines.push(Line::styled(
+        format!(
+            "{:<8} {:>18} {:>16} {:>12}",
+            "SIDE", "PRICE (QUOTE)", "QTY (BASE)", "STATUS"
+        ),
+        Style::default().fg(Color::DarkGray),
+    ));
+    lines.push(Line::styled(
+        "------------------------------------------------------------",
+        Style::default().fg(Color::DarkGray),
+    ));
+
+    let levels = ordered_levels(&status.ladder);
+    if levels.is_empty() {
+        lines.push(Line::styled(
+            "(no grid levels in the latest snapshot)",
+            Style::default().fg(Color::DarkGray),
+        ));
+    } else {
+        for level in levels {
+            lines.push(ladder_line(level));
+        }
+    }
+
+    let rendered_event_count = status.events.len().min(MAX_RENDERED_EVENTS);
+    lines.push(Line::raw(""));
+    lines.push(Line::styled(
+        format!(
+            "EVENTS (latest {rendered_event_count} / {})",
+            status.events.len()
+        ),
+        Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD),
+    ));
+    lines.push(Line::styled(
+        "------------------------------------------------------------",
+        Style::default().fg(Color::DarkGray),
+    ));
+    if status.events.is_empty() {
+        lines.push(Line::styled(
+            "(no events in the latest snapshot)",
+            Style::default().fg(Color::DarkGray),
+        ));
+    } else {
+        for event in status.events.iter().rev().take(MAX_RENDERED_EVENTS) {
+            lines.push(Line::from(vec![
+                Span::styled(
+                    event.at.format("%H:%M:%S").to_string(),
+                    Style::default().fg(Color::DarkGray),
+                ),
+                Span::raw("  "),
+                Span::raw(event.message.clone()),
+            ]));
+        }
+    }
+    lines
+}
+
+fn ordered_levels(levels: &[LadderLevel]) -> Vec<&LadderLevel> {
+    let mut bids = levels
+        .iter()
+        .filter(|l| l.side.eq_ignore_ascii_case("BID"))
+        .collect::<Vec<_>>();
+    let mut asks = levels
+        .iter()
+        .filter(|l| l.side.eq_ignore_ascii_case("ASK"))
+        .collect::<Vec<_>>();
+    let mut other: Vec<&LadderLevel> = levels
+        .iter()
+        .filter(|l| !l.side.eq_ignore_ascii_case("BID") && !l.side.eq_ignore_ascii_case("ASK"))
+        .collect();
+
+    // BID: 按价格升序排列(最低在最上面 = 从最便宜的 bid 开始展示)
+    bids.sort_by(|a, b| parse_decimal(&a.price).cmp(&parse_decimal(&b.price)));
+    // ASK: 按价格升序排列(最低在最上面 = best ask 先可见)
+    asks.sort_by(|a, b| parse_decimal(&a.price).cmp(&parse_decimal(&b.price)));
+    other.sort_by(|a, b| parse_decimal(&a.price).cmp(&parse_decimal(&b.price)));
+
+    // 输出顺序: 全部 BID(低→高)在上, 全部 ASK(低→高)在下
+    bids.extend(asks);
+    bids.extend(other);
+    bids
+}
+
+fn ladder_line(level: &LadderLevel) -> Line<'static> {
+    let side_is_bid = level.side.eq_ignore_ascii_case("BID");
+    let side_is_ask = level.side.eq_ignore_ascii_case("ASK");
+    let side_style = if side_is_bid {
+        Style::default()
+            .fg(Color::Green)
+            .add_modifier(Modifier::BOLD)
+    } else if side_is_ask {
+        Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)
+    } else {
+        Style::default()
+            .fg(Color::Yellow)
+            .add_modifier(Modifier::BOLD)
+    };
+    let price_style = Style::default()
+        .fg(Color::White)
+        .add_modifier(Modifier::BOLD);
+    let state = display_state(&level.state);
+    let state_style = if state == "Cancelled" {
+        Style::default().fg(Color::Yellow)
+    } else if state == "Failed" || state == "Rejected" {
+        Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(Color::DarkGray)
+    };
+
+    Line::from(vec![
+        Span::styled(
+            format!("{:<8}", level.side.to_ascii_uppercase()),
+            side_style,
+        ),
+        Span::styled(
+            format!("{:>16}", format_decimal(&level.size, 6)),
+            side_style,
+        ),
+        Span::styled(
+            format!("{:>18}", format_decimal(&level.price, 8)),
+            price_style,
+        ),
+        Span::styled(format!("{:>12}", state), state_style),
+    ])
+}
+
+fn display_state(state: &str) -> &str {
+    if state.eq_ignore_ascii_case("placed") {
+        "Active"
+    } else if state.eq_ignore_ascii_case("planned") {
+        "Planned"
+    } else if state.eq_ignore_ascii_case("cancelled") || state.eq_ignore_ascii_case("canceled") {
+        "Cancelled"
+    } else if state.eq_ignore_ascii_case("failed") {
+        "Failed"
+    } else if state.eq_ignore_ascii_case("rejected") {
+        "Rejected"
+    } else {
+        state
+    }
+}
+
+fn parse_decimal(value: &str) -> Option<Decimal> {
+    Decimal::from_str(value).ok()
+}
+
+fn format_decimal(value: &str, scale: usize) -> String {
+    parse_decimal(value)
+        .map(|decimal| format!("{decimal:.scale$}"))
+        .unwrap_or_else(|| value.to_owned())
+}
+
+fn short_account(account: &str) -> String {
+    if account.len() <= 14 {
+        account.to_owned()
+    } else {
+        format!("{}...{}", &account[..8], &account[account.len() - 4..])
+    }
+}
+
+fn product_tag(product: &str) -> (&'static str, Style) {
+    if product.eq_ignore_ascii_case("spot") {
+        (
+            "[S]",
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        )
+    } else {
+        (
+            "[P]",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )
+    }
+}
+
+fn snapshot_plain_text(status: &EngineStatus) -> String {
+    snapshot_lines(status)
+        .into_iter()
+        .map(|line| line.to_string())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn copy_snapshot_to_clipboard(status: &EngineStatus) -> Result<()> {
+    let mut child = Command::new("pbcopy")
+        .stdin(Stdio::piped())
+        .spawn()
+        .context("start macOS clipboard command (pbcopy)")?;
+    let text = snapshot_plain_text(status);
+    child
+        .stdin
+        .as_mut()
+        .context("open clipboard command input")?
+        .write_all(text.as_bytes())
+        .context("write snapshot to clipboard")?;
+    let result = child.wait().context("wait for clipboard command")?;
+    if result.success() {
+        Ok(())
+    } else {
+        anyhow::bail!("pbcopy exited with {result}")
+    }
+}
+
+fn snapshot_indicator(app: &App) -> Span<'static> {
+    if let Some(error) = &app.status.last_error {
+        Span::styled(
+            format!("REST snapshot FAILED: {}", compact_text(error, 56)),
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+        )
+    } else if app.received_snapshot {
+        Span::styled(
+            format!("REST snapshot OK: {} grid levels", app.status.ladder.len()),
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )
+    } else {
+        Span::styled(
+            "REST snapshot pending",
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        )
+    }
+}
+
+fn compact_text(value: &str, max_chars: usize) -> String {
+    let compact = value.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut chars = compact.chars();
+    let shortened = chars.by_ref().take(max_chars).collect::<String>();
+    if chars.next().is_some() {
+        format!("{shortened}...")
+    } else {
+        shortened
+    }
+}
+
+fn render(frame: &mut ratatui::Frame, app: &App, content: &[Line<'static>], max_scroll: usize) {
+    let area = frame.area();
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(5),
+            Constraint::Min(3),
+            Constraint::Length(3),
+        ])
+        .split(area);
+
+    let connection = if app.connected {
+        Span::styled(
+            "● Connected",
+            Style::default()
+                .fg(Color::Green)
+                .add_modifier(Modifier::BOLD),
+        )
+    } else {
+        Span::styled(
+            "● Disconnected",
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+        )
+    };
+    let subscription = if app.subscribed {
+        Span::styled(
+            "● Subscribed",
+            Style::default()
+                .fg(Color::Green)
+                .add_modifier(Modifier::BOLD),
+        )
+    } else if app.connected {
+        Span::styled(
+            "● Waiting for snapshot",
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        )
+    } else {
+        Span::styled(
+            "● Live updates retrying",
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+        )
+    };
+    let snapshot = snapshot_indicator(app);
+    let last_update = app
+        .status
+        .last_cycle_at
+        .map(|at| at.format("%H:%M:%S").to_string())
+        .unwrap_or_else(|| "-".to_owned());
+    let (tag, tag_style) = product_tag(&app.status.product);
+
+    frame.render_widget(
+        Paragraph::new(vec![
+            Line::from(vec![connection, Span::raw("   "), subscription]),
+            Line::from(vec![
+                Span::styled("Account: ", Style::default().fg(Color::DarkGray)),
+                Span::raw(short_account(&app.status.subaccount)),
+                Span::styled("   Network: ", Style::default().fg(Color::DarkGray)),
+                Span::raw(&app.status.network),
+                Span::styled("   Engine: ", Style::default().fg(Color::DarkGray)),
+                Span::raw(&app.status.phase),
+                Span::raw("   "),
+                snapshot,
+            ]),
+            Line::from(vec![
+                Span::styled(tag, tag_style),
+                Span::raw(" "),
+                Span::styled(
+                    &app.status.market,
+                    Style::default()
+                        .fg(Color::White)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    format!(
+                        "  · live seq={}  · updated {}",
+                        app.live_sequence, last_update
+                    ),
+                    Style::default().fg(Color::DarkGray),
+                ),
+                Span::styled("  · mid ", Style::default().fg(Color::DarkGray)),
+                Span::styled(
+                    app.status.mid.as_deref().unwrap_or("-"),
+                    Style::default()
+                        .fg(Color::White)
+                        .add_modifier(Modifier::BOLD),
+                ),
+            ]),
+        ])
+        .block(Block::default().borders(Borders::ALL).title("Grid monitor")),
+        rows[0],
+    );
+
+    frame.render_widget(
+        Paragraph::new(content.to_vec())
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title("Price order: BID low→high, ASK low→high"),
+            )
+            .scroll((app.scroll.min(u16::MAX as usize) as u16, 0))
+            .wrap(Wrap { trim: false }),
+        rows[1],
+    );
+
+    let viewport_height = rows[1].height.saturating_sub(2) as usize;
+    let start = app.scroll.min(max_scroll).saturating_add(1);
+    let end = start
+        .saturating_add(viewport_height)
+        .saturating_sub(1)
+        .min(content.len());
+    let scroll_mode = if app.follow_latest {
+        "following latest"
+    } else {
+        "manual scroll"
+    };
+    let controls = format!(
+        "Lines {start}-{end} / {} ({scroll_mode})  |  Up/Down scroll  PgUp/PgDn page  Home/End bounds  c copy  s liquidate  q/Esc/Ctrl+C quit",
+        content.len(),
+    );
+    let notice_style = if app.connected {
+        Style::default().fg(Color::DarkGray)
+    } else {
+        Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)
+    };
+    frame.render_widget(
+        Paragraph::new(vec![
+            Line::styled(controls, Style::default().fg(Color::DarkGray)),
+            Line::styled(app.notice.clone(), notice_style),
+        ])
+        .block(Block::default().borders(Borders::ALL)),
+        rows[2],
+    );
+
+    if app.confirm_liquidate {
+        let popup = Rect {
+            x: area.width.saturating_sub(62) / 2,
+            y: area.height.saturating_sub(7) / 2,
+            width: 62.min(area.width),
+            height: 7.min(area.height),
+        };
+        frame.render_widget(Clear, popup);
+        frame.render_widget(
+            Paragraph::new(
+                "Stop the engine, cancel the ladder, and liquidate Spot base?\n\n[y] confirm liquidation    [n/Esc] cancel",
+            )
+            .style(Style::default().fg(Color::Yellow))
+            .block(Block::default().borders(Borders::ALL).title("Confirm liquidation")),
+            popup,
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::control::EngineEvent;
+    use chrono::Utc;
+
+    fn level(side: &str, price: &str) -> LadderLevel {
+        LadderLevel {
+            side: side.into(),
+            price: price.into(),
+            size: "2".into(),
+            state: "Placed".into(),
+        }
+    }
+
+    #[test]
+    fn snapshot_contains_all_ladder_and_event_rows() {
+        let status = EngineStatus {
+            ladder: vec![level("BID", "1.0"), level("ASK", "1.1")],
+            events: vec![EngineEvent {
+                at: Utc::now(),
+                message: "reconciled".into(),
+            }],
+            ..EngineStatus::default()
+        };
+
+        let snapshot = snapshot_plain_text(&status);
+        assert!(snapshot.contains("BID"));
+        assert!(snapshot.contains("ASK"));
+        assert!(snapshot.contains("reconciled"));
+    }
+
+    #[test]
+    fn snapshot_shows_only_the_ten_latest_events() {
+        let status = EngineStatus {
+            events: (0..=10)
+                .map(|index| EngineEvent {
+                    at: Utc::now(),
+                    message: format!("event-{index:02}"),
+                })
+                .collect(),
+            ..EngineStatus::default()
+        };
+
+        let snapshot = snapshot_plain_text(&status);
+        assert!(snapshot.contains("EVENTS (latest 10 / 11)"));
+        assert!(snapshot.contains("event-10"));
+        assert!(snapshot.contains("event-01"));
+        assert!(!snapshot.contains("event-00"));
+    }
+
+    #[test]
+    fn grid_levels_are_bid_then_ask_with_each_side_ordered() {
+        let levels = vec![
+            level("ASK", "1.20"),
+            level("BID", "1.10"),
+            level("ASK", "1.15"),
+            level("BID", "1.05"),
+        ];
+        let ordered = ordered_levels(&levels);
+        let prices = ordered
+            .iter()
+            .map(|level| format!("{}:{}", level.side, level.price))
+            .collect::<Vec<_>>();
+        // BID: 从小到大(最便宜的 bid 在最上面), ASK: 从小到大(最便宜的 ask 在最上面)
+        assert_eq!(prices, ["BID:1.05", "BID:1.10", "ASK:1.15", "ASK:1.20"]);
+    }
+
+    #[test]
+    fn formats_quantities_and_prices_at_fixed_precision() {
+        assert_eq!(format_decimal("50.68", 6), "50.680000");
+        assert_eq!(format_decimal("0.5559", 8), "0.55590000");
+    }
+
+    #[test]
+    fn page_step_is_a_full_viewport() {
+        assert_eq!(page_step(1), 1);
+        assert_eq!(page_step(24), 14);
+    }
+
+    #[test]
+    fn manual_scroll_stays_clamped_and_following_resumes_at_bottom() {
+        let mut app = App::default();
+        app.update_scroll_bounds(5);
+        assert_eq!(app.scroll, 0);
+        assert!(!app.follow_latest);
+
+        app.scroll_down(2);
+        assert_eq!(app.scroll, 2);
+        assert!(!app.follow_latest);
+
+        app.update_scroll_bounds(8);
+        assert_eq!(app.scroll, 2);
+        assert!(!app.follow_latest);
+
+        app.scroll_down(usize::MAX);
+        assert_eq!(app.scroll, 8);
+        assert!(app.follow_latest);
+
+        app.update_scroll_bounds(11);
+        assert_eq!(app.scroll, 11);
+        assert!(app.follow_latest);
+
+        app.scroll_up(1);
+        assert_eq!(app.scroll, 10);
+        assert!(!app.follow_latest);
+    }
+}

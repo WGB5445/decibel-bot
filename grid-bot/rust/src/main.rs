@@ -4,6 +4,7 @@ use std::{
     io::{self, Write},
     panic::{self, PanicHookInfo},
     path::{Path, PathBuf},
+    process::{Command, Stdio},
     str::FromStr,
     sync::{
         Arc,
@@ -249,6 +250,15 @@ struct Cli {
 
 #[derive(Subcommand, Clone, Copy, Eq, PartialEq)]
 enum Cmd {
+    /// Launch a local engine child and return once its control socket is ready.
+    Start,
+    /// Internal foreground engine command for systemd/tmux. Do not use directly for ad-hoc trading.
+    #[command(hide = true)]
+    Engine,
+    /// Stream the engine's local log file; pass --follow to wait for appended lines.
+    Logs,
+    /// Repeatedly render the engine's current socket status.
+    Attach,
     /// Validate the key locally, then verify it against the selected network.
     CheckKey,
     Preview,
@@ -311,6 +321,12 @@ struct Args {
     /// Write stdout and stderr to this file, replacing it at startup.
     #[arg(long, global = true, env = "LOG_FILE")]
     log_file: Option<PathBuf>,
+    /// Continue streaming new lines for the `logs` client.
+    #[arg(short = 'f', long, global = true, default_value_t = false)]
+    follow: bool,
+    /// Exit mode for the `stop` client: hold or liquidate.
+    #[arg(long, global = true, value_parser = ["hold", "liquidate"])]
+    exit_mode: Option<String>,
     /// Human-readable USDC amount to move from Cross to PFS for `spot-funding-setup`.
     #[arg(long, global = true, env = "SPOT_FUNDING_AMOUNT", default_value = "0")]
     spot_funding_amount: String,
@@ -1640,11 +1656,15 @@ async fn main() -> Result<()> {
     dotenv().ok();
     let cli = Cli::parse();
     let opens_tui = matches!(&cli.command, Some(Cmd::Preview | Cmd::Tui) | None);
-    if let Some(path) = cli.args.log_file.as_deref() {
+    let engine_log = if matches!(&cli.command, Some(Cmd::Engine)) {
+        Some(control_paths(&Settings::from(&cli.args))?.log)
+    } else {
+        None
+    };
+    let log_path = cli.args.log_file.clone().or(engine_log);
+    if let Some(path) = log_path.as_deref() {
         if opens_tui {
-            anyhow::bail!(
-                "--log-file is only supported by CLI commands (run/status/reconcile/doctor/shadow/check-key), not TUI/preview"
-            )
+            anyhow::bail!("--log-file is only supported by CLI commands, not TUI/preview")
         }
         redirect_output_to_log(path)?;
         println!(
@@ -1653,9 +1673,25 @@ async fn main() -> Result<()> {
         );
     }
     match cli.command {
+        Some(Cmd::Start) => {
+            start_cli(
+                Settings::from(&cli.args),
+                cli.args.confirm_mainnet.as_deref(),
+            )
+            .await
+        }
+        Some(Cmd::Engine) => {
+            engine_cli(
+                Settings::from(&cli.args),
+                cli.args.confirm_mainnet.as_deref(),
+            )
+            .await
+        }
+        Some(Cmd::Logs) => logs_client(Settings::from(&cli.args), cli.args.follow).await,
+        Some(Cmd::Attach) => attach_client(Settings::from(&cli.args)).await,
         Some(Cmd::CheckKey) => check_api_key(Settings::from(&cli.args)).await,
         Some(Cmd::Reconcile) => reconcile_cli(Settings::from(&cli.args)).await,
-        Some(Cmd::Status) => status_cli(Settings::from(&cli.args)).await,
+        Some(Cmd::Status) => status_client(Settings::from(&cli.args)).await,
         Some(Cmd::Doctor) => doctor_cli(Settings::from(&cli.args)).await,
         Some(Cmd::Shadow) => shadow_cli(Settings::from(&cli.args), cli.args.shadow_cycles).await,
         Some(Cmd::SpotFundingSetup) => {
@@ -1666,18 +1702,14 @@ async fn main() -> Result<()> {
             )
             .await
         }
-        Some(Cmd::Run) => {
-            run_cli(
-                Settings::from(&cli.args),
-                cli.args.execute,
-                cli.args.confirm_mainnet.as_deref(),
-            )
-            .await
-        }
+        Some(Cmd::Run) => anyhow::bail!(
+            "`run` no longer owns a live trading loop; use `start` (or let systemd/tmux run the internal `engine` command) and control it with status/logs/stop/attach"
+        ),
         Some(Cmd::Stop) => {
-            stop_cli(
+            stop_client(
                 Settings::from(&cli.args),
                 cli.args.confirm_mainnet.as_deref(),
+                cli.args.exit_mode.as_deref(),
             )
             .await
         }
@@ -1727,7 +1759,197 @@ async fn check_api_key(settings: Settings) -> Result<()> {
     Ok(())
 }
 
-/// Fetch and print one monitor snapshot without changing exchange state.
+struct EngineRuntimeGuard {
+    paths: control::ControlPaths,
+}
+
+impl Drop for EngineRuntimeGuard {
+    fn drop(&mut self) {
+        self.paths.remove_runtime_files();
+    }
+}
+
+fn control_paths(settings: &Settings) -> Result<control::ControlPaths> {
+    control::ControlPaths::for_subaccount(&settings.subaccount)
+}
+
+async fn control_request(
+    settings: &Settings,
+    request: control::Request,
+) -> Result<control::Response> {
+    control::request(&control_paths(settings)?, &request).await
+}
+
+async fn status_client(settings: Settings) -> Result<()> {
+    match control_request(&settings, control::Request::Status).await? {
+        control::Response::Status { status } => {
+            println!("engine pid={} phase={}", status.pid, status.phase);
+            println!(
+                "{} {} {} {}",
+                status.network, status.subaccount, status.product, status.market
+            );
+            println!(
+                "last cycle: {:?}; mid: {:?}",
+                status.last_cycle_at, status.mid
+            );
+            println!(
+                "reconciliation: matched={:?} missing={:?} unmanaged={:?}",
+                status.matched, status.missing, status.unmanaged
+            );
+            if let Some(error) = status.last_error {
+                println!("last error: {error}");
+            }
+            Ok(())
+        }
+        control::Response::Error { message } => {
+            anyhow::bail!("engine rejected status request: {message}")
+        }
+        response => anyhow::bail!("unexpected engine status response: {response:?}"),
+    }
+}
+
+async fn stop_client(
+    settings: Settings,
+    confirm_mainnet: Option<&str>,
+    exit_mode: Option<&str>,
+) -> Result<()> {
+    if settings.network.eq_ignore_ascii_case("mainnet") && confirm_mainnet != Some("MAINNET") {
+        anyhow::bail!("mainnet stop requires --confirm-mainnet MAINNET")
+    }
+    let mode = match exit_mode.unwrap_or("hold") {
+        "hold" => control::ExitMode::Hold,
+        "liquidate" => control::ExitMode::Liquidate,
+        _ => anyhow::bail!("--exit-mode must be hold or liquidate"),
+    };
+    match control_request(&settings, control::Request::Stop { exit_mode: mode }).await? {
+        control::Response::Accepted { message } => {
+            println!("{message}");
+            Ok(())
+        }
+        control::Response::Error { message } => {
+            anyhow::bail!("engine rejected stop request: {message}")
+        }
+        response => anyhow::bail!("unexpected engine stop response: {response:?}"),
+    }
+}
+
+async fn logs_client(settings: Settings, follow: bool) -> Result<()> {
+    let paths = control_paths(&settings)?;
+    let shown = control::tail_lines(&paths.log, 200)?;
+    if !shown.is_empty() {
+        println!("{shown}");
+    }
+    if !follow {
+        return Ok(());
+    }
+    let mut offset = fs::metadata(&paths.log)?.len();
+    loop {
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        let bytes = fs::read(&paths.log)?;
+        if bytes.len() < offset as usize {
+            offset = 0;
+        }
+        if bytes.len() > offset as usize {
+            let appended = String::from_utf8_lossy(&bytes[offset as usize..]);
+            print!("{appended}");
+            io::stdout().flush()?;
+            offset = bytes.len() as u64;
+        }
+    }
+}
+
+async fn attach_client(settings: Settings) -> Result<()> {
+    let client = decibel_grid_tui::client::EngineClient::for_subaccount(&settings.subaccount)?;
+    decibel_grid_tui::attach_tui::run(client).await
+}
+
+async fn start_cli(settings: Settings, confirm_mainnet: Option<&str>) -> Result<()> {
+    if settings.network.eq_ignore_ascii_case("mainnet") && confirm_mainnet != Some("MAINNET") {
+        anyhow::bail!("mainnet start requires --confirm-mainnet MAINNET")
+    }
+    let paths = control_paths(&settings)?;
+    paths.ensure_directory()?;
+    if let Some(pid) = paths.read_pid()? {
+        if control::process_is_alive(pid) {
+            anyhow::bail!("engine already running for this account (pid {pid})")
+        }
+        paths.remove_runtime_files();
+    }
+    // Check the same advisory file lock used by the engine before launching. The child acquires
+    // and holds it for its entire lifetime, which closes the race after this preflight check.
+    drop(SubaccountRunLock::acquire(
+        &settings.network,
+        &settings.subaccount,
+    )?);
+    let executable = std::env::current_exe().context("resolve grid-bot executable")?;
+    let mut args = std::env::args_os().skip(1).collect::<Vec<_>>();
+    let Some(index) = args.iter().position(|arg| arg == "start") else {
+        anyhow::bail!("could not rewrite start command for engine child")
+    };
+    args[index] = "engine".into();
+    let child = Command::new(executable)
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .context("launch grid engine child")?;
+    for _ in 0..40 {
+        if matches!(
+            control::request(&paths, &control::Request::Ping).await,
+            Ok(control::Response::Pong)
+        ) {
+            println!(
+                "grid engine started (pid {}); socket {}",
+                child.id(),
+                paths.socket.display()
+            );
+            return Ok(());
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    anyhow::bail!(
+        "engine process {} did not open its control socket; inspect {}",
+        child.id(),
+        paths.log.display()
+    )
+}
+
+async fn engine_cli(settings: Settings, confirm_mainnet: Option<&str>) -> Result<()> {
+    let paths = control_paths(&settings)?;
+    paths.ensure_directory()?;
+    if let Some(pid) = paths.read_pid()? {
+        if control::process_is_alive(pid) {
+            anyhow::bail!("engine already running for this account (pid {pid})")
+        }
+        paths.remove_runtime_files();
+    }
+    let runtime = control::EngineHandle::new(control::EngineStatus {
+        pid: std::process::id(),
+        started_at: Some(Utc::now()),
+        network: settings.network.clone(),
+        subaccount: settings.subaccount.clone(),
+        market: settings.market.clone(),
+        product: format!("{:?}", settings.product).to_lowercase(),
+        phase: "starting".to_owned(),
+        ..Default::default()
+    });
+    paths.write_pid(std::process::id())?;
+    let _guard = EngineRuntimeGuard {
+        paths: paths.clone(),
+    };
+    let server = control::start_server(&paths, runtime.clone()).await?;
+    let result = run_cli(settings, true, confirm_mainnet, Some(runtime.clone())).await;
+    runtime
+        .update_status(|status| status.phase = "stopped".to_owned())
+        .await;
+    server.abort();
+    result
+}
+
+/// Legacy direct status implementation retained for compatibility tests; the public `status`
+/// command now queries the running engine's local socket.
+#[allow(dead_code)]
 async fn status_cli(settings: Settings) -> Result<()> {
     validate_api_key_format(&settings.api_key).context("API key format check failed")?;
     let config = settings.to_grid_config()?;
@@ -1737,8 +1959,9 @@ async fn status_cli(settings: Settings) -> Result<()> {
     Ok(())
 }
 
-/// Stop a running grid through an explicit one-shot lifecycle command. The exit disposition is
-/// selected at stop time, never inferred from the strategy's original startup configuration.
+/// Legacy direct lifecycle implementation retained for compatibility tests; the public `stop`
+/// command now tells the running engine to execute this shutdown flow.
+#[allow(dead_code)]
 async fn stop_cli(settings: Settings, confirm_mainnet: Option<&str>) -> Result<()> {
     if settings.api_key.trim().is_empty()
         || settings.aptos_private_key.trim().is_empty()
@@ -2107,7 +2330,12 @@ async fn shadow_cli(settings: Settings, max_cycles: Option<usize>) -> Result<()>
 ///   3. If any open orders exist (no client-order ID), halt new submissions
 ///   4. If market is empty and desired levels exist, submit the **full** desired plan
 ///   5. Persist every step to an append-only event journal
-async fn run_cli(settings: Settings, execute: bool, confirm_mainnet: Option<&str>) -> Result<()> {
+async fn run_cli(
+    settings: Settings,
+    execute: bool,
+    confirm_mainnet: Option<&str>,
+    engine_runtime: Option<control::EngineHandle>,
+) -> Result<()> {
     if execute
         && (settings.api_key.trim().is_empty()
             || settings.aptos_private_key.trim().is_empty()
@@ -2248,14 +2476,14 @@ async fn run_cli(settings: Settings, execute: bool, confirm_mainnet: Option<&str
     let mut paused_by_breakout = false;
     // A submission-failure circuit breaker also cancels and pauses without liquidating.
     let mut paused_by_failure_circuit = false;
+    // Local PFS preflight rejections and submitted-chain failures are intentionally independent.
+    let mut consecutive_local_preflight_rejections = 0usize;
     let mut consecutive_bulk_failures = 0usize;
-    // Set only after the startup base target is actually reached. A failed/partial funding
-    // attempt must be retried on a later cycle instead of permanently disabling funding.
-    let mut spot_base_funded_this_run = run_state
-        .spot_runtime
-        .as_ref()
-        .is_some_and(|state| state.base_funded);
-    let mut spot_base_funding_attempts: usize = 0;
+    // Bootstrap eligibility is always derived from the newest PFS snapshot. Never cache a
+    // historical "funded" success: fills, withdrawals, and a changed pinned plan can all make
+    // an old success record unsafe.
+    let mut consecutive_spot_funding_failures: usize = 0;
+    let mut paused_by_spot_funding_circuit = false;
     // Spot grid geometry is initialized once per process and then pinned. A moving mid may
     // detect fills and trigger replacement, but it must never move the configured boundaries or
     // regenerate prices; otherwise the strategy becomes a moving target instead of a grid.
@@ -2283,10 +2511,24 @@ async fn run_cli(settings: Settings, execute: bool, confirm_mainnet: Option<&str
     let mut last_market: Option<Market> = None;
     // A shared cancellation token so every long `.await` in the loop body can bail promptly
     // on Ctrl+C rather than only checking between sleep-drain cycles.
-    let cancel = Arc::new(AtomicBool::new(false));
+    let cancel = engine_runtime
+        .as_ref()
+        .map(|runtime| runtime.cancel())
+        .unwrap_or_else(|| Arc::new(AtomicBool::new(false)));
     {
         let cancel = Arc::clone(&cancel);
         tokio::spawn(async move {
+            #[cfg(unix)]
+            {
+                use tokio::signal::unix::{SignalKind, signal};
+                let mut terminate =
+                    signal(SignalKind::terminate()).expect("install SIGTERM handler");
+                tokio::select! {
+                    _ = tokio::signal::ctrl_c() => {}
+                    _ = terminate.recv() => {}
+                }
+            }
+            #[cfg(not(unix))]
             tokio::signal::ctrl_c().await.ok();
             cancel.store(true, Ordering::Relaxed);
             println!("\nShutdown requested.");
@@ -2330,6 +2572,42 @@ async fn run_cli(settings: Settings, execute: bool, confirm_mainnet: Option<&str
             }
         };
         check_cancel!();
+        if let Some(runtime) = &engine_runtime {
+            let mid = snapshot.plan.mid.to_string();
+            let ladder = snapshot
+                .plan
+                .all_levels()
+                .map(|level| decibel_grid_tui::control::LadderLevel {
+                    side: format!("{:?}", level.side),
+                    price: level.price.to_string(),
+                    size: level.size.to_string(),
+                    state: format!("{:?}", level.state),
+                })
+                .collect();
+            let funds = snapshot.account.spot_funds.as_ref().map(|funds| {
+                (
+                    funds.base_symbol.clone(),
+                    funds.base_balance.to_string(),
+                    funds.quote_symbol.clone(),
+                    funds.quote_balance.to_string(),
+                )
+            });
+            runtime
+                .update_status(|status| {
+                    status.phase = "running".to_owned();
+                    status.last_cycle_at = Some(Utc::now());
+                    status.mid = Some(mid);
+                    status.last_error = None;
+                    status.ladder = ladder;
+                    if let Some((base_symbol, base_balance, quote_symbol, quote_balance)) = funds {
+                        status.pfs_base_symbol = Some(base_symbol);
+                        status.pfs_base_balance = Some(base_balance);
+                        status.pfs_quote_symbol = Some(quote_symbol);
+                        status.pfs_quote_balance = Some(quote_balance);
+                    }
+                })
+                .await;
+        }
         // Rebuild the plan without trade-history markers. Historical fills are a UI hint and
         // must not suppress a future desired order during reconciliation or execution.
         let mut snapshot = snapshot;
@@ -2380,6 +2658,24 @@ async fn run_cli(settings: Settings, execute: bool, confirm_mainnet: Option<&str
                     Err(error) => eprintln!("Spot stop-loss liquidation failed: {error:#}"),
                 }
                 break;
+            }
+            // Upgrade pre-uniform persisted state once, retaining its price geometry while
+            // introducing the fixed per-grid base size used by every later replacement.
+            if pinned_spot_plan
+                .as_ref()
+                .is_some_and(|plan| plan.per_grid_base_size.is_none())
+            {
+                let upgraded = pinned_spot_plan
+                    .as_ref()
+                    .expect("checked above")
+                    .pin_spot_per_grid_base_size(&config, &snapshot.market)?;
+                println!(
+                    "Migrated persisted Spot grid to fixed per-grid size {}.",
+                    upgraded
+                        .per_grid_base_size
+                        .expect("Spot migration sets per_grid_base_size")
+                );
+                pinned_spot_plan = Some(upgraded);
             }
             // Initialize the Spot geometry once. From the second cycle onward the plan's mid,
             // lower/upper bounds, prices, and per-level sizes are all pinned for this run.
@@ -2453,7 +2749,15 @@ async fn run_cli(settings: Settings, execute: bool, confirm_mainnet: Option<&str
                             other => other,
                         };
                         config.range = shifted_range;
-                        let shifted = build_plan(&config, &snapshot.market, mid)?;
+                        let fixed_size = pinned_spot_plan
+                            .as_ref()
+                            .and_then(|plan| plan.per_grid_base_size);
+                        let shifted = build_plan_with_per_grid_base_size(
+                            &config,
+                            &snapshot.market,
+                            mid,
+                            fixed_size,
+                        )?;
                         println!(
                             "RANGE BREAKOUT: {reason}; extended grid to [{}, {}]",
                             shifted.lower, shifted.upper
@@ -2469,6 +2773,24 @@ async fn run_cli(settings: Settings, execute: bool, confirm_mainnet: Option<&str
                 .as_ref()
                 .expect("Spot plan was pinned above");
             snapshot.plan = pinned.project_spot(mid, snapshot.market.tick_size)?;
+            if let Err(error) = snapshot.plan.enforce_spot_budget(&config) {
+                let reason = format!(
+                    "fixed Spot per-grid size no longer fits the configured budget after re-centering: {error:#}"
+                );
+                eprintln!("RISK REJECTED: {reason}");
+                if let Some(journal) = &journal {
+                    let event = journal::JournalEvent::RiskRejected {
+                        at: Utc::now(),
+                        reason,
+                    };
+                    journal.append(&event)?;
+                    run_state.apply(&event);
+                    journal.save_state(&run_state)?;
+                }
+                check_cancel!();
+                tokio::time::sleep(config.refresh).await;
+                continue;
+            }
         } else {
             snapshot.plan = build_plan(&config, &snapshot.market, snapshot.plan.mid)?;
         }
@@ -2493,20 +2815,16 @@ async fn run_cli(settings: Settings, execute: bool, confirm_mainnet: Option<&str
                 }
             };
             check_cancel!();
-            // Funding is one-shot per process: buy enough APT to cover the ask side, but only
-            // when no bulk is resting (first cycle).  This runs BEFORE fit_spot_snapshot_to_pfs
-            // so the plan still reflects the full configured (pre-shrink) base_required.
+            // Every bootstrap decision comes from the current PFS snapshot. This same shortfall
+            // helper is used at startup, after fills/re-centering, and before bulk submission.
             if config.spot.auto_convert_missing_base
-                && !spot_base_funded_this_run
-                && spot_base_funding_attempts < config.spot.entry_exit_max_attempts
+                && !paused_by_spot_funding_circuit
                 && snapshot.market.product == Product::Spot
                 && let Some(funds) = &snapshot.account.spot_funds
-                && funds.available_base_for_bulk() < snapshot.plan.base_required
+                && let Some(base_gap) =
+                    decibel_grid_tui::spot_base_shortfall(&snapshot.plan, funds, &snapshot.market)
                 && decibel_grid_tui::reconcile::blocking_orders(&actual).is_empty()
             {
-                spot_base_funding_attempts += 1;
-                let base_gap = (snapshot.plan.base_required - funds.available_base_for_bulk())
-                    .max(Decimal::ZERO);
                 let quote_spare = (funds.available_quote_for_bulk() - snapshot.plan.quote_required)
                     .max(Decimal::ZERO);
                 let funding_result = spot_taker::execute_guarded_spot_ioc(
@@ -2543,43 +2861,75 @@ async fn run_cli(settings: Settings, execute: bool, confirm_mainnet: Option<&str
                 {
                     Ok(account) => {
                         snapshot.account = account;
-                        let available_base = snapshot
-                            .account
-                            .spot_funds
-                            .as_ref()
-                            .map(|updated| updated.available_base_for_bulk())
-                            .unwrap_or(Decimal::ZERO);
                         let accepted_partial = funding_result.as_ref().is_ok_and(|funding| {
                             base_gap > Decimal::ZERO
                                 && funding.filled_total / base_gap
                                     >= config.spot.entry_min_fill_ratio
                         });
-                        if available_base >= snapshot.plan.base_required {
-                            spot_base_funded_this_run = true;
+                        let available_base = snapshot
+                            .account
+                            .spot_funds
+                            .as_ref()
+                            .expect("Spot funds refreshed")
+                            .available_base_for_bulk();
+                        let needed_base = snapshot.plan.base_required;
+                        if available_base >= needed_base {
+                            consecutive_spot_funding_failures = 0;
                             println!(
                                 "Spot base funding target reached; proceeding to the full pinned grid."
                             );
                         } else if accepted_partial {
-                            let resized = pinned_spot_plan
-                                .as_ref()
-                                .expect("Spot plan was pinned before entry funding")
-                                .resize_asks_to_available_base(available_base, &snapshot.market)?;
-                            pinned_spot_plan = Some(resized);
-                            snapshot.plan = pinned_spot_plan
-                                .as_ref()
-                                .expect("resized Spot plan was stored")
-                                .project_spot(snapshot.plan.mid, snapshot.market.tick_size)?;
-                            spot_base_funded_this_run = true;
-                            println!(
-                                "Spot entry met the {:.2}% minimum fill ratio; ask sizes were reduced to actual PFS base.",
-                                config.spot.entry_min_fill_ratio * Decimal::from(100)
-                            );
-                        } else if spot_base_funding_attempts >= config.spot.entry_exit_max_attempts
-                        {
-                            eprintln!(
-                                "Spot base funding exhausted {} startup attempts; grid remains paused until manual funding.",
-                                config.spot.entry_exit_max_attempts
-                            );
+                            let reduced = snapshot
+                                .plan
+                                .reduce_asks_to_available_base(available_base)?;
+                            let dropped = snapshot.plan.asks.len() - reduced.asks.len();
+                            let received_ratio = if needed_base > Decimal::ZERO {
+                                available_base / needed_base
+                            } else {
+                                Decimal::ONE
+                            };
+                            if reduced.asks.is_empty() {
+                                eprintln!(
+                                    "Spot entry received {:.2}% of required base but cannot fund even one ask level; startup remains failed.",
+                                    received_ratio * Decimal::from(100)
+                                );
+                            } else {
+                                println!(
+                                    "Spot entry received {:.2}% of required base ({} available vs {} needed); reduced asks from {} to {} and dropped {} unfundable level(s).",
+                                    received_ratio * Decimal::from(100),
+                                    available_base,
+                                    needed_base,
+                                    snapshot.plan.asks.len(),
+                                    reduced.asks.len(),
+                                    dropped
+                                );
+                                pinned_spot_plan = Some(reduced.clone());
+                                snapshot.plan = reduced
+                                    .project_spot(snapshot.plan.mid, snapshot.market.tick_size)?;
+                                consecutive_spot_funding_failures = 0;
+                            }
+                        } else {
+                            consecutive_spot_funding_failures += 1;
+                            if consecutive_spot_funding_failures
+                                >= config.spot.entry_exit_max_attempts
+                            {
+                                paused_by_spot_funding_circuit = true;
+                                let reason = format!(
+                                    "Spot entry funding failed to reach the {:.2}% minimum fill ratio {} consecutive time(s); paused pending manual intervention",
+                                    config.spot.entry_min_fill_ratio * Decimal::from(100),
+                                    consecutive_spot_funding_failures
+                                );
+                                eprintln!("RISK REJECTED: {reason}");
+                                if let Some(journal) = &journal {
+                                    let event = journal::JournalEvent::RiskRejected {
+                                        at: Utc::now(),
+                                        reason,
+                                    };
+                                    journal.append(&event)?;
+                                    run_state.apply(&event);
+                                    journal.save_state(&run_state)?;
+                                }
+                            }
                         }
                     }
                     Err(error) => eprintln!("  balance refresh after funding failed: {error:#}"),
@@ -2589,6 +2939,39 @@ async fn run_cli(settings: Settings, execute: bool, confirm_mainnet: Option<&str
             // one-way by design: preserve the bid reserve and buy only the missing ask inventory.
             check_cancel!();
             actual_for_execution = Some(actual);
+        }
+
+        // This runs even when the remaining gap is smaller than one legal IOC. Such a gap is not
+        // sufficient to claim the full ladder is funded, but it can fund fewer whole ask levels.
+        if execute
+            && snapshot.market.product == Product::Spot
+            && actual_for_execution.as_ref().is_some_and(|orders| {
+                decibel_grid_tui::reconcile::blocking_orders(orders).is_empty()
+            })
+            && let Some(funds) = &snapshot.account.spot_funds
+            && funds.available_base_for_bulk() < snapshot.plan.base_required
+        {
+            let reduced = snapshot
+                .plan
+                .reduce_asks_to_available_base(funds.available_base_for_bulk())?;
+            if !reduced.asks.is_empty() && reduced.asks.len() < snapshot.plan.asks.len() {
+                let dropped = snapshot.plan.asks.len() - reduced.asks.len();
+                let ratio = funds.available_base_for_bulk() / snapshot.plan.base_required;
+                println!(
+                    "Spot base is {:.2}% funded ({} available vs {} needed); reduced asks from {} to {} and dropped {} unfundable level(s).",
+                    ratio * Decimal::from(100),
+                    funds.available_base_for_bulk(),
+                    snapshot.plan.base_required,
+                    snapshot.plan.asks.len(),
+                    reduced.asks.len(),
+                    dropped
+                );
+                pinned_spot_plan = Some(reduced.clone());
+                snapshot.plan =
+                    reduced.project_spot(snapshot.plan.mid, snapshot.market.tick_size)?;
+            } else if reduced.asks.is_empty() {
+                eprintln!("Spot base cannot fund even one ask level; full ladder remains blocked.");
+            }
         }
 
         if let Some(adjustment) = fit_spot_snapshot_to_pfs(&mut snapshot)? {
@@ -2601,7 +2984,6 @@ async fn run_cli(settings: Settings, execute: bool, confirm_mainnet: Option<&str
             run_state.spot_runtime = Some(journal::SpotRuntimeState {
                 pinned_plan: pinned_plan.clone(),
                 last_seen_trade_ms,
-                base_funded: spot_base_funded_this_run,
             });
         }
         if let Some(journal) = &journal {
@@ -2635,6 +3017,23 @@ async fn run_cli(settings: Settings, execute: bool, confirm_mainnet: Option<&str
             );
 
             println!("RECONCILE CYCLE — {}", reconcile_result.summary());
+            if let Some(runtime) = &engine_runtime {
+                let matched = reconcile_result.matched.len();
+                let missing = reconcile_result.missing.len();
+                let unmanaged = reconcile_result.unmanaged.len();
+                runtime
+                    .update_status(|status| {
+                        status.matched = Some(matched);
+                        status.missing = Some(missing);
+                        status.unmanaged = Some(unmanaged);
+                        status.events.push(decibel_grid_tui::control::EngineEvent {
+                            at: Utc::now(),
+                            message: format!("reconcile: {matched} matched, {missing} missing, {unmanaged} unmanaged"),
+                        });
+                        if status.events.len() > 200 { status.events.drain(..status.events.len() - 200); }
+                    })
+                    .await;
+            }
             if let Some(journal) = &journal {
                 let event = journal::JournalEvent::ReconciliationResult {
                     at: Utc::now(),
@@ -2684,7 +3083,12 @@ async fn run_cli(settings: Settings, execute: bool, confirm_mainnet: Option<&str
                 if snapshot.market.product == Product::Spot
                     && let Some(funds) = &snapshot.account.spot_funds
                     && (funds.available_quote_for_bulk() < exec_plan.quote_required
-                        || funds.available_base_for_bulk() < exec_plan.base_required)
+                        || decibel_grid_tui::spot_base_shortfall(
+                            &exec_plan,
+                            funds,
+                            &snapshot.market,
+                        )
+                        .is_some())
                 {
                     let account = api
                         .account(Some(&settings.subaccount), &snapshot.market)
@@ -2694,7 +3098,12 @@ async fn run_cli(settings: Settings, execute: bool, confirm_mainnet: Option<&str
                         .and_then(|a| a.spot_funds)
                         .unwrap_or_else(|| funds.clone());
                     if fresh_funds.available_quote_for_bulk() < exec_plan.quote_required
-                        || fresh_funds.available_base_for_bulk() < exec_plan.base_required
+                        || decibel_grid_tui::spot_base_shortfall(
+                            &exec_plan,
+                            &fresh_funds,
+                            &snapshot.market,
+                        )
+                        .is_some()
                     {
                         // Never shrink a pinned ladder to fit: that silently converts the
                         // configured grid into a different, narrower one. Skip the submission
@@ -2710,9 +3119,32 @@ async fn run_cli(settings: Settings, execute: bool, confirm_mainnet: Option<&str
                 }
 
                 if let Some(shortfall) = spot_underfunded {
-                    println!(
-                        "  bulk replacement skipped: pinned Spot grid is underfunded - {shortfall}"
+                    consecutive_local_preflight_rejections =
+                        consecutive_local_preflight_rejections.saturating_add(1);
+                    eprintln!(
+                        "  LOCAL PFS PRECHECK REJECTED ({}/{}): {shortfall}",
+                        consecutive_local_preflight_rejections, config.spot.entry_exit_max_attempts
                     );
+                    if consecutive_local_preflight_rejections >= config.spot.entry_exit_max_attempts
+                    {
+                        let reason = format!(
+                            "{} consecutive local PFS precheck rejections; inspect funding and bootstrap logic",
+                            consecutive_local_preflight_rejections
+                        );
+                        eprintln!(
+                            "LOCAL PRECHECK CIRCUIT BREAKER: {reason}; pausing automatic replacement."
+                        );
+                        paused_by_failure_circuit = true;
+                        if let Some(journal) = &journal {
+                            let event = journal::JournalEvent::RiskRejected {
+                                at: Utc::now(),
+                                reason,
+                            };
+                            journal.append(&event)?;
+                            run_state.apply(&event);
+                            journal.save_state(&run_state)?;
+                        }
+                    }
                     if let Some(journal) = &journal {
                         let event = journal::JournalEvent::RiskRejected {
                             at: Utc::now(),
@@ -2722,108 +3154,112 @@ async fn run_cli(settings: Settings, execute: bool, confirm_mainnet: Option<&str
                         run_state.apply(&event);
                         journal.save_state(&run_state)?;
                     }
-                } else if exec_plan.bids.is_empty() && exec_plan.asks.is_empty() {
-                    println!("  No levels can be placed (budget exhausted).");
                 } else {
-                    let desired_level_count = exec_plan.bids.len() + exec_plan.asks.len();
-                    let structural_change = new_trade_observed
-                        || last_submitted_level_count
-                            .is_none_or(|previous| previous != desired_level_count);
-                    let cooldown_active = last_bulk_replacement_at
-                        .is_some_and(|submitted| submitted.elapsed() < BULK_REPLACEMENT_COOLDOWN);
-                    if cooldown_active && !structural_change {
-                        println!(
-                            "  bulk replacement skipped: minor ladder drift during {}s cooldown ({} desired levels; no level-count change)",
-                            BULK_REPLACEMENT_COOLDOWN.as_secs(),
-                            desired_level_count
-                        );
+                    consecutive_local_preflight_rejections = 0;
+                    if exec_plan.bids.is_empty() && exec_plan.asks.is_empty() {
+                        println!("  No levels can be placed (budget exhausted).");
                     } else {
-                        match execute_bulk_grid(
-                            &settings.network,
-                            &settings.api_key,
-                            &settings.aptos_private_key,
-                            &settings.subaccount,
-                            &snapshot.market,
-                            &exec_plan,
-                        )
-                        .await
-                        {
-                            Ok(execution) => {
-                                consecutive_bulk_failures = 0;
-                                last_bulk_replacement_at = Some(tokio::time::Instant::now());
-                                last_submitted_level_count =
-                                    Some(execution.bid_count + execution.ask_count);
-                                println!(
-                                    "  FULL ladder replaced: {} bid(s), {} ask(s) in tx {}",
-                                    execution.bid_count,
-                                    execution.ask_count,
-                                    execution.transaction_hash
-                                );
-                                if let Some(journal) = &journal {
-                                    let event = journal::JournalEvent::BulkOrderSubmitted {
-                                        at: Utc::now(),
-                                        transaction_hash: execution.transaction_hash,
-                                        bid_count: execution.bid_count,
-                                        ask_count: execution.ask_count,
-                                    };
-                                    journal.append(&event)?;
-                                    run_state.apply(&event);
-                                    journal.save_state(&run_state)?;
-                                }
-                            }
-                            Err(error) => {
-                                consecutive_bulk_failures =
-                                    consecutive_bulk_failures.saturating_add(1);
-                                eprintln!(
-                                    "  bulk order failed ({}/{}): {error:#}",
-                                    consecutive_bulk_failures,
-                                    config.spot.max_consecutive_bulk_failures
-                                );
-                                if let Some(journal) = &journal {
-                                    let event = journal::JournalEvent::BulkOrderFailed {
-                                        at: Utc::now(),
-                                        error: format!("{error:#}"),
-                                    };
-                                    journal.append(&event)?;
-                                    run_state.apply(&event);
-                                    journal.save_state(&run_state)?;
-                                }
-                                if consecutive_bulk_failures
-                                    >= config.spot.max_consecutive_bulk_failures
-                                {
-                                    let reason = format!(
-                                        "{} consecutive bulk replacement failures",
-                                        consecutive_bulk_failures
-                                    );
-                                    eprintln!(
-                                        "FAILURE CIRCUIT BREAKER: {reason}; cancelling ladder and pausing."
+                        let desired_level_count = exec_plan.bids.len() + exec_plan.asks.len();
+                        let structural_change = new_trade_observed
+                            || last_submitted_level_count
+                                .is_none_or(|previous| previous != desired_level_count);
+                        let cooldown_active = last_bulk_replacement_at.is_some_and(|submitted| {
+                            submitted.elapsed() < BULK_REPLACEMENT_COOLDOWN
+                        });
+                        if cooldown_active && !structural_change {
+                            println!(
+                                "  bulk replacement skipped: minor ladder drift during {}s cooldown ({} desired levels; no level-count change)",
+                                BULK_REPLACEMENT_COOLDOWN.as_secs(),
+                                desired_level_count
+                            );
+                        } else {
+                            match execute_bulk_grid(
+                                &settings.network,
+                                &settings.api_key,
+                                &settings.aptos_private_key,
+                                &settings.subaccount,
+                                &snapshot.market,
+                                &exec_plan,
+                            )
+                            .await
+                            {
+                                Ok(execution) => {
+                                    consecutive_bulk_failures = 0;
+                                    last_bulk_replacement_at = Some(tokio::time::Instant::now());
+                                    last_submitted_level_count =
+                                        Some(execution.bid_count + execution.ask_count);
+                                    println!(
+                                        "  FULL ladder replaced: {} bid(s), {} ask(s) in tx {}",
+                                        execution.bid_count,
+                                        execution.ask_count,
+                                        execution.transaction_hash
                                     );
                                     if let Some(journal) = &journal {
-                                        let event = journal::JournalEvent::RiskRejected {
+                                        let event = journal::JournalEvent::BulkOrderSubmitted {
                                             at: Utc::now(),
-                                            reason,
+                                            transaction_hash: execution.transaction_hash,
+                                            bid_count: execution.bid_count,
+                                            ask_count: execution.ask_count,
                                         };
                                         journal.append(&event)?;
                                         run_state.apply(&event);
                                         journal.save_state(&run_state)?;
                                     }
-                                    match spot_lifecycle::cancel_bulk_ladder(
-                                        &settings.network,
-                                        &settings.aptos_private_key,
-                                        &settings.subaccount,
-                                        &snapshot.market,
-                                    )
-                                    .await
-                                    {
-                                        Ok(hash) => println!(
-                                            "Failure-circuit cancellation submitted in tx {hash}"
-                                        ),
-                                        Err(cancel_error) => eprintln!(
-                                            "Failure-circuit cancellation failed: {cancel_error:#}"
-                                        ),
+                                }
+                                Err(error) => {
+                                    consecutive_bulk_failures =
+                                        consecutive_bulk_failures.saturating_add(1);
+                                    eprintln!(
+                                        "  bulk order failed ({}/{}): {error:#}",
+                                        consecutive_bulk_failures,
+                                        config.spot.max_consecutive_bulk_failures
+                                    );
+                                    if let Some(journal) = &journal {
+                                        let event = journal::JournalEvent::BulkOrderFailed {
+                                            at: Utc::now(),
+                                            error: format!("{error:#}"),
+                                        };
+                                        journal.append(&event)?;
+                                        run_state.apply(&event);
+                                        journal.save_state(&run_state)?;
                                     }
-                                    paused_by_failure_circuit = true;
-                                    break;
+                                    if consecutive_bulk_failures
+                                        >= config.spot.max_consecutive_bulk_failures
+                                    {
+                                        let reason = format!(
+                                            "{} consecutive bulk replacement failures",
+                                            consecutive_bulk_failures
+                                        );
+                                        eprintln!(
+                                            "FAILURE CIRCUIT BREAKER: {reason}; cancelling ladder and pausing."
+                                        );
+                                        if let Some(journal) = &journal {
+                                            let event = journal::JournalEvent::RiskRejected {
+                                                at: Utc::now(),
+                                                reason,
+                                            };
+                                            journal.append(&event)?;
+                                            run_state.apply(&event);
+                                            journal.save_state(&run_state)?;
+                                        }
+                                        match spot_lifecycle::cancel_bulk_ladder(
+                                            &settings.network,
+                                            &settings.aptos_private_key,
+                                            &settings.subaccount,
+                                            &snapshot.market,
+                                        )
+                                        .await
+                                        {
+                                            Ok(hash) => println!(
+                                                "Failure-circuit cancellation submitted in tx {hash}"
+                                            ),
+                                            Err(cancel_error) => eprintln!(
+                                                "Failure-circuit cancellation failed: {cancel_error:#}"
+                                            ),
+                                        }
+                                        paused_by_failure_circuit = true;
+                                        break;
+                                    }
                                 }
                             }
                         }
@@ -2847,6 +3283,13 @@ async fn run_cli(settings: Settings, execute: bool, confirm_mainnet: Option<&str
                     event = spot_event_rx.recv() => match event {
                         Some(events::SpotEvent::BulkFill(fill)) => {
                             println!("Spot bulk fill {} {} at {}; reconciling immediately.", fill.size, fill.market_addr, fill.price);
+                            if let Some(runtime) = &engine_runtime {
+                                let message = format!("fill: {} {} at {}", fill.size, fill.market_addr, fill.price);
+                                runtime.update_status(|status| {
+                                    status.events.push(decibel_grid_tui::control::EngineEvent { at: Utc::now(), message });
+                                    if status.events.len() > 200 { status.events.drain(..status.events.len() - 200); }
+                                }).await;
+                            }
                             if let Some(journal) = &journal {
                                 let event = journal::JournalEvent::SpotFill {
                                     at: Utc::now(),
@@ -2864,6 +3307,13 @@ async fn run_cli(settings: Settings, execute: bool, confirm_mainnet: Option<&str
                         }
                         Some(events::SpotEvent::BulkOrderRejected(rejected)) => {
                             eprintln!("Spot bulk order rejected for {}: {}; reconciling immediately.", rejected.market_addr, rejected.reason);
+                            if let Some(runtime) = &engine_runtime {
+                                let message = format!("bulk rejected: {}", rejected.reason);
+                                runtime.update_status(|status| {
+                                    status.events.push(decibel_grid_tui::control::EngineEvent { at: Utc::now(), message });
+                                    if status.events.len() > 200 { status.events.drain(..status.events.len() - 200); }
+                                }).await;
+                            }
                             if let Some(journal) = &journal {
                                 let event = journal::JournalEvent::RiskRejected {
                                     at: Utc::now(),
@@ -2893,6 +3343,14 @@ async fn run_cli(settings: Settings, execute: bool, confirm_mainnet: Option<&str
         check_cancel!();
     }
 
+    let exit_policy = engine_runtime
+        .as_ref()
+        .and_then(|runtime| runtime.requested_exit_mode())
+        .map(|mode| match mode {
+            control::ExitMode::Hold => ExitAssetPolicy::Retain,
+            control::ExitMode::Liquidate => ExitAssetPolicy::Sell,
+        })
+        .unwrap_or(settings.exit_asset_policy);
     if paused_by_breakout || paused_by_failure_circuit {
         println!(
             "Risk pause complete: ladder cancellation was attempted; assets were not liquidated."
@@ -2901,7 +3359,7 @@ async fn run_cli(settings: Settings, execute: bool, confirm_mainnet: Option<&str
         println!("Stop-loss already liquidated this market; skipping the exit sell policy.");
     } else if execute {
         if let Some(market) = last_market {
-            match settings.exit_asset_policy {
+            match exit_policy {
                 ExitAssetPolicy::Sell => {
                     println!(
                         "Exit policy is SELL: cancelling the ladder and liquidating assets..."

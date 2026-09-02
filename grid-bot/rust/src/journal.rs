@@ -103,7 +103,6 @@ pub struct SpotRuntimeState {
     /// from silently rebuilding a different range around the then-current mid price.
     pub pinned_plan: GridPlan,
     pub last_seen_trade_ms: Option<i64>,
-    pub base_funded: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

@@ -12,158 +12,216 @@ grid-bot/rust
 - Spot bulk 执行只使用 Subaccount 的 **PFS**(`spot.positions`)余额；Cross/CBS 中的 quote 不能直接用于 `place_spot_bulk_order_to_subaccount`。
 - Spot 成交后的资产默认可能路由到 Cross。为避免卖出所得 USDC 不能被下一轮 bulk 买单使用,应将已有 Cross USDC 转回 PFS,并设置 `HOLD_AS_NON_COLLATERAL=true` 让未来成交继续留在 PFS。**`set_hold_as_non_collateral_for_subaccount` 只能由 subaccount owner 本人调用**(`dex_accounts::get_subaccount_signer_if_owner`,不接受 delegate),因此本工具不会代为提交这笔交易,只会提示你手动在 Decibel UI/钱包中完成。Cross→PFS 转账走 `transfer_assets_between_non_collateral_and_collateral`,可由 owner 或拥有 `ChangingCollateralFundsMovement` 权限的 delegate 签名,本工具的 API 私钥若只是 delegate 也能提交这一笔。
 - TUI 的 Spot Preview/Monitor 页面会显示 Cross USDC 警告,并提示需手动设置 HOLD_AS_NON_COLLATERAL;按 `U` 打开资金设置弹窗,输入要转回 PFS 的 USDC 数量后按 Enter,只提交 Cross→PFS 转账一笔交易。不会在刷新或下单循环中自动转账,也不会尝试提交 owner-only 的 routing 设置交易。
-- **Spot 首次铺网格时会自动买入缺口 base 库存**(见下节)。这只发生在链上尚无 bulk ladder 时;之后的每轮刷新都不会再自动买入。
+- **Spot 引擎每轮都以当前 PFS base 余额计算缺口**；达到最小订单量时才会走有固定滑点上限的 IOC 建仓。连续失败达到阈值后会暂停并告警，不会无限支付 taker fee。详见“Spot 固定每档数量、建仓与风险门禁”。
 
 - 每次执行前先 **reconcile**(对比期望网格与交易所实际订单)。由于 bulk API 没有 client-order-id，只要市场已存在任何订单，CLI Live 模式就不会提交 bulk replacement。
 - 主网执行需要 `--confirm-mainnet MAINNET` 显式确认。
 - 每个 Live/Shadow 运行写入 append-only event journal(JSON Lines)，默认状态记录在 `~/.local/share/decibel-grid/runs/<run_id>/`；受限容器可设 `DECIBEL_GRID_DATA_DIR` 覆盖根目录。
 - journal 不保存原始子账户地址，仅保存不可逆 SHA3-256 指纹。
 
-## CLI 命令
+## 当前使用方式
 
-| 命令 | 行为 |
-|------|------|
-| `check-key` | 验证 API key 格式 + 远程连通性 |
-| `status` | 一次快照（市场、计划、账户、成交） |
-| `reconcile` | 一次 reconcile（快照 + 期望 vs 实际订单对比） |
-| `doctor` | 完整前置检查：API key、市场规则、计划、余额、reconciliation |
-| `run` | 持续循环：fetch → 打印快照；（加 `-e` 后 reconcile → 仅在安全时替换整个 ladder） |
-| `shadow` | 持续 fetch + PFS 适配 + reconcile + journal;绝不签名、提交、取消或转账 |
-| `spot-funding-setup` | 显式设置 USDC future settlement 路由，并可将 Cross USDC 转入 PFS |
-| `tui` | TUI 配置与监控 |
-| `preview` | 直接进入 TUI Preview 标签 |
+> **真实交易入口只有常驻引擎。** `start` 启动引擎；`status`、`logs`、`attach`、`stop` 是本地瘦客户端，不会各自签名、提交订单或另起交易循环。旧 `run` 已退役，会明确报错。
 
-CLI 命令支持 `--log-file PATH`：启动时覆盖旧文件，并将 stdout/stderr（包括错误和 panic 输出）写入该文件。适合 `run -e` 长时间运行后交给我分析；该选项不适用于 TUI/Preview。
+### 1. 首次配置与只读检查
 
 ```bash
-# 覆盖写入 /tmp/decibel-spot.log；目录不存在时会自动创建
-cargo run -- run -e \
-  --log-file /tmp/decibel-spot.log \
-  --product spot --market APT/USDC --subaccount 0x... \
-  --aptos-private-key 0x... --decibel-api-key ...
+cd grid-bot/rust
+cp .env.example .env
+chmod 600 .env
 
-# 也可用环境变量 LOG_FILE=/tmp/decibel-spot.log
-```
-
-所有 read-only 命令都不修改交易所状态。
-
-## 退出时资产策略
-
-`--exit-asset-policy` 控制进程收到退出信号或 TUI 按 `q`/`Ctrl+C` 时的处理方式，也可用环境变量 `EXIT_ASSET_POLICY` 设置：
-
-- `retain`（默认）：取消进程不会主动卖出 Spot base，也不会平 Perp 仓位；资产和仓位保留。
-- `sell`：仅在明确选择后执行退出清理。程序先取消当前市场的 bulk ladder；Spot 用 IOC 卖出可用 base；Perp 用 reduce-only IOC 订单平掉当前仓位。
-
-```bash
-# 默认保留资产
-cargo run -- run -e --exit-asset-policy retain ...
-
-# 明确退出时清理 Spot base / Perp 仓位
-cargo run -- run -e --exit-asset-policy sell ...
-# 或：EXIT_ASSET_POLICY=sell cargo run -- run -e ...
-```
-
-`sell` 使用有界 IOC 价格，不保证在极端流动性不足时完全成交；退出清理失败会保留错误并停止继续尝试，不会循环追单。使用前应确认私钥账户有足够 APT 支付取消和退出交易 gas。TUI Configure 页的 **Exit Asset Policy / 退出资产策略** 字段与 CLI 使用同一配置，并可通过 `Ctrl+S` 保存到 profile。
-
-## 启动方式
-
-```bash
-# 无参数 → TUI 配置
-cargo run --
-
-# 完整的网格参数 → TUI 监控
-cargo run -- --product spot --market APT/USDC --subaccount 0x... \
-  --range-percent 5 --grid-count 40 --total-budget 1000
-
-# CLI 持续监控
-cargo run -- run --product spot --market APT/USDC ...
-
-# CLI 执行（主网需额外确认）
-cargo run -- run -e --product perp --market BTC/USD \
-  --subaccount 0x... \
-  --aptos-private-key 0x... \
-  -e
-# 主网:
-cargo run -- run -e --network mainnet --confirm-mainnet MAINNET \
-  --product spot --market APT/USDC ...
-
-# 前置检查
+cargo run -- check-key --network testnet
 cargo run -- doctor --product spot --market APT/USDC --subaccount 0x...
-
-# Spot 资金初始化：设置未来成交留在 PFS，并把指定 Cross USDC 转回 PFS
-# amount 使用人类可读 USDC 数量；0 只设置路由，不转账
-cargo run -- spot-funding-setup \
-  --network testnet \
-  --subaccount 0xYOUR_SUBACCOUNT \
-  --aptos-private-key 0xYOUR_PRIVATE_KEY \
-  --spot-funding-amount 945.910599
-
-# 主网必须显式指定该网络的 USDC metadata 地址
-cargo run -- spot-funding-setup \
-  --network mainnet \
-  --subaccount 0xYOUR_SUBACCOUNT \
-  --aptos-private-key 0xYOUR_PRIVATE_KEY \
-  --spot-funding-metadata 0xYOUR_MAINNET_USDC_METADATA \
-  --spot-funding-amount 100
+cargo run -- reconcile --product spot --market APT/USDC --subaccount 0x...
 ```
 
-## Spot Cross → PFS 资金闭环
+真实 Spot 引擎需要 `APTOS_PRIVATE_KEY`、`SUBACCOUNT_ADDRESS` 与 `DECIBEL_API_KEY`。主网启动或停止引擎必须加 `--confirm-mainnet MAINNET`。
 
-Decibel Spot bulk 下单调用 `place_spot_bulk_order_to_subaccount`，资金从 subaccount 的 PFS（primary fungible store）读取；Cross/CBS 里的 USDC 不能直接作为 bulk 买单资金。另一方面，Spot 成交结算在默认路由下可能把卖出所得 USDC 放入 Cross。如果不处理，网格卖出几轮后会出现“Cross 有 USDC、PFS 没 USDC、bulk 买单 `EINSUFFICIENT_PFS_FUNDS`”的状态。
+### 2. 常驻引擎（推荐）
 
-建议在开始 Spot 网格前先由 subaccount owner 在 Decibel UI/钱包中设置 `HOLD_AS_NON_COLLATERAL=true`，因为 `set_hold_as_non_collateral_for_subaccount` 使用 owner-only 权限，本工具不会代为提交。然后执行 `spot-funding-setup`，只将已有 Cross USDC 转入 PFS:
+```bash
+# socket 就绪后立即返回；引擎继续运行
+cargo run -- start --network testnet --product spot --market APT/USDC --subaccount 0x...
 
-1. owner 手动调用/设置 `dex_accounts_spot_entry::set_hold_as_non_collateral_for_subaccount`，对 USDC 设置 `hold=true`，影响**未来**结算；不会搬运已有 Cross 余额。
-2. 本工具调用 `dex_accounts_entry::transfer_assets_between_non_collateral_and_collateral`，传入负的 `i64` amount，把 Cross 转入 PFS。正数方向是 PFS → Cross，负数方向是 Cross → PFS。
-3. 等待交易确认后重新运行 `doctor`，确认 PFS USDC 已增加。
+cargo run -- status --subaccount 0x...
+cargo run -- logs --subaccount 0x...
+cargo run -- logs -f --subaccount 0x...
+cargo run -- attach --subaccount 0x...
 
-Testnet USDC metadata：
+# 先撤 ladder，再保留资产或尝试清仓
+cargo run -- stop --subaccount 0x... --exit-mode hold
+cargo run -- stop --subaccount 0x... --exit-mode liquidate
+```
+
+每个 subaccount 的控制文件：
 
 ```text
-0x5428acf5c112826d0c74ae1cd2de9030f53d1d01235e6c2621d967bf914ee1c8
+/tmp/grid-bot/<normalized-subaccount>.sock  # 单行 JSON Unix socket
+/tmp/grid-bot/<normalized-subaccount>.pid   # 引擎 PID
+/tmp/grid-bot/<normalized-subaccount>.log   # 默认引擎日志
 ```
 
-例如转 `945.910599 USDC`,原始 amount 是 `-945910599`(USDC 6 位精度)。命令只执行 Cross→PFS 转账;不会提交 owner-only 的 routing 设置交易。
+`start` 检查 PID、socket 和账户文件锁；运行中的引擎持有同一把锁，因此同一 subaccount 不能有两个进程同时提交 bulk ladder。`status`、`logs`、`attach`、`stop` 不直接访问交易所或使用私钥。`attach` 的 Ctrl+C 只退出客户端，不会停止引擎。
 
-TUI 中进入 Preview 或 Monitor 后按 `U`,输入要从 Cross 转回 PFS 的 USDC 数量并按 Enter。TUI 会显示 Cross 余额提示，并明确提示必须由 owner 手动设置 HOLD 状态；TUI 只提交 Cross→PFS 转账。合约没有公开的只读 view 用来确认 HOLD 状态,因此 UI 不会伪造“已设置”状态。转账需要 subaccount owner,或拥有 `ChangingCollateralFundsMovement` 的 delegate;私钥会签署真实链上交易,请先核对 network、subaccount、metadata 和金额。
+引擎收到 `SIGINT` 或 `SIGTERM` 时执行和 `stop` 相同的优雅流程：先撤单，再按退出模式保留资产或清仓。不要手工删除仍在运行引擎的 PID 或 socket 文件。
 
-# 只读 reconcile
-cargo run -- reconcile --product perp --market BTC/USD --subaccount 0x...
+### 3. systemd 与 tmux
 
-# 持续 shadow reconciliation（不签名、不下单、不转账）
-cargo run -- shadow --product spot --market APT/USDC --subaccount 0x... \
-  --range-percent 5 --grid-count 20 --total-budget 500 --refresh-seconds 3
+`start` 仅用标准 `Command` 拉起内部前台 `engine`，没有 fork/双重 fork。生产环境应让 systemd 直接监管前台 `engine`：
 
-# 有界 Shadow：成功完成 N 次 reconciliation 后正常退出（适合 CI/Testnet 验证）
-cargo run -- shadow --product perp --market BTC/USD --subaccount 0x... \
-  --range-percent 5 --grid-count 20 --total-budget 500 --shadow-cycles 2
+```ini
+# /etc/systemd/system/decibel-grid.service
+[Unit]
+Description=Decibel grid engine
+After=network-online.target
 
-# 自定义 journal 存储目录（容器、受限环境等）
-# DECIBEL_GRID_DATA_DIR=/path/to/writable cargo run -- shadow ...
+[Service]
+Type=simple
+WorkingDirectory=/opt/decibel-grid
+ExecStart=/opt/decibel-grid/decibel-grid-tui engine --network mainnet --confirm-mainnet MAINNET --product spot --market APT/USDC --subaccount 0x...
+Restart=on-failure
+RestartSec=5
+EnvironmentFile=/opt/decibel-grid/.env
 
+[Install]
+WantedBy=multi-user.target
 ```
 
-## 执行流程（`run -e`）
+本机快速迭代可让 tmux 托管同一个前台命令：
 
-```
-循环:
-  1. 读取市场规则、价格、账户余额、未完成订单
-  2. Spot 时按 PFS 余额缩小网格（自动保留最靠近 mid 的可负担档位）
-  3. 打印快照 + 写入 event journal
-  4. Reconcile（期望档位 vs 实际挂单）
-  5. 若市场已存在任何订单 → 记录 RiskRejected 事件,跳过本轮（无法证明订单归属）
-  6. 仅在市场为空且有缺失档位时 → 提交完整 bulk 替换,记录 BulkOrderSubmitted/Failed 事件
-  7. 等待 refresh_interval
+```bash
+tmux new-session -d -s decibel-grid \
+  'cd /path/to/grid-bot/rust && cargo run -- engine --network testnet --product spot --market APT/USDC --subaccount 0x...'
+
+cargo run -- status --subaccount 0x...
+cargo run -- logs -f --subaccount 0x...
 ```
 
-### Spot 首次铺网格的 base 自动补足
+不要在 systemd/tmux 已有引擎时再次运行 `start`；锁会拒绝第二个实例。
 
-当 Spot 首次执行时，如果完整计划所需的 base 数量大于 PFS 当前余额，程序会先读取订单簿卖一价，使用有上限的 IOC 主动买单补足缺口，再重新读取 PFS 余额。补货金额只使用扣除完整 bid 资金预留后的 USDC 余量，不会挪用买单预算；补货完成后才提交完整 bulk ladder。
+### 4. TUI 与 Preview
 
-- 只在该 subaccount/market 没有现存 bulk ladder 时触发；后续刷新不会因为卖单成交而自动追买，避免用 taker 费把网格价差还回去。
-- IOC 限价会在 best ask 上方设置有限滑点上限；流动性不足或补货失败时不会宣称已补足。
-- 如果补货后仍未补齐(流动性不足、USDC 余量不够或补货报错)，程序会打印实际缺口，然后按现有余额缩减卖单侧并照常提交本轮 ladder——即回落到原来的行为，不会阻塞下单。
-- 例如总预算约 1000 USDC 时，约 500 USDC 可能被 bid 侧预留；剩余 USDC 才用于买入缺少的 APT。
+```bash
+cargo run -- tui
+cargo run -- preview --product spot --market APT/USDC --subaccount 0x...
+```
+
+TUI 只用于配置、预览和监控：**不能提交 bulk ladder，也不会在退出时清仓。** 真实交易通过常驻引擎完成。已有引擎运行时，优先使用 `attach` 或 `status`；TUI 是一次性快照，不是引擎控制台。
+
+`attach` 是独立的实时 ratatui 面板，通过 Unix socket 订阅类型化状态，不会调用或解析其它 CLI 命令的输出。连接后先收到完整快照，随后只接收引擎主动广播的状态变化；socket 断开后会显示“连接已断开，重连中”并以 1/2/4/8/16/30 秒退避自动重订阅：
+
+- 顶部按层次显示 `Connected` / `Subscribed`、账户/网络/REST 快照健康度，以及 `[S]` 或 `[P]` 市场标签、订阅序号、更新时间和 mid；中部是包含 PFS 余额、完整 ladder 和事件的**单一全页快照**；底部显示控制提示、可见行范围和连接状态；
+- `↑` / `↓`、`PgUp` / `PgDn`、`Home` / `End` 在同一页面内滚动全部内容；向上滚动会退出“跟随最新”，回到底部会恢复；鼠标滚轮不由应用捕获，交给宿主终端；事件只改变状态，界面最多以 30 FPS 的固定 tick 重绘，终端 resize 会在下一帧重新布局；
+- `c` 将当前完整的 ladder、余额与**最新 10 条 events** 快照复制到 macOS 剪贴板；`q`、`Esc` 或 `Ctrl+C` 退出 attach；`s` 打开“停止并清仓”确认框，只有在框内按 `y` 才会发送 `stop --exit-mode liquidate` 请求，`n` / `Esc` 取消；
+- 验证 panic 恢复：运行 `GRID_ATTACH_PANIC_TEST=1 cargo run -- attach --subaccount 0x...`。终端应在 panic 文本出现前退出 raw mode、alternate screen 并关闭鼠标捕获。
+
+#### Attach TUI 实时监控
+
+attach TUI 使用可靠的 **alternate screen** 全屏重绘，避免状态更新时文字在主终端缓冲区相互覆盖。动态重绘的 TUI 不能同时支持可靠的原生鼠标框选，因此按 `c` 会将当前完整的 ladder、余额和**最新 10 条 events**（不受屏幕大小和滚动位置影响）直接复制到 macOS 剪贴板。
+
+```
+cargo run -- attach --subaccount 0x...
+```
+
+页面布局（从上到下）：
+- 连接与订阅栏：`Connected` / `Subscribed` 分别表达 socket 可用与收到完整快照；账户、网络与 REST 快照健康度独立显示
+- 市场元数据：Spot 为黄色 `[S]`、Perp 为青色 `[P]`；市场名和价格加粗白色；显示本地订阅序号、最后更新时间和 mid
+- PFS 余额 / PnL / reconciliation 摘要
+- Ladder 表格：`Side`、`Qty (BASE)`、`Price (QUOTE)`、`Status` 明确分列；数量保留 6 位、价格保留 8 位且右对齐；BID 绿、ASK 红、价格白色加粗、取消黄、失败红
+- Events 日志（按时间倒序，最新的在最上方；最多显示 10 条）
+
+为检查网格几何，表格始终按 **BID 价格升序，然后 ASK 价格升序** 排列；标题会明确标注 `Price order: BID low→high, ASK low→high`。
+
+滚屏操作：
+
+| 按键 | 动作 |
+|------|------|
+| `↑` / `↓` | 逐行滚动 |
+| `PgUp` / `PgDn` | 翻一页 |
+| `Home` / `g` | 回到顶部 |
+| `End` / `Shift+G` | 跳到底部 |
+| `c` | 复制完整 ladder、余额和最新 10 条 events 快照到 macOS 剪贴板 |
+| `s` | 打开清仓确认框 |
+| `q` / `Esc` / `Ctrl+C` | 退出 attach（引擎继续运行） |
+
+attach 在进入和退出时都会显式关闭鼠标捕获；鼠标滚轮保留给宿主终端自己的滚动、选择或快捷键行为。即使复用器仍转发滚轮报告，attach 也会忽略它们，不会为每个事件触发一次重绘。
+
+退出 attach 会恢复原终端画面。若要保留或分享当前完整状态，请先按 `c`，再粘贴到任意文本编辑器。
+
+attach 不会轮询 `status`，它使用长连接订阅引擎广播：收到完整快照后，仅在余额、ladder、事件有变化时收到增量推送。多个 attach 可同时连接同一个引擎互不干扰。
+
+> **排障：** 如果 attach 无法连接，先确认引擎是否存活：
+> ```
+> cargo run -- status --subaccount 0x...
+> ls -l /tmp/grid-bot/<normalized-subaccount>.sock
+> cargo run -- logs -f --subaccount 0x...
+> ```
+> 旧版引擎不支持订阅推送时，请 `stop` 后重启。
+
+#### Attach 实时订阅操作与排障
+
+先启动**同一份新二进制**的引擎，再打开一个或多个 attach：
+
+```bash
+cargo run -- start --network testnet --product spot --market APT/USDC --subaccount 0x...
+
+# 可以在两个终端同时运行；二者都是只读订阅者
+cargo run -- attach --subaccount 0x...
+cargo run -- attach --subaccount 0x...
+
+# 日志跟随可同时运行，不会影响 attach 或引擎
+cargo run -- logs -f --subaccount 0x...
+```
+
+attach 的连接语义是：发送一次 `subscribe` → 收到一份完整快照 → 仅在成交、对账、熔断、余额、ladder 或引擎阶段发生变化时收到增量更新。渲染 tick 不会调用 `status`，因此在没有状态变化时界面保持不变是正常的。
+
+若引擎重启、socket 消失或订阅流关闭，面板会将实时连接和订阅状态标为 **断线/重连中**，但会保留最后一份完整 ladder 快照以便继续检查；它按 `1, 2, 4, 8, 16, 30` 秒间隔自动尝试重连。新引擎启动后无需重开 attach，收到新快照即恢复。如果长期无法重连，请检查：
+
+```bash
+# 引擎是否存活、socket 是否存在
+cargo run -- status --subaccount 0x...
+ls -l /tmp/grid-bot/<normalized-subaccount>.sock
+
+# 引擎是否由旧二进制启动；旧引擎不支持订阅推送时请 stop 后重启
+cargo run -- logs -f --subaccount 0x...
+```
+
+在 attach 里按 `s` 只会打开确认框；按 `y` 才会请求引擎停止并清仓。这是唯一会从 attach 发出的交易相关命令。正常退出 attach 使用 `q`，不要用 `s` 代替退出。
+
+TUI 的 `U` 只会提交明确指定数量的 Cross → PFS 转账；不会自动转账，也不会设置 owner-only 的 `HOLD_AS_NON_COLLATERAL`。该 owner-only 设置应在 Decibel UI 或钱包中完成。
+
+### 5. 其它工具
+
+| 命令 | 用途 | 是否可能交易 |
+|---|---|---|
+| `check-key` | 校验 API key 格式和远端连通性 | 否 |
+| `doctor` | 读取市场、计划、余额、订单并报告风险 | 否 |
+| `reconcile` | 单次期望网格与实际订单对比 | 否 |
+| `shadow --shadow-cycles N` | 连续模拟 reconciliation 与 journal，不签名 | 否 |
+| `spot-funding-setup` | 显式配置资金路由、可选 Cross → PFS 转账 | 是，仅在明确调用时 |
+| `tui` / `preview` | 配置、预览、监控 | 否 |
+
+### 6. Spot 固定每档数量、建仓与风险门禁
+
+Spot 首次计划会计算并持久化 `per_grid_base_size`。所有 bid/ask 档位使用同一个 base 数量；重新居中、成交后投影、区间扩展和重启恢复都不会按预算重新计算每档数量。
+
+- `TOTAL_QUOTE_BUDGET` 和 `TOTAL_BASE_BUDGET` 只在首次确定该常量时提供上限，随后用于预算校验；若新几何超预算，引擎记录风险并拒绝替换 ladder，不会悄悄缩小某一侧。
+- 引擎每次从当前 **PFS** 余额实时计算 `shortfall = plan.base_required - available_base`；不存在持久化的“已补仓”标记。
+- shortfall 达到最小订单量时，使用固定滑点 cap 的 IOC 补足 base；只使用扣除完整 bid reserve 后的 PFS quote。
+- IOC 未达到 `ENTRY_MIN_FILL_RATIO` 的连续失败次数达到 `ENTRY_EXIT_MAX_ATTEMPTS` 后，引擎暂停并记录 `RiskRejected`；后续对账不再自动付 taker fee，等待人工处理。
+- bulk 提交前会重新读取 PFS；quote 或 base 不足时仍拒绝提交完整 ladder。
+
+### 7. 引擎执行流程
+
+```text
+每个刷新周期：
+  1. 获取市场、mid、PFS 余额、实际订单与事件状态
+  2. 从固定价格几何投影当前 bid/ask；每档数量保持 per_grid_base_size
+  3. 计算实时 PFS base shortfall；必要时执行受限 IOC 建仓
+  4. reconcile 期望 ladder 与实际订单
+  5. 若缺档且风险/资金门禁全部通过，原子替换整条 bulk ladder
+  6. 记录 journal、更新本地 socket 状态并等待下个周期
+```
 
 ## 研究参考
 
@@ -190,7 +248,7 @@ cargo run -- shadow --product perp --market BTC/USD --subaccount 0x... \
 - Neutral / Long / Short Perp 方向；
 - 总预算 + 总订单数自动推导每格统一数量；
 - 固定区间、上下百分比区间、每格百分比间距三种价格范围；
-- Etna bulk order 限制：最多 **40 Bid + 40 Ask**；
+- Etna bulk order 限制：策略总计最多 **40 档**，且单边最多 **30 档**；
 - REST 拉取 market、价格、账户概览、仓位、open orders 与 trade history；
 - 将 trade history 中价格命中的网格格子标记为 `Filled`;
 - TUI 中显示完整网格、当前价格、区间、仓位、可用保证金、格子状态;
@@ -378,7 +436,7 @@ English  ⇄  中文
 6. 按 `2` 到 **Preview Tab**，查看实时网格与扣费后的理论收益；
 7. 按 `3` 到 **Monitor Tab**，持续刷新市场、账户、成交历史与网格格子；
 8. 满意后按 `Ctrl+S` 保存档案，下次启动直接复用；
-9. 因当前 Rust 版是只读版本，`run` / Monitor **不会提交交易**。TUI 会清楚显示该状态。
+9. TUI / Monitor **不会提交交易**；`run` 已退役。真实交易使用常驻 `start` 引擎，实时查看使用 `attach` 或 `status`。
 
 ### 市场选择弹窗
 
@@ -617,7 +675,7 @@ Monitor 页按刷新间隔持续更新市场、账户、仓位、订单和成交
 | ---: | --- |
 | `10` | 5 Bid + 5 Ask |
 | `40` | 20 Bid + 20 Ask |
-| `80` | 40 Bid + 40 Ask，单次 bulk 最大值 |
+| `80` | 策略总计 40 档；单边仍不得超过 30 档 |
 
 Long Perp 将总数都作为 Bid，Short Perp 将总数都作为 Ask。
 

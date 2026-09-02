@@ -21,6 +21,9 @@ use tokio_tungstenite::{
     tungstenite::{Message, client::IntoClientRequest, http::HeaderValue},
 };
 
+pub mod attach_tui;
+pub mod client;
+pub mod control;
 pub mod events;
 pub mod i18n;
 pub mod journal;
@@ -89,8 +92,8 @@ pub enum RangeBreakoutAction {
 
 #[derive(Clone, Debug)]
 pub struct SpotExecutionConfig {
-    /// Explicit per-side inventory budgets. When omitted, the legacy total-budget allocation is
-    /// used; when supplied, each side is independently sized from its real Spot asset budget.
+    /// Spot inventory caps used once to derive a single fixed per-grid base size. Re-centering
+    /// and ladder replacement only validate against these caps; they never re-size a level.
     pub total_quote_budget: Option<Decimal>,
     pub total_base_budget: Option<Decimal>,
     pub min_net_margin_bps: Decimal,
@@ -418,7 +421,7 @@ pub struct SpotFundingPlan {
     pub borrowed_from_grid_quote: Decimal,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize)]
 pub struct BulkOrderParameters {
     pub sequence_number: u64,
     pub bid_prices: Vec<u64>,
@@ -1885,6 +1888,10 @@ pub struct GridPlan {
     pub mid: Decimal,
     pub lower: Decimal,
     pub upper: Decimal,
+    /// Spot-only base quantity fixed when a ladder is first created. Re-projections may change
+    /// which side owns a level, but never the quantity assigned to that level.
+    #[serde(default)]
+    pub per_grid_base_size: Option<Decimal>,
     pub bids: Vec<GridLevel>,
     pub asks: Vec<GridLevel>,
     pub quote_required: Decimal,
@@ -1907,6 +1914,98 @@ impl GridPlan {
         self.bids.iter().chain(self.asks.iter())
     }
 
+    /// Check the operator's Spot budgets against the already-fixed per-grid quantity. Budgets
+    /// never re-size a running ladder; they only reject a geometry that no longer fits.
+    pub fn enforce_spot_budget(&self, config: &GridConfig) -> Result<()> {
+        if config.product != Product::Spot {
+            return Ok(());
+        }
+        let Some(size) = self.per_grid_base_size else {
+            return Ok(());
+        };
+        if size <= Decimal::ZERO {
+            bail!("per_grid_base_size must be positive for a Spot ladder")
+        }
+        if self.all_levels().any(|level| level.size != size) {
+            bail!(
+                "Spot ladder contains a level whose size differs from fixed per_grid_base_size {size}"
+            )
+        }
+        let bid_notional: Decimal = self.bids.iter().map(|level| level.price * size).sum();
+        if let Some(quote_budget) = config.spot.total_quote_budget {
+            if bid_notional > quote_budget {
+                bail!(
+                    "fixed per_grid_base_size {size} needs {bid_notional} quote across {} bid level(s), above TOTAL_QUOTE_BUDGET {quote_budget}; reduce grid levels or increase the quote budget",
+                    self.bids.len()
+                )
+            }
+            let fee_inclusive = bid_notional * (Decimal::ONE + config.maker_fee_rate);
+            if fee_inclusive > quote_budget {
+                bail!(
+                    "fixed per_grid_base_size {size} needs {fee_inclusive} quote including maker fees, above TOTAL_QUOTE_BUDGET {quote_budget}; reduce grid levels or increase the quote budget"
+                )
+            }
+        }
+        if let Some(base_budget) = config.spot.total_base_budget {
+            let base_required = size * Decimal::from(self.asks.len());
+            if base_required > base_budget {
+                bail!(
+                    "fixed per_grid_base_size {size} needs {base_required} base across {} ask level(s), above TOTAL_BASE_BUDGET {base_budget}; reduce grid levels or increase the base budget",
+                    self.asks.len()
+                )
+            }
+        }
+        Ok(())
+    }
+
+    /// Upgrade a pre-uniform Spot ladder exactly once, retaining its price geometry while fixing
+    /// every level to one lot-aligned base quantity.
+    pub fn pin_spot_per_grid_base_size(
+        &self,
+        config: &GridConfig,
+        market: &Market,
+    ) -> Result<GridPlan> {
+        if config.product != Product::Spot {
+            return Ok(self.clone());
+        }
+        if self.per_grid_base_size.is_some() {
+            self.enforce_spot_budget(config)?;
+            return Ok(self.clone());
+        }
+        let bid_prices = self
+            .bids
+            .iter()
+            .map(|level| level.price)
+            .collect::<Vec<_>>();
+        let ask_prices = self
+            .asks
+            .iter()
+            .map(|level| level.price)
+            .collect::<Vec<_>>();
+        let size = derive_spot_uniform_size(config, &bid_prices, &ask_prices, market)?;
+        let resize = |level: &GridLevel| GridLevel {
+            size,
+            notional: level.price * size,
+            ..level.clone()
+        };
+        let bids = self.bids.iter().map(resize).collect::<Vec<_>>();
+        let asks = self.asks.iter().map(resize).collect::<Vec<_>>();
+        let plan = GridPlan {
+            bids,
+            asks,
+            quote_required: self
+                .bids
+                .iter()
+                .map(|level| level.price * size * (Decimal::ONE + config.maker_fee_rate))
+                .sum(),
+            base_required: size * Decimal::from(self.asks.len()),
+            per_grid_base_size: Some(size),
+            ..self.clone()
+        };
+        plan.enforce_spot_budget(config)?;
+        Ok(plan)
+    }
+
     /// Re-project a pinned Spot ladder around the latest price without changing its bounds,
     /// prices, or per-level quantities. Levels below the current price are bids and levels above
     /// it are asks; levels exactly at the current tick remain unquoted to avoid self-crossing.
@@ -1918,6 +2017,7 @@ impl GridPlan {
         if !(self.lower < self.upper) {
             bail!("pinned Spot bounds must be ordered")
         }
+        let fixed_size = self.per_grid_base_size;
         let mut levels: Vec<GridLevel> = self
             .all_levels()
             .map(|level| GridLevel {
@@ -1930,8 +2030,8 @@ impl GridPlan {
                     Side::Bid
                 },
                 price: level.price,
-                size: level.size,
-                notional: level.notional,
+                size: fixed_size.unwrap_or(level.size),
+                notional: level.price * fixed_size.unwrap_or(level.size),
                 // Trade history is only a display hint. A projected executable ladder must
                 // always be eligible to re-place a level after it has filled.
                 state: LevelState::Planned,
@@ -1959,6 +2059,7 @@ impl GridPlan {
             mid: current_mid,
             lower: self.lower,
             upper: self.upper,
+            per_grid_base_size: self.per_grid_base_size,
             bids,
             asks,
             quote_required,
@@ -1991,6 +2092,28 @@ impl GridPlan {
     }
 
     /// Explicitly resize only the ask inventory after an accepted partial initial base fill.
+    /// Keep the closest ask levels that current PFS base can fully fund. Retained levels preserve
+    /// the fixed per-grid base size; only the number of asks changes.
+    pub fn reduce_asks_to_available_base(&self, available_base: Decimal) -> Result<GridPlan> {
+        let size = self
+            .per_grid_base_size
+            .ok_or_else(|| anyhow!("Spot ask reduction requires fixed per_grid_base_size"))?;
+        if size <= Decimal::ZERO {
+            bail!("per_grid_base_size must be positive")
+        }
+        let affordable = (available_base.max(Decimal::ZERO) / size)
+            .floor()
+            .to_string()
+            .parse::<usize>()
+            .context("convert affordable Spot ask count")?
+            .min(self.asks.len());
+        Ok(GridPlan {
+            asks: self.asks.iter().take(affordable).cloned().collect(),
+            base_required: size * Decimal::from(affordable),
+            ..self.clone()
+        })
+    }
+
     /// This is never used as a silent response to an ordinary PFS shortfall: the caller must first
     /// satisfy the configured entry minimum-fill policy and record the resulting actual balance.
     pub fn resize_asks_to_available_base(
@@ -1998,6 +2121,11 @@ impl GridPlan {
         available_base: Decimal,
         market: &Market,
     ) -> Result<GridPlan> {
+        if self.per_grid_base_size.is_some() {
+            bail!(
+                "partial Spot entry cannot resize a ladder with a fixed per_grid_base_size; fund the configured base budget before submitting"
+            )
+        }
         if available_base.is_sign_negative() {
             bail!("available Spot base must not be negative")
         }
@@ -2112,6 +2240,18 @@ impl GridPlan {
 }
 
 pub fn build_plan(config: &GridConfig, market: &Market, mid: Decimal) -> Result<GridPlan> {
+    build_plan_with_per_grid_base_size(config, market, mid, None)
+}
+
+/// Build a Spot plan while retaining an already-pinned per-level base quantity. This is used when
+/// an existing grid is re-centered or its range is extended; changing geometry must never derive a
+/// new size from the budgets.
+pub fn build_plan_with_per_grid_base_size(
+    config: &GridConfig,
+    market: &Market,
+    mid: Decimal,
+    pinned_per_grid_base_size: Option<Decimal>,
+) -> Result<GridPlan> {
     config.validate()?;
     if mid <= Decimal::ZERO {
         bail!("market mid price must be positive")
@@ -2150,7 +2290,22 @@ pub fn build_plan(config: &GridConfig, market: &Market, mid: Decimal) -> Result<
         ask_count,
         market.tick_size,
     )?;
-    let (bid_size, ask_size) = derive_sizes(config, &bids, &asks, market, bid_budget, ask_budget)?;
+    let (bid_size, ask_size) = if config.product == Product::Spot {
+        if let Some(size) = pinned_per_grid_base_size {
+            if round_down(size, market.lot_size) != size || size < market.min_size {
+                bail!(
+                    "pinned per_grid_base_size {size} is not aligned to lot {} or below min size {}",
+                    market.lot_size,
+                    market.min_size
+                )
+            }
+            (size, size)
+        } else {
+            derive_sizes(config, &bids, &asks, market, bid_budget, ask_budget)?
+        }
+    } else {
+        derive_sizes(config, &bids, &asks, market, bid_budget, ask_budget)?
+    };
 
     let bid_levels = bids
         .into_iter()
@@ -2191,6 +2346,7 @@ pub fn build_plan(config: &GridConfig, market: &Market, mid: Decimal) -> Result<
         mid,
         lower,
         upper,
+        per_grid_base_size: (config.product == Product::Spot).then_some(bid_size),
         bids: bid_levels,
         asks: ask_levels,
         quote_required,
@@ -2199,6 +2355,7 @@ pub fn build_plan(config: &GridConfig, market: &Market, mid: Decimal) -> Result<
     };
     if config.product == Product::Spot {
         plan.enforce_min_net_margin(config.maker_fee_rate, config.spot.min_net_margin_bps)?;
+        plan.enforce_spot_budget(config)?;
     }
     Ok(plan)
 }
@@ -2315,6 +2472,62 @@ fn prices(
     Ok(values)
 }
 
+fn derive_spot_uniform_size(
+    config: &GridConfig,
+    bids: &[Decimal],
+    asks: &[Decimal],
+    market: &Market,
+) -> Result<Decimal> {
+    let bid_price_sum: Decimal = bids.iter().sum();
+    let quote_cap = match config.spot.total_quote_budget {
+        Some(quote_budget) => {
+            if bid_price_sum <= Decimal::ZERO {
+                bail!("cannot size a Spot grid without theoretical bid prices")
+            }
+            // Reserve maker fees inside the quote cap. The public budget check below still
+            // reports the raw notional requested by the operator, while this denominator keeps
+            // the submitted transaction fundable.
+            Some(quote_budget / (bid_price_sum * (Decimal::ONE + config.maker_fee_rate)))
+        }
+        None => None,
+    };
+    let base_cap = match config.spot.total_base_budget {
+        Some(base_budget) => {
+            if asks.is_empty() {
+                bail!("cannot size a Spot grid without theoretical ask prices")
+            }
+            Some(base_budget / Decimal::from(asks.len()))
+        }
+        None => None,
+    };
+    let raw_size = match (quote_cap, base_cap) {
+        (Some(quote), Some(base)) => quote.min(base),
+        (Some(quote), None) => quote,
+        (None, Some(base)) => base,
+        (None, None) => match config.allocation {
+            Allocation::FixedSize(size) => size,
+            // Legacy GRID_TOTAL_BUDGET remains supported as a single, symmetric preview cap.
+            // It is intentionally not re-used by a pinned live ladder after the first build.
+            Allocation::TotalBudget(total_budget) => {
+                let denominator = bid_price_sum * (Decimal::ONE + config.maker_fee_rate)
+                    + asks.iter().sum::<Decimal>();
+                if denominator <= Decimal::ZERO {
+                    bail!("cannot size a Spot grid without theoretical prices")
+                }
+                total_budget / denominator
+            }
+        },
+    };
+    let size = round_down(raw_size, market.lot_size);
+    if size < market.min_size {
+        bail!(
+            "derived per_grid_base_size {size} is below min size {}; increase budgets or reduce grid levels",
+            market.min_size
+        )
+    }
+    Ok(size)
+}
+
 fn derive_sizes(
     config: &GridConfig,
     bids: &[Decimal],
@@ -2323,6 +2536,11 @@ fn derive_sizes(
     bid_budget: Decimal,
     ask_budget: Decimal,
 ) -> Result<(Decimal, Decimal)> {
+    if config.product == Product::Spot {
+        let size = derive_spot_uniform_size(config, bids, asks, market)?;
+        return Ok((size, size));
+    }
+
     let explicit_spot_budgets = config.product == Product::Spot
         && (config.spot.total_quote_budget.is_some() || config.spot.total_base_budget.is_some());
     let (mut bid, mut ask) = if explicit_spot_budgets {
@@ -3102,6 +3320,20 @@ fn parse_open_order(value: &Value) -> Result<reconcile::ActualOrder> {
     })
 }
 
+/// Return the executable base shortfall for a pinned Spot ladder using only the current PFS
+/// balance. A shortfall smaller than one minimum order is ignored after lot rounding.
+///
+/// This is the single bootstrap decision used by startup, reconciliation-triggered replacement,
+/// and pre-submission funding checks. It contains no persistent success flag.
+pub fn spot_base_shortfall(plan: &GridPlan, funds: &SpotFunds, market: &Market) -> Option<Decimal> {
+    if market.product != Product::Spot {
+        return None;
+    }
+    let shortfall = (plan.base_required - funds.available_base_for_bulk()).max(Decimal::ZERO);
+    let executable = round_down(shortfall, market.lot_size);
+    (executable >= market.min_size).then_some(executable)
+}
+
 /// Read the current plan and current orders, then compare them without submitting, replacing, or
 /// cancelling anything. This is the safe first step for startup and operational reconciliation.
 /// Fit a Spot snapshot's plan to its PFS balances. Perp plans are unchanged.
@@ -3668,6 +3900,7 @@ mod tests {
             mid: dec!(100),
             lower: dec!(90),
             upper: dec!(110),
+            per_grid_base_size: Some(Decimal::ONE),
             bids,
             asks,
             quote_required,
@@ -3971,6 +4204,7 @@ mod tests {
             mid: dec!(0.5372),
             lower: dec!(0.4834),
             upper: dec!(0.591),
+            per_grid_base_size: None,
             bids: vec![],
             asks: vec![],
             quote_required,
@@ -4240,6 +4474,7 @@ mod tests {
             mid: dec!(60000),
             lower: dec!(57000),
             upper: dec!(63000),
+            per_grid_base_size: None,
             bids: vec![],
             asks: vec![],
             quote_required: dec!(1000),
@@ -4282,6 +4517,7 @@ mod tests {
             mid: dec!(0.5782),
             lower: dec!(0.55),
             upper: dec!(0.61),
+            per_grid_base_size: None,
             bids: vec![],
             asks: vec![],
             quote_required: dec!(400),
@@ -4323,6 +4559,7 @@ mod tests {
             mid: dec!(60000),
             lower: dec!(57000),
             upper: dec!(63000),
+            per_grid_base_size: None,
             bids: vec![],
             asks: vec![],
             quote_required: dec!(500),
@@ -4365,6 +4602,7 @@ mod tests {
             mid: dec!(1),
             lower: dec!(0.9),
             upper: dec!(1.1),
+            per_grid_base_size: None,
             bids: vec![],
             asks: vec![],
             quote_required: dec!(99.995),
@@ -4407,6 +4645,7 @@ mod tests {
             mid: dec!(1),
             lower: dec!(0.9),
             upper: dec!(1.1),
+            per_grid_base_size: None,
             bids: vec![],
             asks: vec![],
             quote_required: dec!(99.995),
@@ -4447,6 +4686,7 @@ mod tests {
             mid: dec!(60000),
             lower: dec!(57000),
             upper: dec!(63000),
+            per_grid_base_size: None,
             bids: vec![],
             asks: vec![],
             quote_required: dec!(500),
@@ -4513,12 +4753,76 @@ mod tests {
     }
 
     #[test]
+    fn bulk_json_keeps_one_fixed_spot_size_after_recenter() {
+        let mut market = market();
+        market.product = Product::Spot;
+        market.name = "APT/USDC".to_owned();
+        let config = GridConfig {
+            product: Product::Spot,
+            range: RangeSpec::Bounds {
+                lower: dec!(90),
+                upper: dec!(110),
+            },
+            total_count: 4,
+            allocation: Allocation::TotalBudget(dec!(1)),
+            maker_fee_rate: dec!(0.001),
+            spot: SpotExecutionConfig {
+                total_quote_budget: Some(dec!(4000)),
+                total_base_budget: Some(dec!(20)),
+                ..SpotExecutionConfig::default()
+            },
+            ..config()
+        };
+        let initial = build_plan(&config, &market, dec!(100)).unwrap();
+        assert_eq!(initial.per_grid_base_size, Some(dec!(10)));
+        let initial_bids = initial.bids.iter().collect::<Vec<_>>();
+        let initial_asks = initial.asks.iter().collect::<Vec<_>>();
+        let initial_bulk = prepare_bulk_order_parameters(1, &initial_bids, &initial_asks, &market)
+            .expect("initial Spot bulk parameters");
+        println!(
+            "initial bulk order JSON: {}",
+            serde_json::to_string(&initial_bulk).expect("serialize initial bulk parameters")
+        );
+        assert!(
+            initial_bulk
+                .bid_sizes
+                .iter()
+                .chain(&initial_bulk.ask_sizes)
+                .all(|size| *size == 1000)
+        );
+
+        // A fill prompts the live loop to re-project around the newest mid before submitting its
+        // replacement. The side counts change from 2/2 to 3/1, but every raw Move size remains
+        // the same persisted 10.00 APT value.
+        let recentered = initial.project_spot(dec!(106), market.tick_size).unwrap();
+        recentered.enforce_spot_budget(&config).unwrap();
+        assert_eq!(recentered.per_grid_base_size, initial.per_grid_base_size);
+        let recentered_bids = recentered.bids.iter().collect::<Vec<_>>();
+        let recentered_asks = recentered.asks.iter().collect::<Vec<_>>();
+        let recentered_bulk =
+            prepare_bulk_order_parameters(2, &recentered_bids, &recentered_asks, &market)
+                .expect("recentered Spot bulk parameters");
+        println!(
+            "recentered bulk order JSON: {}",
+            serde_json::to_string(&recentered_bulk).expect("serialize recentered bulk parameters")
+        );
+        assert!(
+            recentered_bulk
+                .bid_sizes
+                .iter()
+                .chain(&recentered_bulk.ask_sizes)
+                .all(|size| *size == 1000)
+        );
+    }
+
+    #[test]
     fn accepted_partial_entry_resizes_only_ask_inventory() {
         let market = spot_funding_market();
         let plan = GridPlan {
             mid: dec!(100),
             lower: dec!(90),
             upper: dec!(110),
+            per_grid_base_size: None,
             bids: vec![GridLevel {
                 side: Side::Bid,
                 price: dec!(99),
