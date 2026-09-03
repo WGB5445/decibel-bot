@@ -27,10 +27,12 @@ pub mod control;
 pub mod events;
 pub mod i18n;
 pub mod journal;
+pub mod network;
 pub mod profile;
 pub mod reconcile;
 pub mod spot_lifecycle;
 pub mod spot_taker;
+pub mod strategy;
 
 /// Decibel's per-side protocol limit. This is separate from the bot policy below.
 pub const MAX_LEVELS_PER_SIDE: usize = 30;
@@ -173,6 +175,9 @@ pub struct GridConfig {
     pub refresh: Duration,
     pub price_source: PriceSource,
     pub spot: SpotExecutionConfig,
+    /// Perp-only absolute position cap. When set, live execution refuses plans that would breach
+    /// current or worst-case exposure after resting bids/asks fill.
+    pub max_position: Option<Decimal>,
 }
 
 impl GridConfig {
@@ -430,29 +435,38 @@ pub struct BulkOrderParameters {
     pub ask_sizes: Vec<u64>,
 }
 
-const MAINNET_PACKAGE: &str = "0x50ead22afd6ffd9769e3b3d6e0e64a2a350d68e8b102c4e72e33d0b8cfdfdb06";
-const TESTNET_PACKAGE: &str = "0xe7da2794b1d8af76532ed95f38bfdf1136abfd8ea3a240189971988a83101b7f";
 /// Decibel's testnet USDC metadata object. Mainnet assets must be supplied explicitly by the
 /// caller because metadata addresses are network-specific.
 pub const TESTNET_USDC_METADATA: &str =
     "0x5428acf5c112826d0c74ae1cd2de9030f53d1d01235e6c2621d967bf914ee1c8";
 
 pub fn package_for_network(network: &str) -> Result<&'static str> {
-    match network.trim().to_ascii_lowercase().as_str() {
-        "mainnet" => Ok(MAINNET_PACKAGE),
-        "testnet" => Ok(TESTNET_PACKAGE),
-        other => bail!("unsupported execution network {other}; expected mainnet or testnet"),
-    }
+    Ok(network::default_registry()
+        .resolve(network)?
+        .package_address)
 }
 
-fn aptos_for_network(network: &str) -> Result<Aptos> {
-    Ok(Aptos::new(
-        match network.trim().to_ascii_lowercase().as_str() {
-            "mainnet" => AptosConfig::mainnet(),
-            "testnet" => AptosConfig::testnet(),
-            other => bail!("unsupported execution network {other}; expected mainnet or testnet"),
-        },
-    )?)
+pub fn aptos_for_network(network: &str) -> Result<Aptos> {
+    let profile = network::default_registry().resolve(network)?;
+    network::default_registry().aptos(profile)
+}
+
+/// Returns false when `max_position` is set and current or worst-case exposure would breach it.
+pub fn perp_position_is_safe(
+    position: Decimal,
+    plan: &GridPlan,
+    max_position: Option<Decimal>,
+) -> bool {
+    let Some(max) = max_position else {
+        return true;
+    };
+    let bid_sum: Decimal = plan.bids.iter().map(|level| level.size).sum();
+    let ask_sum: Decimal = plan.asks.iter().map(|level| level.size).sum();
+    let worst_long = position + bid_sum;
+    let worst_short = position - ask_sum;
+    position.abs() < max
+        && worst_long.abs() <= max
+        && worst_short.abs() <= max
 }
 
 /// Build, sign, submit, and wait for an official Spot or Perp bulk order transaction.
@@ -514,16 +528,8 @@ pub async fn execute_bulk_grid(
         .parse()
         .context("invalid subaccount address")?;
     let market_addr: AccountAddress = market.address.parse().context("invalid market address")?;
-    let network_name = network.trim().to_ascii_lowercase();
-    let package = match network_name.as_str() {
-        "mainnet" => MAINNET_PACKAGE,
-        "testnet" => TESTNET_PACKAGE,
-        other => bail!("unsupported execution network {other}; expected mainnet or testnet"),
-    };
-    let aptos = Aptos::new(match network_name.as_str() {
-        "mainnet" => AptosConfig::mainnet(),
-        _ => AptosConfig::testnet(),
-    })?;
+    let package = package_for_network(network)?;
+    let aptos = aptos_for_network(network)?;
     let bids: Vec<&GridLevel> = execution_plan
         .bids
         .iter()
@@ -1410,16 +1416,8 @@ async fn submit_spot_ioc_order(
     let subaccount_addr: AccountAddress =
         subaccount.parse().context("invalid subaccount address")?;
     let market_addr: AccountAddress = market.address.parse().context("invalid market address")?;
-    let network = network.trim().to_ascii_lowercase();
-    let package = match network.as_str() {
-        "mainnet" => MAINNET_PACKAGE,
-        "testnet" => TESTNET_PACKAGE,
-        other => bail!("unsupported execution network {other}; expected mainnet or testnet"),
-    };
-    let aptos = Aptos::new(match network.as_str() {
-        "mainnet" => AptosConfig::mainnet(),
-        _ => AptosConfig::testnet(),
-    })?;
+    let package = package_for_network(&network)?;
+    let aptos = aptos_for_network(&network)?;
     let entry_function =
         format!("{package}::dex_accounts_spot_entry::place_spot_order_to_subaccount");
     let payload = InputEntryFunctionData::new(&entry_function)
@@ -1565,16 +1563,8 @@ async fn cancel_spot_order(
     let subaccount_addr: AccountAddress =
         subaccount.parse().context("invalid subaccount address")?;
     let market_addr: AccountAddress = market.address.parse().context("invalid market address")?;
-    let network = network.trim().to_ascii_lowercase();
-    let package = match network.as_str() {
-        "mainnet" => MAINNET_PACKAGE,
-        "testnet" => TESTNET_PACKAGE,
-        other => bail!("unsupported execution network {other}; expected mainnet or testnet"),
-    };
-    let aptos = Aptos::new(match network.as_str() {
-        "mainnet" => AptosConfig::mainnet(),
-        _ => AptosConfig::testnet(),
-    })?;
+    let package = package_for_network(&network)?;
+    let aptos = aptos_for_network(&network)?;
     let entry_function =
         format!("{package}::dex_accounts_spot_entry::cancel_spot_order_to_subaccount");
     let payload = InputEntryFunctionData::new(&entry_function)
@@ -2252,115 +2242,18 @@ pub fn build_plan_with_per_grid_base_size(
     mid: Decimal,
     pinned_per_grid_base_size: Option<Decimal>,
 ) -> Result<GridPlan> {
-    config.validate()?;
-    if mid <= Decimal::ZERO {
-        bail!("market mid price must be positive")
-    }
-    // Resolve the configured range first. For Spot, an already-pinned market may later trade
-    // outside its bounds; clamp only the side-allocation reference used to build a snapshot.
-    // The bounds and generated prices remain those of the configured range, while the live
-    // execution loop projects the pinned plan against the out-of-range price.
-    let (lower, upper) = resolve_range(config, mid, config.total_count)?;
-    let allocation_mid = if config.product == Product::Spot {
-        mid.clamp(lower, upper)
-    } else {
-        if !(lower < mid && mid < upper) {
-            bail!("mid price {mid} is outside grid range [{lower}, {upper}]")
-        }
-        mid
-    };
-    let (bid_count, ask_count, bid_budget, ask_budget) =
-        side_counts(config, lower, upper, allocation_mid);
-
-    let bids = prices(
-        config,
-        Side::Bid,
-        allocation_mid,
-        lower,
-        upper,
-        bid_count,
-        market.tick_size,
-    )?;
-    let asks = prices(
-        config,
-        Side::Ask,
-        allocation_mid,
-        lower,
-        upper,
-        ask_count,
-        market.tick_size,
-    )?;
-    let (bid_size, ask_size) = if config.product == Product::Spot {
-        if let Some(size) = pinned_per_grid_base_size {
-            if round_down(size, market.lot_size) != size || size < market.min_size {
-                bail!(
-                    "pinned per_grid_base_size {size} is not aligned to lot {} or below min size {}",
-                    market.lot_size,
-                    market.min_size
-                )
-            }
-            (size, size)
-        } else {
-            derive_sizes(config, &bids, &asks, market, bid_budget, ask_budget)?
-        }
-    } else {
-        derive_sizes(config, &bids, &asks, market, bid_budget, ask_budget)?
-    };
-
-    let bid_levels = bids
-        .into_iter()
-        .map(|price| GridLevel {
-            side: Side::Bid,
-            price,
-            size: bid_size,
-            notional: price * bid_size,
-            state: LevelState::Planned,
-        })
-        .collect::<Vec<_>>();
-    let ask_levels = asks
-        .into_iter()
-        .map(|price| GridLevel {
-            side: Side::Ask,
-            price,
-            size: ask_size,
-            notional: price * ask_size,
-            state: LevelState::Planned,
-        })
-        .collect::<Vec<_>>();
-
-    let quote_required = bid_levels
-        .iter()
-        .map(|l| l.notional * (Decimal::ONE + config.maker_fee_rate))
-        .sum();
-    let base_required = ask_levels.iter().map(|l| l.size).sum();
-    let long_notional: Decimal = bid_levels.iter().map(|l| l.notional).sum();
-    let short_notional: Decimal = ask_levels.iter().map(|l| l.notional).sum();
-    let estimated_margin = match config.product {
-        Product::Spot => None,
-        Product::Perp => Some(
-            long_notional.max(short_notional) / config.preview_leverage
-                + (long_notional + short_notional) * config.maker_fee_rate,
-        ),
-    };
-    let plan = GridPlan {
+    let ctx = strategy::StrategyContext {
         mid,
-        lower,
-        upper,
-        per_grid_base_size: (config.product == Product::Spot).then_some(bid_size),
-        bids: bid_levels,
-        asks: ask_levels,
-        quote_required,
-        base_required,
-        estimated_margin,
+        position: None,
+        pinned_per_grid_base_size,
     };
-    if config.product == Product::Spot {
-        plan.enforce_min_net_margin(config.maker_fee_rate, config.spot.min_net_margin_bps)?;
-        plan.enforce_spot_budget(config)?;
+    match config.product {
+        Product::Spot => strategy::spot::planning::build(config, market, &ctx),
+        Product::Perp => strategy::resolve(config).build_plan(config, market, &ctx),
     }
-    Ok(plan)
 }
 
-fn side_counts(
+pub(crate) fn side_counts(
     config: &GridConfig,
     lower: Decimal,
     upper: Decimal,
@@ -2370,12 +2263,12 @@ fn side_counts(
     match (config.product, config.perp_mode) {
         (Product::Perp, PerpMode::Long) => (
             config.total_count,
-            1,
+            0,
             config.budget_or_zero(),
             Decimal::ZERO,
         ),
         (Product::Perp, PerpMode::Short) => (
-            1,
+            0,
             config.total_count,
             Decimal::ZERO,
             config.budget_or_zero(),
@@ -2417,7 +2310,7 @@ fn side_counts(
     }
 }
 
-fn resolve_range(config: &GridConfig, mid: Decimal, levels: usize) -> Result<(Decimal, Decimal)> {
+pub(crate) fn resolve_range(config: &GridConfig, mid: Decimal, levels: usize) -> Result<(Decimal, Decimal)> {
     let hundred = Decimal::from(100);
     match config.range {
         RangeSpec::Bounds { lower, upper } => Ok((lower, upper)),
@@ -2438,7 +2331,7 @@ fn resolve_range(config: &GridConfig, mid: Decimal, levels: usize) -> Result<(De
     }
 }
 
-fn prices(
+pub(crate) fn prices(
     config: &GridConfig,
     side: Side,
     mid: Decimal,
@@ -2447,6 +2340,9 @@ fn prices(
     count: usize,
     tick: Decimal,
 ) -> Result<Vec<Decimal>> {
+    if count == 0 {
+        return Ok(Vec::new());
+    }
     let mut values = Vec::with_capacity(count);
     for i in 1..=count {
         let raw = match (&config.range, side) {
@@ -2528,7 +2424,7 @@ fn derive_spot_uniform_size(
     Ok(size)
 }
 
-fn derive_sizes(
+pub(crate) fn derive_sizes(
     config: &GridConfig,
     bids: &[Decimal],
     asks: &[Decimal],
@@ -2601,12 +2497,6 @@ fn derive_sizes(
             },
         }
     };
-    if config.product == Product::Perp && config.perp_mode == PerpMode::Long {
-        ask = Decimal::ZERO;
-    }
-    if config.product == Product::Perp && config.perp_mode == PerpMode::Short {
-        bid = Decimal::ZERO;
-    }
     bid = if bid > Decimal::ZERO {
         round_down(bid, market.lot_size)
     } else {
@@ -2659,17 +2549,7 @@ pub struct DecibelClient {
 impl DecibelClient {
     pub fn new(network: &str, api_key: &str) -> Result<Self> {
         validate_api_key_format(api_key)?;
-        let (api_root, ws_url) = match network {
-            "mainnet" => (
-                "https://api.mainnet.aptoslabs.com/decibel/api/v1",
-                "wss://api.mainnet.aptoslabs.com/decibel/ws",
-            ),
-            "testnet" => (
-                "https://api.testnet.aptoslabs.com/decibel/api/v1",
-                "wss://api.testnet.aptoslabs.com/decibel/ws",
-            ),
-            other => bail!("unsupported network {other}; expected mainnet or testnet"),
-        };
+        let profile = network::default_registry().resolve(network)?;
         let mut headers = header::HeaderMap::new();
         let bearer = format!("Bearer {api_key}")
             .parse()
@@ -2681,8 +2561,8 @@ impl DecibelClient {
             .build()?;
         Ok(Self {
             http,
-            base_url: api_root.to_owned(),
-            ws_url: ws_url.to_owned(),
+            base_url: profile.decibel_api_base.to_owned(),
+            ws_url: profile.decibel_ws_url.to_owned(),
             api_key: api_key.to_owned(),
         })
     }
@@ -3653,6 +3533,7 @@ mod tests {
             refresh: Duration::from_secs(3),
             price_source: PriceSource::Prices,
             spot: SpotExecutionConfig::default(),
+            max_position: None,
         }
     }
 
@@ -4856,5 +4737,154 @@ mod tests {
         assert_eq!(resized.quote_required, plan.quote_required);
         assert!(resized.base_required <= dec!(1));
         assert_eq!(resized.bids[0].size, dec!(1));
+    }
+
+    #[test]
+    fn perp_long_places_bids_only() {
+        let plan = build_plan(
+            &GridConfig {
+                perp_mode: PerpMode::Long,
+                total_count: 10,
+                ..config()
+            },
+            &market(),
+            dec!(100),
+        )
+        .unwrap();
+        assert_eq!(plan.bids.len(), 10);
+        assert!(plan.asks.is_empty());
+        assert!(plan.bids.iter().all(|level| level.size > Decimal::ZERO));
+    }
+
+    #[test]
+    fn perp_short_places_asks_only() {
+        let plan = build_plan(
+            &GridConfig {
+                perp_mode: PerpMode::Short,
+                total_count: 10,
+                ..config()
+            },
+            &market(),
+            dec!(100),
+        )
+        .unwrap();
+        assert_eq!(plan.asks.len(), 10);
+        assert!(plan.bids.is_empty());
+        assert!(plan.asks.iter().all(|level| level.size > Decimal::ZERO));
+    }
+
+    #[test]
+    fn perp_neutral_splits_by_mid_ratio() {
+        let lower = dec!(1);
+        let upper = dec!(100);
+        let mid = dec!(25);
+        let (bid, ask, _, _) = side_counts(
+            &GridConfig {
+                perp_mode: PerpMode::Neutral,
+                total_count: 40,
+                ..config()
+            },
+            lower,
+            upper,
+            mid,
+        );
+        assert_eq!((bid, ask), (10, 30));
+        let plan = build_plan(
+            &GridConfig {
+                perp_mode: PerpMode::Neutral,
+                total_count: 40,
+                range: RangeSpec::Bounds {
+                    lower,
+                    upper,
+                },
+                ..config()
+            },
+            &market(),
+            mid,
+        )
+        .unwrap();
+        assert_eq!(plan.bids.len(), 10);
+        assert_eq!(plan.asks.len(), 30);
+    }
+
+    #[test]
+    fn perp_directional_rejects_over_30_levels() {
+        let err = GridConfig {
+            perp_mode: PerpMode::Long,
+            total_count: 31,
+            ..config()
+        }
+        .validate()
+        .unwrap_err();
+        assert!(err.to_string().contains("30"));
+    }
+
+    #[test]
+    fn perp_position_is_safe_respects_worst_case_exposure() {
+        let plan = build_plan(
+            &GridConfig {
+                perp_mode: PerpMode::Long,
+                total_count: 4,
+                allocation: Allocation::FixedSize(dec!(1)),
+                ..config()
+            },
+            &market(),
+            dec!(100),
+        )
+        .unwrap();
+        let max = dec!(2);
+        let bid_sum: Decimal = plan.bids.iter().map(|level| level.size).sum();
+        assert!(bid_sum > max);
+        assert!(!perp_position_is_safe(dec!(2), &plan, Some(max)));
+        assert!(!perp_position_is_safe(
+            Decimal::ZERO,
+            &plan,
+            Some(bid_sum - dec!(0.01))
+        ));
+        assert!(perp_position_is_safe(
+            Decimal::ZERO,
+            &plan,
+            Some(bid_sum)
+        ));
+    }
+
+    #[test]
+    fn spot_plan_regression_golden() {
+        let config = GridConfig {
+            product: Product::Spot,
+            perp_mode: PerpMode::Neutral,
+            market_name: "APT/USDC".to_owned(),
+            range: RangeSpec::Percent { percent: dec!(10) },
+            total_count: 8,
+            allocation: Allocation::FixedSize(dec!(1)),
+            maker_fee_rate: dec!(0.001),
+            preview_leverage: dec!(1),
+            refresh: Duration::from_secs(3),
+            price_source: PriceSource::Prices,
+            spot: SpotExecutionConfig::default(),
+            max_position: None,
+        };
+        let market = Market {
+            address: "0xspot".to_owned(),
+            name: "APT/USDC".to_owned(),
+            tick_size: dec!(0.01),
+            lot_size: dec!(0.01),
+            min_size: dec!(0.01),
+            px_decimals: 2,
+            sz_decimals: 2,
+            product: Product::Spot,
+            base_asset_addr: None,
+            quote_asset_addr: None,
+            base_symbol: Some("APT".to_owned()),
+            quote_symbol: Some("USDC".to_owned()),
+        };
+        let plan = build_plan(&config, &market, dec!(10)).unwrap();
+        assert_eq!(plan.bids.len(), 4);
+        assert_eq!(plan.asks.len(), 4);
+        assert_eq!(plan.bids[0].price, dec!(9.75));
+        assert_eq!(plan.asks[0].price, dec!(10.25));
+        assert!(plan.bids.iter().all(|level| level.size == dec!(1)));
+        assert!(plan.asks.iter().all(|level| level.size == dec!(1)));
+        assert_eq!(plan.per_grid_base_size, Some(dec!(1)));
     }
 }

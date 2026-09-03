@@ -154,6 +154,8 @@ pub struct ProfileData {
     pub price_buffer_bps: String,
     #[serde(default)]
     pub max_consecutive_bulk_failures: String,
+    #[serde(default)]
+    pub max_position: Option<String>,
     /// Argon2id + XChaCha20-Poly1305 envelopes. `None` when a credential has not been saved.
     pub encrypted_api_key: Option<EncryptedSecret>,
     pub encrypted_aptos_private_key: Option<EncryptedSecret>,

@@ -375,6 +375,15 @@ fn snapshot_lines(status: &EngineStatus) -> Vec<Line<'static>> {
     let quote_symbol = status.pfs_quote_symbol.as_deref().unwrap_or("QUOTE");
     let quote_balance = status.pfs_quote_balance.as_deref().unwrap_or("-");
 
+    if let Some(summary) = perp_summary_text(status) {
+        lines.push(Line::styled(
+            summary,
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
+
     lines.push(Line::from(vec![
         Span::styled("PFS balances  ", Style::default().fg(Color::DarkGray)),
         Span::styled(
@@ -590,6 +599,46 @@ fn short_account(account: &str) -> String {
     }
 }
 
+fn perp_summary_text(status: &EngineStatus) -> Option<String> {
+    let mode = status.perp_mode.as_deref()?;
+    let position = status.position.as_deref().unwrap_or("-");
+    let max_position = status.max_position.as_deref().unwrap_or("-");
+    let available = status.available_margin.as_deref().unwrap_or("-");
+    let estimated = status.estimated_margin.as_deref().unwrap_or("-");
+    Some(format!(
+        "Perp: {}  pos={}  max={}  margin={}/{} USDC",
+        mode.to_ascii_uppercase(),
+        position,
+        max_position,
+        available,
+        estimated,
+    ))
+}
+
+fn perp_summary_line(status: &EngineStatus) -> Option<Line<'static>> {
+    let mode = status.perp_mode.as_deref()?;
+    let position = status.position.as_deref().unwrap_or("-").to_owned();
+    let max_position = status.max_position.as_deref().unwrap_or("-").to_owned();
+    let available = status.available_margin.as_deref().unwrap_or("-").to_owned();
+    let estimated = status.estimated_margin.as_deref().unwrap_or("-").to_owned();
+    Some(Line::from(vec![
+        Span::styled("Perp: ", Style::default().fg(Color::DarkGray)),
+        Span::styled(
+            format!(
+                "{}  pos={}  max={}  margin={}/{} USDC",
+                mode.to_ascii_uppercase(),
+                position,
+                max_position,
+                available,
+                estimated,
+            ),
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ),
+    ]))
+}
+
 fn product_tag(product: &str) -> (&'static str, Style) {
     if product.eq_ignore_ascii_case("spot") {
         (
@@ -672,10 +721,15 @@ fn compact_text(value: &str, max_chars: usize) -> String {
 
 fn render(frame: &mut ratatui::Frame, app: &App, content: &[Line<'static>], max_scroll: usize) {
     let area = frame.area();
+    let header_height = if app.status.perp_mode.is_some() {
+        6
+    } else {
+        5
+    };
     let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(5),
+            Constraint::Length(header_height),
             Constraint::Min(3),
             Constraint::Length(3),
         ])
@@ -721,45 +775,49 @@ fn render(frame: &mut ratatui::Frame, app: &App, content: &[Line<'static>], max_
         .map(|at| at.format("%H:%M:%S").to_string())
         .unwrap_or_else(|| "-".to_owned());
     let (tag, tag_style) = product_tag(&app.status.product);
+    let mut header_lines = vec![
+        Line::from(vec![connection, Span::raw("   "), subscription]),
+        Line::from(vec![
+            Span::styled("Account: ", Style::default().fg(Color::DarkGray)),
+            Span::raw(short_account(&app.status.subaccount)),
+            Span::styled("   Network: ", Style::default().fg(Color::DarkGray)),
+            Span::raw(&app.status.network),
+            Span::styled("   Engine: ", Style::default().fg(Color::DarkGray)),
+            Span::raw(&app.status.phase),
+            Span::raw("   "),
+            snapshot,
+        ]),
+        Line::from(vec![
+            Span::styled(tag, tag_style),
+            Span::raw(" "),
+            Span::styled(
+                &app.status.market,
+                Style::default()
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                format!(
+                    "  · live seq={}  · updated {}",
+                    app.live_sequence, last_update
+                ),
+                Style::default().fg(Color::DarkGray),
+            ),
+            Span::styled("  · mid ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                app.status.mid.as_deref().unwrap_or("-"),
+                Style::default()
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ]),
+    ];
+    if let Some(perp_line) = perp_summary_line(&app.status) {
+        header_lines.push(perp_line);
+    }
 
     frame.render_widget(
-        Paragraph::new(vec![
-            Line::from(vec![connection, Span::raw("   "), subscription]),
-            Line::from(vec![
-                Span::styled("Account: ", Style::default().fg(Color::DarkGray)),
-                Span::raw(short_account(&app.status.subaccount)),
-                Span::styled("   Network: ", Style::default().fg(Color::DarkGray)),
-                Span::raw(&app.status.network),
-                Span::styled("   Engine: ", Style::default().fg(Color::DarkGray)),
-                Span::raw(&app.status.phase),
-                Span::raw("   "),
-                snapshot,
-            ]),
-            Line::from(vec![
-                Span::styled(tag, tag_style),
-                Span::raw(" "),
-                Span::styled(
-                    &app.status.market,
-                    Style::default()
-                        .fg(Color::White)
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Span::styled(
-                    format!(
-                        "  · live seq={}  · updated {}",
-                        app.live_sequence, last_update
-                    ),
-                    Style::default().fg(Color::DarkGray),
-                ),
-                Span::styled("  · mid ", Style::default().fg(Color::DarkGray)),
-                Span::styled(
-                    app.status.mid.as_deref().unwrap_or("-"),
-                    Style::default()
-                        .fg(Color::White)
-                        .add_modifier(Modifier::BOLD),
-                ),
-            ]),
-        ])
+        Paragraph::new(header_lines)
         .block(Block::default().borders(Borders::ALL).title("Grid monitor")),
         rows[0],
     );
@@ -837,6 +895,24 @@ mod tests {
             size: "2".into(),
             state: "Placed".into(),
         }
+    }
+
+    #[test]
+    fn snapshot_includes_perp_fields_when_present() {
+        let status = EngineStatus {
+            perp_mode: Some("long".to_owned()),
+            max_position: Some("0.01".to_owned()),
+            position: Some("0.002".to_owned()),
+            available_margin: Some("120".to_owned()),
+            estimated_margin: Some("500".to_owned()),
+            ..EngineStatus::default()
+        };
+
+        let snapshot = snapshot_plain_text(&status);
+        assert!(snapshot.contains("Perp: LONG"));
+        assert!(snapshot.contains("pos=0.002"));
+        assert!(snapshot.contains("max=0.01"));
+        assert!(snapshot.contains("margin=120/500 USDC"));
     }
 
     #[test]

@@ -8,13 +8,13 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
 use aptos_sdk::{
-    Aptos, AptosConfig,
     account::Ed25519Account,
     transaction::{InputEntryFunctionData, TransactionBuilder, sign_transaction},
     types::AccountAddress,
 };
 use serde_json::Value;
 
+use crate::network::{self, default_registry};
 use crate::{Market, Product, normalize_private_key, package_for_network};
 
 /// Cancel the complete Spot or Perp bulk ladder for one `(subaccount, market)`.
@@ -34,11 +34,8 @@ pub async fn cancel_bulk_ladder(
     let subaccount_addr: AccountAddress =
         subaccount.parse().context("invalid subaccount address")?;
     let market_addr: AccountAddress = market.address.parse().context("invalid market address")?;
-    let aptos = Aptos::new(if network.eq_ignore_ascii_case("mainnet") {
-        AptosConfig::mainnet()
-    } else {
-        AptosConfig::testnet()
-    })?;
+    let aptos = default_registry()
+        .aptos(network::default_registry().resolve(network)?)?;
     let gas_price = aptos
         .fullnode()
         .estimate_gas_price()

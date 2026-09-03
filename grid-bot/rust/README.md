@@ -323,6 +323,56 @@ cargo run -- check-key
 
 该检查会验证 key 非空、无空白/控制字符且长度合理,然后同时检查当前网络的 REST `/markets` 和官方 WebSocket `all_market_prices` 连接。只有两者都成功才会报告 key 已被 API 接受;无效或无权限的 key 会明确返回 REST HTTP 401/403 或 WebSocket 网关错误,不会打印 key 或响应正文。
 
+## Perp 方向模式
+
+Perp 网格通过 `PERP_GRID_MODE`（CLI：`--perp-mode`）选择方向。三种模式对档位分配的影响如下：
+
+| 模式 | 行为 |
+| --- | --- |
+| `neutral` | 双边网格，按 mid 比例分配 bid/ask |
+| `long` | 仅买单档位 |
+| `short` | 仅卖单档位 |
+
+### `GRID_MAX_POSITION` 风控
+
+`GRID_MAX_POSITION`（CLI：`--max-position`）设置 Perp 仓位的绝对上限（base 单位）。引擎在每轮执行前检查：
+
+- 当前仓位 `|position|` 是否已超限；
+- 若全部 resting bid/ask 成交后的最坏情况敞口是否会超限。
+
+任一条件触发时，引擎拒绝提交新的 bulk ladder，并在 journal / attach 状态中可见。未设置该值时不启用仓位上限检查。
+
+### Perp 必须用 `start` 启动
+
+Perp 实盘循环只能通过常驻引擎启动，**不能**使用已退役的 `run -e`：
+
+```bash
+# 正确：启动常驻引擎
+cargo run -- start --product perp --perp-mode long --max-position 0.01 ...
+
+# 错误：run 已退役，会明确报错
+cargo run -- run -e --product perp ...
+```
+
+只读检查、Shadow 和 `status` 仍可直接运行；Live 交易请使用 `start` + `attach` / `stop`。
+
+### Perp `doctor` 前置检查
+
+在 testnet/mainnet 启动 Perp 引擎前，建议先跑 `doctor` 验证市场、计划、保证金与仓位：
+
+```bash
+cargo run -- doctor \
+  --network testnet \
+  --product perp \
+  --market BTC/USD \
+  --perp-mode neutral \
+  --max-position 0.01 \
+  --subaccount 0xYOUR_SUBACCOUNT \
+  --decibel-api-key "$DECIBEL_API_KEY"
+```
+
+`doctor` 会报告当前仓位、可用保证金、计划所需保证金，以及 `max_position` 风控是否通过。
+
 ### 在 TUI 内输入 API Key
 
 不需要先创建 `.env` 才能进入 TUI：

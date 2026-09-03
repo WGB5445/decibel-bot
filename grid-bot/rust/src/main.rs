@@ -471,6 +471,9 @@ struct Args {
         default_value_t = 5
     )]
     max_consecutive_bulk_failures: usize,
+    /// Perp-only absolute position cap.
+    #[arg(long, global = true, env = "GRID_MAX_POSITION")]
+    max_position: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -528,6 +531,7 @@ struct Settings {
     entry_min_fill_ratio: String,
     price_buffer_bps: String,
     max_consecutive_bulk_failures: usize,
+    max_position: Option<String>,
 }
 
 impl From<&Args> for Settings {
@@ -587,6 +591,7 @@ impl From<&Args> for Settings {
             entry_min_fill_ratio: args.entry_min_fill_ratio.clone(),
             price_buffer_bps: args.price_buffer_bps.clone(),
             max_consecutive_bulk_failures: args.max_consecutive_bulk_failures,
+            max_position: args.max_position.clone(),
         }
     }
 }
@@ -632,7 +637,12 @@ impl Settings {
             entry_min_fill_ratio: "0.8".to_owned(),
             price_buffer_bps: "5".to_owned(),
             max_consecutive_bulk_failures: 5,
+            max_position: None,
         }
+    }
+
+    fn network_profile(&self) -> Result<&'static decibel_grid_tui::network::NetworkProfile> {
+        decibel_grid_tui::network::default_registry().resolve(&self.network)
     }
 
     fn tr(&self, key: TKey) -> &'static str {
@@ -683,6 +693,7 @@ impl Settings {
             entry_min_fill_ratio: self.entry_min_fill_ratio.clone(),
             price_buffer_bps: self.price_buffer_bps.clone(),
             max_consecutive_bulk_failures: self.max_consecutive_bulk_failures.to_string(),
+            max_position: self.max_position.clone(),
             encrypted_api_key: None,
             encrypted_aptos_private_key: None,
         }
@@ -737,6 +748,7 @@ impl Settings {
         if let Ok(value) = data.max_consecutive_bulk_failures.parse() {
             self.max_consecutive_bulk_failures = value;
         }
+        self.max_position = data.max_position.clone();
         if let Ok(value) = data.auto_convert_missing_base.parse() {
             self.auto_convert_missing_base = value;
         }
@@ -844,12 +856,18 @@ impl Settings {
                 price_buffer_bps: decimal(&self.price_buffer_bps)?,
                 max_consecutive_bulk_failures: self.max_consecutive_bulk_failures,
             },
+            max_position: self
+                .max_position
+                .as_deref()
+                .map(decimal)
+                .transpose()?,
         })
     }
     fn api_client(&self) -> Result<DecibelClient> {
         if self.api_key.trim().is_empty() {
             anyhow::bail!("API key is required. Select API Key and press Enter to set it.")
         }
+        let _ = self.network_profile()?;
         DecibelClient::new(&self.network, &self.api_key)
     }
     fn masked_key(&self) -> String {
@@ -894,8 +912,9 @@ enum Field {
     RefreshSeconds,
     PriceSource,
     ExitAssetPolicy,
+    MaxPosition,
 }
-const FIELDS: [Field; 19] = [
+const FIELDS: [Field; 20] = [
     Field::ApiKey,
     Field::AptosPrivateKey,
     Field::Language,
@@ -915,6 +934,7 @@ const FIELDS: [Field; 19] = [
     Field::RefreshSeconds,
     Field::PriceSource,
     Field::ExitAssetPolicy,
+    Field::MaxPosition,
 ];
 
 impl Field {
@@ -941,6 +961,7 @@ impl Field {
                 Self::RefreshSeconds => TKey::FieldRefreshSeconds,
                 Self::PriceSource => TKey::FieldPriceSource,
                 Self::ExitAssetPolicy => TKey::FieldExitAssetPolicy,
+                Self::MaxPosition => TKey::FieldMaxPosition,
             },
         )
     }
@@ -958,6 +979,7 @@ impl Field {
                 | Self::MakerFee
                 | Self::PreviewLeverage
                 | Self::RefreshSeconds
+                | Self::MaxPosition
         )
     }
     fn visible(self, settings: &Settings) -> bool {
@@ -966,6 +988,7 @@ impl Field {
             // two-sided inventory grids, so hiding this avoids a misleading setting.
             Self::PerpMode => settings.product == Product::Perp,
             Self::PreviewLeverage => settings.product == Product::Perp,
+            Self::MaxPosition => settings.product == Product::Perp,
             Self::UpperBound => settings.range_kind == RangeKind::Bounds,
             _ => true,
         }
@@ -1310,6 +1333,11 @@ impl App {
             Field::RefreshSeconds => self.settings.refresh_seconds.clone(),
             Field::PriceSource => format!("{:?}", self.settings.price_source),
             Field::ExitAssetPolicy => format!("{:?}", self.settings.exit_asset_policy),
+            Field::MaxPosition => self
+                .settings
+                .max_position
+                .clone()
+                .unwrap_or_else(|| self.settings.tr(TKey::Optional).to_owned()),
         }
     }
     fn editable_value_mut(&mut self, field: Field) -> Option<&mut String> {
@@ -1325,6 +1353,12 @@ impl App {
             Field::MakerFee => Some(&mut self.settings.maker_fee_rate),
             Field::PreviewLeverage => Some(&mut self.settings.preview_leverage),
             Field::RefreshSeconds => Some(&mut self.settings.refresh_seconds),
+            Field::MaxPosition => {
+                if self.settings.max_position.is_none() {
+                    self.settings.max_position = Some(String::new());
+                }
+                self.settings.max_position.as_mut()
+            }
             _ => None,
         }
     }
@@ -2139,7 +2173,17 @@ async fn doctor_cli(settings: Settings) -> Result<()> {
                 anyhow::anyhow!("available Perp margin unavailable in account overview")
             })?;
             let required = snapshot.plan.estimated_margin.unwrap_or(Decimal::ZERO);
+            let position = snapshot.account.position.size;
             println!("  margin: available={} estimated={}", margin, required);
+            println!("  position: {}", position);
+            if let Some(max) = config.max_position {
+                println!("  max_position: {}", max);
+                if !perp_position_is_safe(position, &snapshot.plan, Some(max)) {
+                    anyhow::bail!(
+                        "Perp position {position} or worst-case exposure exceeds max_position {max}"
+                    )
+                }
+            }
             if margin < required {
                 anyhow::bail!(
                     "estimated Perp margin {} exceeds available {}",
@@ -2592,6 +2636,32 @@ async fn run_cli(
                     funds.quote_balance.to_string(),
                 )
             });
+            let is_perp = snapshot.market.product == Product::Perp;
+            let perp_mode = if is_perp {
+                Some(format!("{:?}", config.perp_mode).to_lowercase())
+            } else {
+                None
+            };
+            let max_position = if is_perp {
+                config.max_position.map(|value| value.to_string())
+            } else {
+                None
+            };
+            let position = if is_perp {
+                Some(snapshot.account.position.size.to_string())
+            } else {
+                None
+            };
+            let available_margin = if is_perp {
+                snapshot.account.available_margin.map(|value| value.to_string())
+            } else {
+                None
+            };
+            let estimated_margin = if is_perp {
+                snapshot.plan.estimated_margin.map(|value| value.to_string())
+            } else {
+                None
+            };
             runtime
                 .update_status(|status| {
                     status.phase = "running".to_owned();
@@ -2599,6 +2669,11 @@ async fn run_cli(
                     status.mid = Some(mid);
                     status.last_error = None;
                     status.ladder = ladder;
+                    status.perp_mode = perp_mode.clone();
+                    status.max_position = max_position.clone();
+                    status.position = position.clone();
+                    status.available_margin = available_margin.clone();
+                    status.estimated_margin = estimated_margin.clone();
                     if let Some((base_symbol, base_balance, quote_symbol, quote_balance)) = funds {
                         status.pfs_base_symbol = Some(base_symbol);
                         status.pfs_base_balance = Some(base_balance);
@@ -2626,173 +2701,34 @@ async fn run_cli(
                 Some(last_seen_trade_ms.map_or(latest, |previous| previous.max(latest)));
         }
         if snapshot.market.product == Product::Spot {
-            // Optional Spot stop-loss: unlike a normal lower-bound breach, this is terminal.
-            // Cancel the bulk ladder and liquidate all available base before stopping the run.
-            if execute
-                && let Some(stop) = spot_exit_price
-                && snapshot.plan.mid <= stop
+            use decibel_grid_tui::strategy::spot::runtime::{
+                SpotCycleContext, SpotCycleOutcome, run_spot_cycle,
+            };
+            match run_spot_cycle(&mut SpotCycleContext {
+                execute,
+                spot_exit_price,
+                spot_fee_rates: spot_fee_rates.as_ref(),
+                network: &settings.network,
+                api_key: &settings.api_key,
+                aptos_private_key: &settings.aptos_private_key,
+                subaccount: &settings.subaccount,
+                config: &mut config,
+                journal: journal.as_ref(),
+                run_state: &mut run_state,
+                pinned_spot_plan: &mut pinned_spot_plan,
+                snapshot: &mut snapshot,
+                stop_loss_liquidated: &mut stop_loss_liquidated,
+                paused_by_breakout: &mut paused_by_breakout,
+                cancelled: Arc::clone(&cancel),
+            })
+            .await?
             {
-                println!(
-                    "Spot stop-loss reached at {} (trigger {}); cancelling ladder and liquidating base.",
-                    snapshot.plan.mid, stop
-                );
-                match exit_sell_assets(
-                    &settings.network,
-                    &settings.api_key,
-                    &settings.aptos_private_key,
-                    &settings.subaccount,
-                    &snapshot.market,
-                    Some((
-                        &config.spot,
-                        spot_fee_rates
-                            .as_ref()
-                            .expect("live Spot execution fetched fee rates"),
-                    )),
-                )
-                .await
-                {
-                    Ok(hashes) => {
-                        println!("Spot stop-loss liquidation completed: {:?}", hashes);
-                        stop_loss_liquidated = true;
-                    }
-                    Err(error) => eprintln!("Spot stop-loss liquidation failed: {error:#}"),
-                }
-                break;
-            }
-            // Upgrade pre-uniform persisted state once, retaining its price geometry while
-            // introducing the fixed per-grid base size used by every later replacement.
-            if pinned_spot_plan
-                .as_ref()
-                .is_some_and(|plan| plan.per_grid_base_size.is_none())
-            {
-                let upgraded = pinned_spot_plan
-                    .as_ref()
-                    .expect("checked above")
-                    .pin_spot_per_grid_base_size(&config, &snapshot.market)?;
-                println!(
-                    "Migrated persisted Spot grid to fixed per-grid size {}.",
-                    upgraded
-                        .per_grid_base_size
-                        .expect("Spot migration sets per_grid_base_size")
-                );
-                pinned_spot_plan = Some(upgraded);
-            }
-            // Initialize the Spot geometry once. From the second cycle onward the plan's mid,
-            // lower/upper bounds, prices, and per-level sizes are all pinned for this run.
-            if pinned_spot_plan.is_none() {
-                pinned_spot_plan = Some(snapshot.plan.clone());
-                println!(
-                    "Spot grid pinned for this run: bounds [{}, {}], mid {}, {} bid(s), {} ask(s).",
-                    snapshot.plan.lower,
-                    snapshot.plan.upper,
-                    snapshot.plan.mid,
-                    snapshot.plan.bids.len(),
-                    snapshot.plan.asks.len()
-                );
-            }
-            let mid = snapshot.plan.mid;
-            let (lower, upper) = pinned_spot_plan
-                .as_ref()
-                .map(|plan| (plan.lower, plan.upper))
-                .expect("Spot plan was pinned above");
-            if mid < lower || mid > upper {
-                let direction = if mid < lower { "below" } else { "above" };
-                let reason =
-                    format!("Spot mid {mid} broke {direction} pinned range [{lower}, {upper}]");
-                match config.spot.range_breakout_action {
-                    RangeBreakoutAction::PauseAndAlert => {
-                        eprintln!("RANGE BREAKOUT: {reason}; pausing the grid.");
-                        if let Some(journal) = &journal {
-                            let event = journal::JournalEvent::RiskRejected {
-                                at: Utc::now(),
-                                reason: reason.clone(),
-                            };
-                            journal.append(&event)?;
-                            run_state.apply(&event);
-                            journal.save_state(&run_state)?;
-                        }
-                        if execute {
-                            match spot_lifecycle::cancel_bulk_ladder(
-                                &settings.network,
-                                &settings.aptos_private_key,
-                                &settings.subaccount,
-                                &snapshot.market,
-                            )
-                            .await
-                            {
-                                Ok(hash) => println!(
-                                    "Range-breakout ladder cancellation submitted in tx {hash}"
-                                ),
-                                Err(error) => {
-                                    eprintln!("Range-breakout cancellation failed: {error:#}")
-                                }
-                            }
-                            paused_by_breakout = true;
-                            break;
-                        }
-                    }
-                    RangeBreakoutAction::ExtendGrid => {
-                        let shifted_range = match config.range.clone() {
-                            RangeSpec::Bounds { lower, upper } => {
-                                let delta = if mid < lower {
-                                    mid - lower
-                                } else {
-                                    mid - upper
-                                };
-                                RangeSpec::Bounds {
-                                    lower: lower + delta,
-                                    upper: upper + delta,
-                                }
-                            }
-                            // Percent and geometric-step ranges are naturally rebuilt around the
-                            // newest mid; retain their configured spacing parameters.
-                            other => other,
-                        };
-                        config.range = shifted_range;
-                        let fixed_size = pinned_spot_plan
-                            .as_ref()
-                            .and_then(|plan| plan.per_grid_base_size);
-                        let shifted = build_plan_with_per_grid_base_size(
-                            &config,
-                            &snapshot.market,
-                            mid,
-                            fixed_size,
-                        )?;
-                        println!(
-                            "RANGE BREAKOUT: {reason}; extended grid to [{}, {}]",
-                            shifted.lower, shifted.upper
-                        );
-                        pinned_spot_plan = Some(shifted);
-                    }
-                }
-            }
-            // The pinned ladder supplies the prices and per-level sizes; only the bid/ask split
-            // follows the latest price, which is what produces sell-high/buy-low rotation after
-            // a fill without ever moving the grid itself.
-            let pinned = pinned_spot_plan
-                .as_ref()
-                .expect("Spot plan was pinned above");
-            snapshot.plan = pinned.project_spot(mid, snapshot.market.tick_size)?;
-            if let Err(error) = snapshot.plan.enforce_spot_budget(&config) {
-                let reason = format!(
-                    "fixed Spot per-grid size no longer fits the configured budget after re-centering: {error:#}"
-                );
-                eprintln!("RISK REJECTED: {reason}");
-                if let Some(journal) = &journal {
-                    let event = journal::JournalEvent::RiskRejected {
-                        at: Utc::now(),
-                        reason,
-                    };
-                    journal.append(&event)?;
-                    run_state.apply(&event);
-                    journal.save_state(&run_state)?;
-                }
-                check_cancel!();
-                tokio::time::sleep(config.refresh).await;
-                continue;
+                SpotCycleOutcome::BreakLoop => break,
+                SpotCycleOutcome::ContinueOuterLoop => continue,
+                SpotCycleOutcome::Completed => {}
             }
         } else {
-            snapshot.plan = build_plan(&config, &snapshot.market, snapshot.plan.mid)?;
+            decibel_grid_tui::strategy::perp::runtime::rebuild_perp_plan(&config, &mut snapshot)?;
         }
 
         // Read the resting orders BEFORE funding or fitting a Spot plan. The executable Spot
@@ -3172,6 +3108,25 @@ async fn run_cli(
                                 BULK_REPLACEMENT_COOLDOWN.as_secs(),
                                 desired_level_count
                             );
+                        } else if snapshot.market.product == Product::Perp
+                            && let Some(reason) = decibel_grid_tui::strategy::perp::runtime::perp_submission_blocked(
+                                &config,
+                                &exec_plan,
+                                snapshot.account.position.size,
+                                snapshot.account.available_margin,
+                            )
+                        {
+                            decibel_grid_tui::strategy::perp::runtime::record_perp_risk_rejection(
+                                reason,
+                                &settings.network,
+                                &settings.aptos_private_key,
+                                &settings.subaccount,
+                                &snapshot.market,
+                                journal.as_ref(),
+                                &mut run_state,
+                                execute,
+                            )
+                            .await?;
                         } else {
                             match execute_bulk_grid(
                                 &settings.network,
@@ -5155,6 +5110,9 @@ fn field_explanation(app: &App, field: Field) -> String {
         Field::ExitAssetPolicy => {
             "Retain leaves Spot base and Perp positions untouched. Sell cancels the bot ladder, sells available Spot base with bounded IOC orders, and submits a reduce-only Perp close."
         }
+        Field::MaxPosition => {
+            "Perp-only absolute position cap. Live execution rejects plans that would breach current or worst-case exposure after resting bids/asks fill."
+        }
         Field::ApiKey => {
             "Decibel API key for market/account reads. It is masked and can be encrypted in the profile with Ctrl+S."
         }
@@ -5201,6 +5159,9 @@ fn field_explanation(app: &App, field: Field) -> String {
         Field::Subaccount => "可选地址,用于读取仓位、挂单、余额和成交历史。",
         Field::ExitAssetPolicy => {
             "Retain：退出时不处理资产。Sell：退出时取消 bot 挂单，用 IOC 卖出可用 Spot base，并提交 reduce-only Perp 平仓。"
+        }
+        Field::MaxPosition => {
+            "仅 Perp：绝对仓位上限。若当前或最坏成交后敞口会超限，则拒绝提交并取消挂单。"
         }
     };
     let mut text = if language == Language::Chinese {

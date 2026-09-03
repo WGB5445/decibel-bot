@@ -81,6 +81,11 @@ pub struct EngineStatus {
     pub pfs_quote_symbol: Option<String>,
     pub pfs_quote_balance: Option<String>,
     pub realized_pnl: Option<String>,
+    pub perp_mode: Option<String>,
+    pub max_position: Option<String>,
+    pub position: Option<String>,
+    pub available_margin: Option<String>,
+    pub estimated_margin: Option<String>,
     pub ladder: Vec<LadderLevel>,
     pub events: Vec<EngineEvent>,
 }
@@ -483,5 +488,24 @@ mod tests {
         assert!(handle.is_cancelled());
         server.await.unwrap().unwrap();
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn engine_status_round_trips_perp_fields() {
+        let status = EngineStatus {
+            perp_mode: Some("long".to_owned()),
+            max_position: Some("0.01".to_owned()),
+            position: Some("0.002".to_owned()),
+            available_margin: Some("120".to_owned()),
+            estimated_margin: Some("500".to_owned()),
+            ..Default::default()
+        };
+        let encoded = serde_json::to_string(&status).unwrap();
+        let decoded: EngineStatus = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(decoded.perp_mode, status.perp_mode);
+        assert_eq!(decoded.max_position, status.max_position);
+        assert_eq!(decoded.position, status.position);
+        assert_eq!(decoded.available_margin, status.available_margin);
+        assert_eq!(decoded.estimated_margin, status.estimated_margin);
     }
 }
