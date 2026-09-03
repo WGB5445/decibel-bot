@@ -1,0 +1,52 @@
+{
+  "name": "reconcile_bulk_match",
+  "product": "spot",
+  "config": {
+    "total_count": 2,
+    "range": { "kind": "bounds", "lower": "99", "upper": "101" },
+    "allocation": { "kind": "fixed_size", "value": "1.23" }
+  },
+  "market": {
+    "name": "TEST/USDC",
+    "tick_size": "0.01",
+    "lot_size": "0.01",
+    "min_size": "0.01"
+  },
+  "steps": [
+    {
+      "mid": "100",
+      "expect": {
+        "bid_count": 1,
+        "ask_count": 1
+      }
+    }
+  ],
+  "reconcile": {
+    "desired": [
+      { "side": "bid", "price": "99.01", "size": "1.23" },
+      { "side": "ask", "price": "101.02", "size": "1.23" }
+    ],
+    "actual": [
+      {
+        "order_id": "bulk:1:Bid:0",
+        "side": "bid",
+        "price": "99.019",
+        "remaining_size": "1.239",
+        "origin": "bulk"
+      },
+      {
+        "order_id": "bulk:1:Ask:0",
+        "side": "ask",
+        "price": "101.029",
+        "remaining_size": "1.239",
+        "origin": "bulk"
+      }
+    ],
+    "expect": {
+      "matched_count": 2,
+      "missing_count": 0,
+      "unmanaged_count": 0,
+      "reconcile_converged": true
+    }
+  }
+}

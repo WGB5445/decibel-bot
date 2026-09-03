@@ -198,6 +198,7 @@ TUI 的 `U` 只会提交明确指定数量的 Cross → PFS 转账；不会自�
 | `doctor` | 读取市场、计划、余额、订单并报告风险 | 否 |
 | `reconcile` | 单次期望网格与实际订单对比 | 否 |
 | `shadow --shadow-cycles N` | 连续模拟 reconciliation 与 journal，不签名 | 否 |
+| `simulate --scenario <file>` | 离线多步场景模拟（JSON/YAML），输出 JSONL | 否 |
 | `spot-funding-setup` | 显式配置资金路由、可选 Cross → PFS 转账 | 是，仅在明确调用时 |
 | `tui` / `preview` | 配置、预览、监控 | 否 |
 
@@ -274,6 +275,14 @@ cargo build --release
 cargo test
 cargo fmt --check
 cargo clippy --all-targets -- -D warnings
+```
+
+**策略正确性以 `cargo test` 为准**（内嵌 `tests/scenarios/` fixture，零网络）。`shadow`、`doctor`、`check-key`、`start` 等连网命令仅用于人工 testnet/mainnet 验收，不进 CI。
+
+离线多步场景调试（同样零网络，输出 JSONL）：
+
+```bash
+cargo run -- simulate --scenario tests/scenarios/spot_pin_sweep.json
 ```
 
 首次构建会从 crates.io 下载依赖。

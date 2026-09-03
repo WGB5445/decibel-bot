@@ -30,6 +30,7 @@ pub mod journal;
 pub mod network;
 pub mod profile;
 pub mod reconcile;
+pub mod simulation;
 pub mod spot_lifecycle;
 pub mod spot_taker;
 pub mod strategy;

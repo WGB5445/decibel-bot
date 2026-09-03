@@ -1,0 +1,51 @@
+{
+  "name": "spot_pin_sweep",
+  "product": "spot",
+  "config": {
+    "total_count": 8,
+    "range": { "kind": "bounds", "lower": "0.45", "upper": "0.65" },
+    "allocation": { "kind": "fixed_size", "value": "0.1" },
+    "maker_fee_rate": "0.001"
+  },
+  "market": {
+    "name": "TEST/USDC",
+    "tick_size": "0.01",
+    "lot_size": "0.01",
+    "min_size": "0.01"
+  },
+  "steps": [
+    {
+      "mid": "0.55",
+      "expect": {
+        "bid_count": 4,
+        "ask_count": 4,
+        "pinned_lower": "0.45",
+        "pinned_upper": "0.65",
+        "per_grid_base_size": "0.1",
+        "all_level_sizes": "0.1",
+        "first_bid_price": "0.52",
+        "first_ask_price": "0.57"
+      }
+    },
+    {
+      "mid": "0.48",
+      "expect": {
+        "bid_count": 2,
+        "ask_count": 6,
+        "pinned_lower": "0.45",
+        "pinned_upper": "0.65",
+        "all_level_sizes": "0.1"
+      }
+    },
+    {
+      "mid": "0.62",
+      "expect": {
+        "bid_count": 6,
+        "ask_count": 1,
+        "pinned_lower": "0.45",
+        "pinned_upper": "0.65",
+        "all_level_sizes": "0.1"
+      }
+    }
+  ]
+}

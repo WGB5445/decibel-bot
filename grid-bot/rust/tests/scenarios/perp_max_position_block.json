@@ -1,0 +1,35 @@
+{
+  "name": "perp_max_position_block",
+  "product": "perp",
+  "config": {
+    "total_count": 4,
+    "perp_mode": "long",
+    "range": { "kind": "percent", "percent": "10" },
+    "allocation": { "kind": "fixed_size", "value": "1" },
+    "max_position": "2"
+  },
+  "market": {
+    "name": "BTC/USD",
+    "tick_size": "1",
+    "lot_size": "0.01",
+    "min_size": "0.01",
+    "px_decimals": 0,
+    "sz_decimals": 2
+  },
+  "steps": [
+    {
+      "mid": "100",
+      "position": "2",
+      "expect": {
+        "perp_blocked": true
+      }
+    },
+    {
+      "mid": "100",
+      "position": "0",
+      "expect": {
+        "perp_blocked": true
+      }
+    }
+  ]
+}

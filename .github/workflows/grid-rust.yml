@@ -1,0 +1,21 @@
+name: grid-rust
+
+on:
+  push:
+    paths:
+      - "grid-bot/rust/**"
+      - ".github/workflows/grid-rust.yml"
+  pull_request:
+    paths:
+      - "grid-bot/rust/**"
+      - ".github/workflows/grid-rust.yml"
+
+jobs:
+  test-offline:
+    runs-on: ubuntu-latest
+    env:
+      CARGO_NET_GIT_FETCH_WITH_CLI: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cd grid-bot/rust && cargo test --locked

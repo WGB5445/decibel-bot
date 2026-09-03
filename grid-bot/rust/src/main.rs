@@ -278,6 +278,8 @@ enum Cmd {
     Shadow,
     /// Move Cross USDC into PFS; set future settlement routing manually as subaccount owner first.
     SpotFundingSetup,
+    /// Offline multi-step scenario simulation (zero network); writes JSONL to stdout.
+    Simulate,
     Tui,
 }
 
@@ -330,6 +332,9 @@ struct Args {
     /// Human-readable USDC amount to move from Cross to PFS for `spot-funding-setup`.
     #[arg(long, global = true, env = "SPOT_FUNDING_AMOUNT", default_value = "0")]
     spot_funding_amount: String,
+    /// Scenario YAML/JSON file for the offline `simulate` command.
+    #[arg(long, global = true, env = "GRID_SCENARIO")]
+    scenario: Option<PathBuf>,
     /// USDC metadata object; defaults to the testnet USDC metadata.
     #[arg(long, global = true, env = "SPOT_FUNDING_METADATA")]
     spot_funding_metadata: Option<String>,
@@ -1736,6 +1741,7 @@ async fn main() -> Result<()> {
             )
             .await
         }
+        Some(Cmd::Simulate) => simulate_cli(cli.args.scenario.as_deref()),
         Some(Cmd::Run) => anyhow::bail!(
             "`run` no longer owns a live trading loop; use `start` (or let systemd/tmux run the internal `engine` command) and control it with status/logs/stop/attach"
         ),
@@ -1780,6 +1786,16 @@ async fn main() -> Result<()> {
             .await
         }
     }
+}
+
+fn simulate_cli(scenario_path: Option<&Path>) -> Result<()> {
+    let path = scenario_path
+        .context("simulate requires --scenario <path> (YAML or JSON)")?;
+    let raw = fs::read_to_string(path)
+        .with_context(|| format!("read scenario {}", path.display()))?;
+    let scenario = decibel_grid_tui::simulation::parse_scenario(&raw)?;
+    decibel_grid_tui::simulation::simulate_scenario(&scenario, std::io::stdout())?;
+    Ok(())
 }
 
 async fn check_api_key(settings: Settings) -> Result<()> {
@@ -2728,7 +2744,17 @@ async fn run_cli(
                 SpotCycleOutcome::Completed => {}
             }
         } else {
-            decibel_grid_tui::strategy::perp::runtime::rebuild_perp_plan(&config, &mut snapshot)?;
+            let offline = decibel_grid_tui::simulation::run_offline_cycle(
+                decibel_grid_tui::simulation::OfflineCycleInput {
+                    config: config.clone(),
+                    market: snapshot.market.clone(),
+                    mid: snapshot.plan.mid,
+                    account: snapshot.account.clone(),
+                    pinned_spot_plan: None,
+                    spot_exit_price: None,
+                },
+            )?;
+            snapshot.plan = offline.plan;
         }
 
         // Read the resting orders BEFORE funding or fitting a Spot plan. The executable Spot
