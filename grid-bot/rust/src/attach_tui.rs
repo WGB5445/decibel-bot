@@ -554,12 +554,12 @@ fn ladder_line(level: &LadderLevel) -> Line<'static> {
             side_style,
         ),
         Span::styled(
-            format!("{:>16}", format_decimal(&level.size, 6)),
-            side_style,
-        ),
-        Span::styled(
             format!("{:>18}", format_decimal(&level.price, 8)),
             price_style,
+        ),
+        Span::styled(
+            format!("{:>16}", format_decimal(&level.size, 6)),
+            side_style,
         ),
         Span::styled(format!("{:>12}", state), state_style),
     ])
@@ -721,11 +721,7 @@ fn compact_text(value: &str, max_chars: usize) -> String {
 
 fn render(frame: &mut ratatui::Frame, app: &App, content: &[Line<'static>], max_scroll: usize) {
     let area = frame.area();
-    let header_height = if app.status.perp_mode.is_some() {
-        6
-    } else {
-        5
-    };
+    let header_height = if app.status.perp_mode.is_some() { 6 } else { 5 };
     let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -818,7 +814,7 @@ fn render(frame: &mut ratatui::Frame, app: &App, content: &[Line<'static>], max_
 
     frame.render_widget(
         Paragraph::new(header_lines)
-        .block(Block::default().borders(Borders::ALL).title("Grid monitor")),
+            .block(Block::default().borders(Borders::ALL).title("Grid monitor")),
         rows[0],
     );
 

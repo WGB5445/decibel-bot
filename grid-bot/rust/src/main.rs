@@ -861,11 +861,7 @@ impl Settings {
                 price_buffer_bps: decimal(&self.price_buffer_bps)?,
                 max_consecutive_bulk_failures: self.max_consecutive_bulk_failures,
             },
-            max_position: self
-                .max_position
-                .as_deref()
-                .map(decimal)
-                .transpose()?,
+            max_position: self.max_position.as_deref().map(decimal).transpose()?,
         })
     }
     fn api_client(&self) -> Result<DecibelClient> {
@@ -1789,10 +1785,9 @@ async fn main() -> Result<()> {
 }
 
 fn simulate_cli(scenario_path: Option<&Path>) -> Result<()> {
-    let path = scenario_path
-        .context("simulate requires --scenario <path> (YAML or JSON)")?;
-    let raw = fs::read_to_string(path)
-        .with_context(|| format!("read scenario {}", path.display()))?;
+    let path = scenario_path.context("simulate requires --scenario <path> (YAML or JSON)")?;
+    let raw =
+        fs::read_to_string(path).with_context(|| format!("read scenario {}", path.display()))?;
     let scenario = decibel_grid_tui::simulation::parse_scenario(&raw)?;
     decibel_grid_tui::simulation::simulate_scenario(&scenario, std::io::stdout())?;
     Ok(())
@@ -2669,12 +2664,18 @@ async fn run_cli(
                 None
             };
             let available_margin = if is_perp {
-                snapshot.account.available_margin.map(|value| value.to_string())
+                snapshot
+                    .account
+                    .available_margin
+                    .map(|value| value.to_string())
             } else {
                 None
             };
             let estimated_margin = if is_perp {
-                snapshot.plan.estimated_margin.map(|value| value.to_string())
+                snapshot
+                    .plan
+                    .estimated_margin
+                    .map(|value| value.to_string())
             } else {
                 None
             };
@@ -3135,12 +3136,13 @@ async fn run_cli(
                                 desired_level_count
                             );
                         } else if snapshot.market.product == Product::Perp
-                            && let Some(reason) = decibel_grid_tui::strategy::perp::runtime::perp_submission_blocked(
-                                &config,
-                                &exec_plan,
-                                snapshot.account.position.size,
-                                snapshot.account.available_margin,
-                            )
+                            && let Some(reason) =
+                                decibel_grid_tui::strategy::perp::runtime::perp_submission_blocked(
+                                    &config,
+                                    &exec_plan,
+                                    snapshot.account.position.size,
+                                    snapshot.account.available_margin,
+                                )
                         {
                             decibel_grid_tui::strategy::perp::runtime::record_perp_risk_rejection(
                                 reason,

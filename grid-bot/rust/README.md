@@ -56,9 +56,15 @@ cargo run -- stop --subaccount 0x... --exit-mode liquidate
 每个 subaccount 的控制文件：
 
 ```text
+# Unix
 /tmp/grid-bot/<normalized-subaccount>.sock  # 单行 JSON Unix socket
-/tmp/grid-bot/<normalized-subaccount>.pid   # 引擎 PID
-/tmp/grid-bot/<normalized-subaccount>.log   # 默认引擎日志
+/tmp/grid-bot/<normalized-subaccount>.pid
+/tmp/grid-bot/<normalized-subaccount>.log
+
+# Windows
+\\.\pipe\grid-bot-<normalized-subaccount>   # 单行 JSON named pipe（仅本机）
+%TEMP%\grid-bot\<normalized-subaccount>.pid
+%TEMP%\grid-bot\<normalized-subaccount>.log
 ```
 
 `start` 检查 PID、socket 和账户文件锁；运行中的引擎持有同一把锁，因此同一 subaccount 不能有两个进程同时提交 bulk ladder。`status`、`logs`、`attach`、`stop` 不直接访问交易所或使用私钥。`attach` 的 Ctrl+C 只退出客户端，不会停止引擎。

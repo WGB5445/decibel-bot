@@ -3,11 +3,11 @@
 use anyhow::Result;
 use rust_decimal::Decimal;
 
+use crate::strategy::perp::runtime::perp_submission_blocked;
 use crate::{
     AccountOverview, GridConfig, GridPlan, Market, Product, RangeBreakoutAction, RangeSpec,
     build_plan, build_plan_with_per_grid_base_size,
 };
-use crate::strategy::perp::runtime::perp_submission_blocked;
 
 /// Inputs for one offline planning cycle (no async I/O).
 #[derive(Clone, Debug)]

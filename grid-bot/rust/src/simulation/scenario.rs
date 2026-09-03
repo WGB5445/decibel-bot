@@ -6,11 +6,11 @@ use anyhow::{Context, Result, bail};
 use rust_decimal::Decimal;
 use serde::Deserialize;
 
+use crate::simulation::cycle::{OfflineCycleInput, OfflineCycleOutput, run_offline_cycle};
 use crate::{
     AccountOverview, Allocation, GridConfig, Market, PerpMode, Position, PriceSource, Product,
     RangeBreakoutAction, RangeSpec, SpotExecutionConfig, SpotFunds,
 };
-use crate::simulation::cycle::{OfflineCycleInput, OfflineCycleOutput, run_offline_cycle};
 
 #[derive(Clone, Debug, Deserialize)]
 pub struct Scenario {
@@ -96,7 +96,9 @@ pub enum ScenarioAllocation {
 
 impl Default for ScenarioAllocation {
     fn default() -> Self {
-        Self::FixedSize { value: Decimal::ONE }
+        Self::FixedSize {
+            value: Decimal::ONE,
+        }
     }
 }
 
@@ -360,20 +362,14 @@ fn assert_step_expectations(
         );
     }
     if let Some(lower) = expect.pinned_lower {
-        let actual = output
-            .pinned_spot_plan
-            .as_ref()
-            .map(|pinned| pinned.lower);
+        let actual = output.pinned_spot_plan.as_ref().map(|pinned| pinned.lower);
         anyhow::ensure!(
             actual == Some(lower),
             "step {step_index}: expected pinned lower {lower}, got {actual:?}"
         );
     }
     if let Some(upper) = expect.pinned_upper {
-        let actual = output
-            .pinned_spot_plan
-            .as_ref()
-            .map(|pinned| pinned.upper);
+        let actual = output.pinned_spot_plan.as_ref().map(|pinned| pinned.upper);
         anyhow::ensure!(
             actual == Some(upper),
             "step {step_index}: expected pinned upper {upper}, got {actual:?}"
@@ -387,9 +383,7 @@ fn assert_step_expectations(
         );
     }
     if let Some(size) = expect.all_level_sizes {
-        let uniform = plan
-            .all_levels()
-            .all(|level| level.size == size);
+        let uniform = plan.all_levels().all(|level| level.size == size);
         anyhow::ensure!(
             uniform,
             "step {step_index}: not all levels have size {size}"

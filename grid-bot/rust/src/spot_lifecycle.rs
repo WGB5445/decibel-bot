@@ -34,8 +34,7 @@ pub async fn cancel_bulk_ladder(
     let subaccount_addr: AccountAddress =
         subaccount.parse().context("invalid subaccount address")?;
     let market_addr: AccountAddress = market.address.parse().context("invalid market address")?;
-    let aptos = default_registry()
-        .aptos(network::default_registry().resolve(network)?)?;
+    let aptos = default_registry().aptos(network::default_registry().resolve(network)?)?;
     let gas_price = aptos
         .fullnode()
         .estimate_gas_price()

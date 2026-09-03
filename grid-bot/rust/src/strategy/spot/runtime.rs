@@ -65,9 +65,7 @@ pub async fn run_spot_cycle(ctx: &mut SpotCycleContext<'_>) -> Result<SpotCycleO
     *ctx.pinned_spot_plan = offline.pinned_spot_plan.clone();
     ctx.snapshot.plan = offline.plan;
 
-    if migrated_from_legacy
-        && let Some(upgraded) = ctx.pinned_spot_plan.as_ref()
-    {
+    if migrated_from_legacy && let Some(upgraded) = ctx.pinned_spot_plan.as_ref() {
         println!(
             "Migrated persisted Spot grid to fixed per-grid size {}.",
             upgraded
@@ -190,9 +188,7 @@ mod tests {
             product: crate::Product::Spot,
             perp_mode: crate::PerpMode::Neutral,
             market_name: "APT/USDC".to_owned(),
-            range: crate::RangeSpec::Percent {
-                percent: dec!(10),
-            },
+            range: crate::RangeSpec::Percent { percent: dec!(10) },
             total_count: 8,
             allocation: crate::Allocation::FixedSize(dec!(1)),
             maker_fee_rate: dec!(0.001),
@@ -240,10 +236,7 @@ mod tests {
         assert_eq!(first.plan.bids[0].price, dec!(9.75));
         assert_eq!(first.plan.asks[0].price, dec!(10.25));
 
-        let pinned_lower = first
-            .pinned_spot_plan
-            .as_ref()
-            .map(|plan| plan.lower);
+        let pinned_lower = first.pinned_spot_plan.as_ref().map(|plan| plan.lower);
         let second = simulation::run_offline_cycle(simulation::OfflineCycleInput {
             config: config.clone(),
             market: market.clone(),
@@ -257,9 +250,6 @@ mod tests {
             second.pinned_spot_plan.as_ref().map(|plan| plan.lower),
             pinned_lower
         );
-        assert!(second
-            .plan
-            .all_levels()
-            .all(|level| level.size == dec!(1)));
+        assert!(second.plan.all_levels().all(|level| level.size == dec!(1)));
     }
 }

@@ -1,6 +1,6 @@
-use crate::{GridConfig, GridPlan, Market, PerpMode, Product, Result};
-use crate::strategy::{GridStrategy, StrategyContext};
 use super::build_perp_plan;
+use crate::strategy::{GridStrategy, StrategyContext};
+use crate::{GridConfig, GridPlan, Market, PerpMode, Product, Result};
 
 pub struct PerpShortStrategy;
 

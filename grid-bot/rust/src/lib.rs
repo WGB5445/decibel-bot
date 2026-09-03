@@ -465,9 +465,7 @@ pub fn perp_position_is_safe(
     let ask_sum: Decimal = plan.asks.iter().map(|level| level.size).sum();
     let worst_long = position + bid_sum;
     let worst_short = position - ask_sum;
-    position.abs() < max
-        && worst_long.abs() <= max
-        && worst_short.abs() <= max
+    position.abs() < max && worst_long.abs() <= max && worst_short.abs() <= max
 }
 
 /// Build, sign, submit, and wait for an official Spot or Perp bulk order transaction.
@@ -2311,7 +2309,11 @@ pub(crate) fn side_counts(
     }
 }
 
-pub(crate) fn resolve_range(config: &GridConfig, mid: Decimal, levels: usize) -> Result<(Decimal, Decimal)> {
+pub(crate) fn resolve_range(
+    config: &GridConfig,
+    mid: Decimal,
+    levels: usize,
+) -> Result<(Decimal, Decimal)> {
     let hundred = Decimal::from(100);
     match config.range {
         RangeSpec::Bounds { lower, upper } => Ok((lower, upper)),
@@ -4794,10 +4796,7 @@ mod tests {
             &GridConfig {
                 perp_mode: PerpMode::Neutral,
                 total_count: 40,
-                range: RangeSpec::Bounds {
-                    lower,
-                    upper,
-                },
+                range: RangeSpec::Bounds { lower, upper },
                 ..config()
             },
             &market(),
@@ -4842,11 +4841,7 @@ mod tests {
             &plan,
             Some(bid_sum - dec!(0.01))
         ));
-        assert!(perp_position_is_safe(
-            Decimal::ZERO,
-            &plan,
-            Some(bid_sum)
-        ));
+        assert!(perp_position_is_safe(Decimal::ZERO, &plan, Some(bid_sum)));
     }
 
     #[test]

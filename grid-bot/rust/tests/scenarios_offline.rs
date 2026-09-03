@@ -36,12 +36,8 @@ fn spot_breakout_pause() {
 
 #[test]
 fn perp_modes_level_counts() {
-    load_scenario("perp_neutral_mid50")
-        .run()
-        .expect("neutral");
-    load_scenario("perp_long_only_bids")
-        .run()
-        .expect("long");
+    load_scenario("perp_neutral_mid50").run().expect("neutral");
+    load_scenario("perp_long_only_bids").run().expect("long");
 }
 
 #[test]
@@ -191,9 +187,8 @@ fn strategy_registry_spot_unchanged() {
 
 #[test]
 fn simulate_scenario_from_embedded_json() {
-    let results = simulation::simulate_scenario_from_str(include_str!(
-        "scenarios/spot_pin_sweep.json"
-    ))
-    .expect("simulate");
+    let results =
+        simulation::simulate_scenario_from_str(include_str!("scenarios/spot_pin_sweep.json"))
+            .expect("simulate");
     assert_eq!(results.len(), 3);
 }

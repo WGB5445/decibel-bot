@@ -1,7 +1,10 @@
 //! Local control plane for one running grid engine.
 //!
-//! The protocol intentionally stays small: one newline-delimited JSON request and response over a
-//! Unix-domain socket. It never carries credentials or signed transaction data.
+//! The protocol intentionally stays small: one newline-delimited JSON request and response. It
+//! never carries credentials or signed transaction data.
+//!
+//! Transport is a Unix-domain socket on Unix and a local named pipe on Windows. PID/log files live
+//! next to that endpoint (`/tmp/grid-bot` or `%TEMP%\grid-bot`).
 
 use std::{
     fs,
@@ -16,7 +19,7 @@ use std::{
 use anyhow::{Context, Result, anyhow, bail};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use tokio::sync::{RwLock, broadcast};
+use tokio::sync::{RwLock, broadcast, mpsc};
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -143,6 +146,29 @@ impl EngineHandle {
     }
 }
 
+fn control_directory() -> PathBuf {
+    #[cfg(unix)]
+    {
+        PathBuf::from("/tmp/grid-bot")
+    }
+    #[cfg(not(unix))]
+    {
+        std::env::temp_dir().join("grid-bot")
+    }
+}
+
+fn control_endpoint(directory: &Path, account: &str) -> PathBuf {
+    #[cfg(windows)]
+    {
+        let _ = directory;
+        PathBuf::from(format!(r"\\.\pipe\grid-bot-{account}"))
+    }
+    #[cfg(not(windows))]
+    {
+        directory.join(format!("{account}.sock"))
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct ControlPaths {
     pub directory: PathBuf,
@@ -163,9 +189,9 @@ impl ControlPaths {
         if account.is_empty() || !account.bytes().all(|byte| byte.is_ascii_hexdigit()) {
             bail!("SUBACCOUNT_ADDRESS must be a non-empty hexadecimal Aptos address")
         }
-        let directory = PathBuf::from("/tmp/grid-bot");
+        let directory = control_directory();
         Ok(Self {
-            socket: directory.join(format!("{account}.sock")),
+            socket: control_endpoint(&directory, &account),
             pid: directory.join(format!("{account}.pid")),
             log: directory.join(format!("{account}.log")),
             directory,
@@ -198,6 +224,8 @@ impl ControlPaths {
     }
 
     pub fn remove_runtime_files(&self) {
+        // Named pipes are not filesystem objects; only the Unix socket path should be unlinked.
+        #[cfg(not(windows))]
         let _ = fs::remove_file(&self.socket);
         let _ = fs::remove_file(&self.pid);
     }
@@ -216,50 +244,17 @@ impl ControlPaths {
     }
 }
 
-#[cfg(unix)]
-mod unix {
+mod protocol {
     use super::*;
-    use tokio::{
-        io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
-        net::{UnixListener, UnixStream},
-        task::JoinHandle,
-    };
+    use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 
     const MAX_LINE_BYTES: usize = 16 * 1024;
 
-    pub async fn start_server(
-        paths: &ControlPaths,
-        handle: EngineHandle,
-    ) -> Result<JoinHandle<Result<()>>> {
-        paths.ensure_directory()?;
-        let _ = fs::remove_file(&paths.socket);
-        let listener = UnixListener::bind(&paths.socket)
-            .with_context(|| format!("bind control socket {}", paths.socket.display()))?;
-        let socket = paths.socket.clone();
-        Ok(tokio::spawn(async move {
-            loop {
-                tokio::select! {
-                    accepted = listener.accept() => {
-                        let (stream, _) = accepted.context("accept control socket client")?;
-                        let client_handle = handle.clone();
-                        tokio::spawn(async move {
-                            let _ = handle_client(stream, client_handle).await;
-                        });
-                    }
-                    _ = tokio::time::sleep(Duration::from_millis(200)) => {
-                        if handle.is_cancelled() {
-                            break;
-                        }
-                    }
-                }
-            }
-            let _ = fs::remove_file(&socket);
-            Ok(())
-        }))
-    }
-
-    async fn handle_client(stream: UnixStream, handle: EngineHandle) -> Result<()> {
-        let (reader, mut writer) = stream.into_split();
+    pub async fn handle_client<R, W>(reader: R, mut writer: W, handle: EngineHandle) -> Result<()>
+    where
+        R: AsyncRead + Unpin,
+        W: AsyncWrite + Unpin,
+    {
         let mut reader = BufReader::new(reader);
         let mut line = String::new();
         let bytes = reader
@@ -288,7 +283,6 @@ mod unix {
                 Ok(Request::Status) => Response::Status {
                     status: Box::new(handle.status().await),
                 },
-                // Handled above before constructing a one-shot response.
                 Ok(Request::Subscribe) => Response::Error {
                     message: "subscribe request was not upgraded".to_owned(),
                 },
@@ -303,23 +297,21 @@ mod unix {
                 },
             }
         };
-        writer
-            .write_all(format!("{}\n", serde_json::to_string(&response)?).as_bytes())
+        write_line(&mut writer, &response)
             .await
             .context("write control response")?;
         writer.shutdown().await.context("close control response")?;
         Ok(())
     }
 
-    async fn stream_updates(
-        mut writer: tokio::net::unix::OwnedWriteHalf,
-        handle: EngineHandle,
-    ) -> Result<()> {
+    async fn stream_updates<W>(mut writer: W, handle: EngineHandle) -> Result<()>
+    where
+        W: AsyncWrite + Unpin,
+    {
         let mut updates = handle.subscribe();
-        // Every subscription starts with a complete snapshot, then receives only state changes.
-        write_update(
+        write_line(
             &mut writer,
-            Response::Status {
+            &Response::Status {
                 status: Box::new(handle.status().await),
             },
         )
@@ -327,20 +319,18 @@ mod unix {
         loop {
             match updates.recv().await {
                 Ok(status) => {
-                    write_update(
+                    write_line(
                         &mut writer,
-                        Response::Update {
+                        &Response::Update {
                             status: Box::new(status),
                         },
                     )
                     .await?
                 }
                 Err(broadcast::error::RecvError::Lagged(_)) => {
-                    // Recover from a slow client with one current snapshot rather than replaying
-                    // stale state or dropping the connection.
-                    write_update(
+                    write_line(
                         &mut writer,
-                        Response::Update {
+                        &Response::Update {
                             status: Box::new(handle.status().await),
                         },
                     )
@@ -352,23 +342,27 @@ mod unix {
         Ok(())
     }
 
-    async fn write_update(
-        writer: &mut tokio::net::unix::OwnedWriteHalf,
-        response: Response,
-    ) -> Result<()> {
+    async fn write_line<W>(writer: &mut W, response: &Response) -> Result<()>
+    where
+        W: AsyncWrite + Unpin,
+    {
         writer
-            .write_all(format!("{}\n", serde_json::to_string(&response)?).as_bytes())
+            .write_all(format!("{}\n", serde_json::to_string(response)?).as_bytes())
             .await
             .context("write status update")?;
         writer.flush().await.context("flush status update")?;
         Ok(())
     }
 
-    pub async fn request(paths: &ControlPaths, request: &Request) -> Result<Response> {
-        let stream = UnixStream::connect(&paths.socket)
-            .await
-            .with_context(|| format!("connect to grid engine at {}", paths.socket.display()))?;
-        let (reader, mut writer) = stream.into_split();
+    pub async fn exchange_oneshot<R, W>(
+        mut writer: W,
+        reader: R,
+        request: &Request,
+    ) -> Result<Response>
+    where
+        R: AsyncRead + Unpin,
+        W: AsyncWrite + Unpin,
+    {
         writer
             .write_all(format!("{}\n", serde_json::to_string(request)?).as_bytes())
             .await
@@ -385,22 +379,221 @@ mod unix {
         }
         serde_json::from_str(line.trim_end()).context("decode control response")
     }
+
+    pub async fn spawn_subscribe_stream<R, W>(
+        mut writer: W,
+        reader: R,
+    ) -> Result<mpsc::Receiver<Result<EngineStatus>>>
+    where
+        R: AsyncRead + Unpin + Send + 'static,
+        W: AsyncWrite + Unpin + Send + 'static,
+    {
+        writer
+            .write_all(format!("{}\n", serde_json::to_string(&Request::Subscribe)?).as_bytes())
+            .await
+            .context("write subscribe request")?;
+        writer.flush().await.context("flush subscribe request")?;
+        let (sender, receiver) = mpsc::channel(16);
+        tokio::spawn(async move {
+            let _writer = writer;
+            let mut reader = BufReader::new(reader);
+            loop {
+                let mut line = String::new();
+                match reader.read_line(&mut line).await {
+                    Ok(0) => break,
+                    Ok(_) => match serde_json::from_str::<Response>(line.trim_end()) {
+                        Ok(Response::Status { status } | Response::Update { status }) => {
+                            if sender.send(Ok(*status)).await.is_err() {
+                                break;
+                            }
+                        }
+                        Ok(Response::Error { message }) => {
+                            let _ = sender.send(Err(anyhow::anyhow!(message))).await;
+                            break;
+                        }
+                        Ok(_) => {}
+                        Err(error) => {
+                            let _ = sender.send(Err(anyhow::Error::from(error))).await;
+                            break;
+                        }
+                    },
+                    Err(error) => {
+                        let _ = sender.send(Err(anyhow::Error::from(error))).await;
+                        break;
+                    }
+                }
+            }
+        });
+        Ok(receiver)
+    }
 }
 
 #[cfg(unix)]
-pub use unix::{request, start_server};
+mod unix {
+    use super::*;
+    use tokio::{
+        net::{UnixListener, UnixStream},
+        task::JoinHandle,
+    };
 
-#[cfg(not(unix))]
+    pub async fn start_server(
+        paths: &ControlPaths,
+        handle: EngineHandle,
+    ) -> Result<JoinHandle<Result<()>>> {
+        paths.ensure_directory()?;
+        let _ = fs::remove_file(&paths.socket);
+        let listener = UnixListener::bind(&paths.socket)
+            .with_context(|| format!("bind control socket {}", paths.socket.display()))?;
+        let socket = paths.socket.clone();
+        Ok(tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    accepted = listener.accept() => {
+                        let (stream, _) = accepted.context("accept control socket client")?;
+                        let client_handle = handle.clone();
+                        tokio::spawn(async move {
+                            let (reader, writer) = stream.into_split();
+                            let _ = protocol::handle_client(reader, writer, client_handle).await;
+                        });
+                    }
+                    _ = tokio::time::sleep(Duration::from_millis(200)) => {
+                        if handle.is_cancelled() {
+                            break;
+                        }
+                    }
+                }
+            }
+            let _ = fs::remove_file(&socket);
+            Ok(())
+        }))
+    }
+
+    pub async fn request(paths: &ControlPaths, request: &Request) -> Result<Response> {
+        let stream = UnixStream::connect(&paths.socket)
+            .await
+            .with_context(|| format!("connect to grid engine at {}", paths.socket.display()))?;
+        let (reader, writer) = stream.into_split();
+        protocol::exchange_oneshot(writer, reader, request).await
+    }
+
+    pub async fn subscribe(paths: &ControlPaths) -> Result<mpsc::Receiver<Result<EngineStatus>>> {
+        let stream = UnixStream::connect(&paths.socket)
+            .await
+            .with_context(|| format!("connect to grid engine at {}", paths.socket.display()))?;
+        let (reader, writer) = stream.into_split();
+        protocol::spawn_subscribe_stream(writer, reader).await
+    }
+}
+
+#[cfg(windows)]
+mod windows {
+    use super::*;
+    use tokio::{
+        io::split,
+        net::windows::named_pipe::{ClientOptions, NamedPipeClient, ServerOptions},
+        task::JoinHandle,
+    };
+
+    const ERROR_PIPE_BUSY: i32 = 231;
+
+    pub async fn start_server(
+        paths: &ControlPaths,
+        handle: EngineHandle,
+    ) -> Result<JoinHandle<Result<()>>> {
+        paths.ensure_directory()?;
+        let pipe_name = paths.socket.clone();
+        let mut server = ServerOptions::new()
+            .first_pipe_instance(true)
+            .reject_remote_clients(true)
+            .create(&pipe_name)
+            .with_context(|| format!("bind control pipe {}", pipe_name.display()))?;
+        Ok(tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    connected = server.connect() => {
+                        connected.context("accept control pipe client")?;
+                        let client = server;
+                        server = ServerOptions::new()
+                            .reject_remote_clients(true)
+                            .create(&pipe_name)
+                            .context("create next control pipe instance")?;
+                        let client_handle = handle.clone();
+                        tokio::spawn(async move {
+                            let (reader, writer) = split(client);
+                            let _ = protocol::handle_client(reader, writer, client_handle).await;
+                        });
+                    }
+                    _ = tokio::time::sleep(Duration::from_millis(200)) => {
+                        if handle.is_cancelled() {
+                            break;
+                        }
+                    }
+                }
+            }
+            Ok(())
+        }))
+    }
+
+    async fn connect(paths: &ControlPaths) -> Result<NamedPipeClient> {
+        let mut last_busy = None;
+        for _ in 0..50 {
+            match ClientOptions::new().open(&paths.socket) {
+                Ok(client) => return Ok(client),
+                Err(error) if error.raw_os_error() == Some(ERROR_PIPE_BUSY) => {
+                    last_busy = Some(error);
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+                Err(error) => {
+                    return Err(error).with_context(|| {
+                        format!("connect to grid engine at {}", paths.socket.display())
+                    });
+                }
+            }
+        }
+        Err(last_busy.expect("pipe busy retry exhausted without an error"))
+            .with_context(|| format!("connect to grid engine at {}", paths.socket.display()))
+    }
+
+    pub async fn request(paths: &ControlPaths, request: &Request) -> Result<Response> {
+        let stream = connect(paths).await?;
+        let (reader, writer) = split(stream);
+        protocol::exchange_oneshot(writer, reader, request).await
+    }
+
+    pub async fn subscribe(paths: &ControlPaths) -> Result<mpsc::Receiver<Result<EngineStatus>>> {
+        let stream = connect(paths).await?;
+        let (reader, writer) = split(stream);
+        protocol::spawn_subscribe_stream(writer, reader).await
+    }
+}
+
+#[cfg(unix)]
+pub use unix::{request, start_server, subscribe};
+
+#[cfg(windows)]
+pub use windows::{request, start_server, subscribe};
+
+#[cfg(not(any(unix, windows)))]
 pub async fn request(_paths: &ControlPaths, _request: &Request) -> Result<Response> {
     Err(anyhow!(
-        "the local grid control plane requires Unix-domain sockets"
+        "the local grid control plane requires Unix-domain sockets or Windows named pipes"
     ))
 }
 
-#[cfg(not(unix))]
-pub async fn start_server(_paths: &ControlPaths, _handle: EngineHandle) -> Result<()> {
+#[cfg(not(any(unix, windows)))]
+pub async fn start_server(
+    _paths: &ControlPaths,
+    _handle: EngineHandle,
+) -> Result<tokio::task::JoinHandle<Result<()>>> {
     Err(anyhow!(
-        "the local grid control plane requires Unix-domain sockets"
+        "the local grid control plane requires Unix-domain sockets or Windows named pipes"
+    ))
+}
+
+#[cfg(not(any(unix, windows)))]
+pub async fn subscribe(_paths: &ControlPaths) -> Result<mpsc::Receiver<Result<EngineStatus>>> {
+    Err(anyhow!(
+        "the local grid control plane requires Unix-domain sockets or Windows named pipes"
     ))
 }
 
@@ -410,7 +603,25 @@ pub fn process_is_alive(pid: u32) -> bool {
         let result = unsafe { libc::kill(pid as i32, 0) };
         result == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::Foundation::{CloseHandle, ERROR_ACCESS_DENIED, GetLastError};
+        use windows_sys::Win32::System::Threading::{
+            GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+        };
+        const STILL_ACTIVE: u32 = 259;
+        unsafe {
+            let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+            if handle.is_null() {
+                return GetLastError() == ERROR_ACCESS_DENIED;
+            }
+            let mut code = 0u32;
+            let ok = GetExitCodeProcess(handle, &mut code);
+            CloseHandle(handle);
+            ok != 0 && code == STILL_ACTIVE
+        }
+    }
+    #[cfg(not(any(unix, windows)))]
     {
         let _ = pid;
         false
@@ -437,7 +648,7 @@ pub fn tail_lines(path: &Path, limit: usize) -> Result<String> {
     }
 }
 
-#[cfg(all(test, unix))]
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -453,13 +664,31 @@ mod tests {
         assert_eq!(second.recv().await.unwrap().phase, "running");
     }
 
+    #[cfg(any(unix, windows))]
     #[tokio::test]
     async fn status_and_stop_use_single_line_json_protocol() {
         let root =
             std::env::temp_dir().join(format!("decibel-grid-control-test-{}", std::process::id()));
+        let socket = {
+            #[cfg(unix)]
+            {
+                root.join("engine.sock")
+            }
+            #[cfg(windows)]
+            {
+                PathBuf::from(format!(
+                    r"\\.\pipe\decibel-grid-control-{}-{}",
+                    std::process::id(),
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .expect("system time")
+                        .as_nanos()
+                ))
+            }
+        };
         let paths = ControlPaths {
             directory: root.clone(),
-            socket: root.join("engine.sock"),
+            socket,
             pid: root.join("engine.pid"),
             log: root.join("engine.log"),
         };
@@ -488,6 +717,16 @@ mod tests {
         assert!(handle.is_cancelled());
         server.await.unwrap().unwrap();
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn control_paths_key_only_on_subaccount() {
+        let paths = ControlPaths::for_subaccount("0x0abc").unwrap();
+        assert!(paths.pid.ends_with("abc.pid"));
+        #[cfg(unix)]
+        assert!(paths.socket.ends_with("abc.sock"));
+        #[cfg(windows)]
+        assert_eq!(paths.socket.to_string_lossy(), r"\\.\pipe\grid-bot-abc");
     }
 
     #[test]

@@ -46,7 +46,9 @@ impl NetworkRegistry {
         self.profiles
             .iter()
             .find(|profile| profile.id == id)
-            .ok_or_else(|| anyhow::anyhow!("unsupported network {name}; expected mainnet or testnet"))
+            .ok_or_else(|| {
+                anyhow::anyhow!("unsupported network {name}; expected mainnet or testnet")
+            })
     }
 
     pub fn all_ids(&self) -> &[&'static str] {

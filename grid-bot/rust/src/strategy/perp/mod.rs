@@ -1,16 +1,16 @@
-pub mod neutral;
 pub mod long;
-pub mod short;
+pub mod neutral;
 pub mod runtime;
+pub mod short;
 
 use anyhow::bail;
 use rust_decimal::Decimal;
 
+use super::StrategyContext;
 use crate::{
     GridConfig, GridLevel, GridPlan, LevelState, Market, PerpMode, Product, Result, Side,
     derive_sizes, prices, resolve_range, side_counts,
 };
-use super::StrategyContext;
 
 pub(crate) fn build_perp_plan(
     config: &GridConfig,
@@ -27,8 +27,7 @@ pub(crate) fn build_perp_plan(
     if !(lower < mid && mid < upper) {
         bail!("mid price {mid} is outside grid range [{lower}, {upper}]")
     }
-    let (bid_count, ask_count, bid_budget, ask_budget) =
-        side_counts(config, lower, upper, mid);
+    let (bid_count, ask_count, bid_budget, ask_budget) = side_counts(config, lower, upper, mid);
 
     let bids = prices(
         config,
@@ -48,8 +47,7 @@ pub(crate) fn build_perp_plan(
         ask_count,
         market.tick_size,
     )?;
-    let (bid_size, ask_size) =
-        derive_sizes(config, &bids, &asks, market, bid_budget, ask_budget)?;
+    let (bid_size, ask_size) = derive_sizes(config, &bids, &asks, market, bid_budget, ask_budget)?;
 
     let mut bid_levels = bids
         .into_iter()

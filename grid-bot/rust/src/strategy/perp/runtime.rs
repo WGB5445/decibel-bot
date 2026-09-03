@@ -62,13 +62,8 @@ pub async fn record_perp_risk_rejection(
         journal.save_state(run_state)?;
     }
     if execute {
-        match spot_lifecycle::cancel_bulk_ladder(
-            network,
-            aptos_private_key,
-            subaccount,
-            market,
-        )
-        .await
+        match spot_lifecycle::cancel_bulk_ladder(network, aptos_private_key, subaccount, market)
+            .await
         {
             Ok(hash) => println!("Perp risk gate cancelled ladder in tx {hash}"),
             Err(error) => eprintln!("Perp risk gate ladder cancellation failed: {error:#}"),
