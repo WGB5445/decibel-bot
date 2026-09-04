@@ -24,6 +24,7 @@ use tokio_tungstenite::{
 pub mod attach_tui;
 pub mod client;
 pub mod control;
+pub mod process_lock;
 pub mod events;
 pub mod i18n;
 pub mod journal;

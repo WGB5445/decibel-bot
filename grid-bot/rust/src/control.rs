@@ -58,6 +58,18 @@ pub struct LadderLevel {
     pub state: String,
 }
 
+/// Build attach/TUI ladder rows from the executable grid plan for this cycle.
+pub fn ladder_from_plan(plan: &crate::GridPlan) -> Vec<LadderLevel> {
+    plan.all_levels()
+        .map(|level| LadderLevel {
+            side: format!("{:?}", level.side),
+            price: level.price.to_string(),
+            size: level.size.to_string(),
+            state: format!("{:?}", level.state),
+        })
+        .collect()
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct EngineEvent {
     pub at: DateTime<Utc>,
@@ -746,5 +758,46 @@ mod tests {
         assert_eq!(decoded.position, status.position);
         assert_eq!(decoded.available_margin, status.available_margin);
         assert_eq!(decoded.estimated_margin, status.estimated_margin);
+    }
+
+    #[test]
+    fn ladder_from_plan_formats_bid_and_ask_levels() {
+        use crate::{GridLevel, GridPlan, LevelState, Side};
+        use rust_decimal_macros::dec;
+
+        let plan = GridPlan {
+            mid: dec!(100),
+            lower: dec!(90),
+            upper: dec!(110),
+            per_grid_base_size: None,
+            bids: vec![GridLevel {
+                side: Side::Bid,
+                price: dec!(99),
+                size: dec!(0.5),
+                notional: dec!(49.5),
+                state: LevelState::Planned,
+            }],
+            asks: vec![GridLevel {
+                side: Side::Ask,
+                price: dec!(101),
+                size: dec!(0.25),
+                notional: dec!(25.25),
+                state: LevelState::Selected,
+            }],
+            quote_required: dec!(49.5),
+            base_required: dec!(0.25),
+            estimated_margin: None,
+        };
+
+        let ladder = ladder_from_plan(&plan);
+        assert_eq!(ladder.len(), 2);
+        assert_eq!(ladder[0].side, "Bid");
+        assert_eq!(ladder[0].price, "99");
+        assert_eq!(ladder[0].size, "0.5");
+        assert_eq!(ladder[0].state, "Planned");
+        assert_eq!(ladder[1].side, "Ask");
+        assert_eq!(ladder[1].price, "101");
+        assert_eq!(ladder[1].size, "0.25");
+        assert_eq!(ladder[1].state, "Selected");
     }
 }
