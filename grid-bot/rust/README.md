@@ -67,7 +67,7 @@ cargo run -- stop --subaccount 0x... --exit-mode liquidate
 %TEMP%\grid-bot\<normalized-subaccount>.log
 ```
 
-`start` 检查 PID、socket 和账户文件锁；引擎在绑定控制面 socket 之前即持有同一把 subaccount 锁，`start` 在引擎响应 Ping 之前也持有该锁以防双 spawn。运行中的引擎持续持有锁，因此同一 subaccount 不能有两个进程同时提交 bulk ladder。`status`、`logs`、`attach`、`stop` 不直接访问交易所或使用私钥。`attach` 的 Ctrl+C 只退出客户端，不会停止引擎。
+`start` 检查 PID、socket，并在引擎响应 Ping 之前持有 **startup 锁**（`subaccount-{digest}.startup.lock`）以防并发双 spawn；引擎在绑定控制面 socket 之前获取独立的 **run 锁**（`subaccount-{digest}.lock`）并持续持有，因此同一 subaccount 不能有两个进程同时提交 bulk ladder。两把锁互不阻塞：`start` 等待 Ping 时不会占用 run 锁，引擎可以正常启动。`status`、`logs`、`attach`、`stop` 不直接访问交易所或使用私钥。`attach` 的 Ctrl+C 只退出客户端，不会停止引擎。
 
 引擎收到 `SIGINT` 或 `SIGTERM` 时执行和 `stop` 相同的优雅流程：先撤单，再按退出模式保留资产或清仓。不要手工删除仍在运行引擎的 PID 或 socket 文件。
 

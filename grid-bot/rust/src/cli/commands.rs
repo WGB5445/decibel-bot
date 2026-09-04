@@ -9,7 +9,7 @@ use std::{
 
 use anyhow::{Context, Result};
 use chrono::Utc;
-use decibel_grid_tui::process_lock::SubaccountRunLock;
+use decibel_grid_tui::process_lock::{SubaccountRunLock, SubaccountStartupLock};
 use decibel_grid_tui::*;
 use rust_decimal::{Decimal, prelude::ToPrimitive};
 
@@ -224,9 +224,9 @@ pub async fn start_cli(settings: Settings, confirm_mainnet: Option<&str>) -> Res
         }
         paths.remove_runtime_files();
     }
-    // Preflight and hold the advisory lock until the child engine responds. The engine acquires
-    // the same lock before binding its control socket, so a second `start` cannot race this spawn.
-    let _startup_lock = SubaccountRunLock::acquire(
+    // Preflight and hold the startup lock until the child engine responds. This serializes
+    // concurrent `start` invocations without blocking the engine's long-lived run lock.
+    let _startup_lock = SubaccountStartupLock::acquire(
         &settings.network,
         &settings.subaccount,
     )?;
@@ -236,7 +236,7 @@ pub async fn start_cli(settings: Settings, confirm_mainnet: Option<&str>) -> Res
         anyhow::bail!("could not rewrite start command for engine child")
     };
     args[index] = "engine".into();
-    let child = Command::new(executable)
+    let mut child = Command::new(executable)
         .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -244,6 +244,17 @@ pub async fn start_cli(settings: Settings, confirm_mainnet: Option<&str>) -> Res
         .spawn()
         .context("launch grid engine child")?;
     for _ in 0..40 {
+        if let Ok(status) = child.try_wait() {
+            if let Some(status) = status {
+                anyhow::bail!(
+                    "engine process {} exited before opening its control socket (status: {status}); \
+                     inspect {}. If another grid process (engine, shadow, or attach) already holds \
+                     the subaccount run lock, stop it first",
+                    child.id(),
+                    paths.log.display()
+                );
+            }
+        }
         if matches!(
             control::request(&paths, &control::Request::Ping).await,
             Ok(control::Response::Pong)
@@ -257,8 +268,14 @@ pub async fn start_cli(settings: Settings, confirm_mainnet: Option<&str>) -> Res
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
+    let exit_hint = match child.try_wait() {
+        Ok(Some(status)) => format!(" (exited with status: {status})"),
+        Ok(None) => String::new(),
+        Err(err) => format!(" (could not check exit status: {err})"),
+    };
     anyhow::bail!(
-        "engine process {} did not open its control socket; inspect {}",
+        "engine process {} did not open its control socket{exit_hint}; inspect {}. \
+         If another grid process (engine, shadow, or attach) already holds the subaccount run lock, stop it first",
         child.id(),
         paths.log.display()
     )
