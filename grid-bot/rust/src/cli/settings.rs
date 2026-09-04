@@ -64,6 +64,17 @@ pub struct Args {
     /// Aptos Ed25519 private key. Prefer entering it in the TUI so Ctrl+S encrypts it in the profile.
     #[arg(long, global = true, env = "APTOS_PRIVATE_KEY", hide_env_values = true)]
     pub(crate) aptos_private_key: Option<String>,
+    /// Optional Geomi Gas Station API key. When unset, the signer pays APT gas.
+    #[arg(
+        long,
+        global = true,
+        env = "GEOMI_GAS_STATION_API_KEY",
+        hide_env_values = true
+    )]
+    pub(crate) geomi_gas_station_api_key: Option<String>,
+    /// Optional override for the Geomi Gas Station base URL (`/gs/v1`).
+    #[arg(long, global = true, env = "GEOMI_GAS_STATION_URL")]
+    pub(crate) geomi_gas_station_url: Option<String>,
     /// Execute the configured grid. Only meaningful with the `run` command.
     #[arg(short = 'e', long = "execute", global = true, default_value_t = false)]
     pub(crate) execute: bool,
@@ -98,9 +109,6 @@ pub struct Args {
     /// Continue streaming new lines for the `logs` client.
     #[arg(short = 'f', long, global = true, default_value_t = false)]
     pub(crate) follow: bool,
-    /// Exit mode for the `stop` client: hold or liquidate.
-    #[arg(long, global = true, value_parser = ["hold", "liquidate"])]
-    pub(crate) exit_mode: Option<String>,
     /// Human-readable USDC amount to move from Cross to PFS for `spot-funding-setup`.
     #[arg(long, global = true, env = "SPOT_FUNDING_AMOUNT", default_value = "0")]
     pub(crate) spot_funding_amount: String,
@@ -318,6 +326,8 @@ pub struct Settings {
     pub(crate) max_consecutive_bulk_failures: usize,
     pub(crate) max_position: Option<String>,
     pub(crate) out_of_range_action: OutOfRangeAction,
+    pub(crate) geomi_gas_station_api_key: Option<String>,
+    pub(crate) geomi_gas_station_url: Option<String>,
 }
 
 impl From<&Args> for Settings {
@@ -379,6 +389,8 @@ impl From<&Args> for Settings {
             max_consecutive_bulk_failures: args.max_consecutive_bulk_failures,
             max_position: args.max_position.clone(),
             out_of_range_action: args.out_of_range_action,
+            geomi_gas_station_api_key: args.geomi_gas_station_api_key.clone(),
+            geomi_gas_station_url: args.geomi_gas_station_url.clone(),
         }
     }
 }
@@ -438,6 +450,8 @@ impl Settings {
             max_consecutive_bulk_failures: 5,
             max_position: None,
             out_of_range_action: OutOfRangeAction::default(),
+            geomi_gas_station_api_key: None,
+            geomi_gas_station_url: None,
         }
     }
 
@@ -676,6 +690,14 @@ impl Settings {
             out_of_range_action: self.out_of_range_action,
         })
     }
+    pub(crate) fn gas_station_config(&self) -> Result<Option<decibel_grid_tui::GasStationConfig>> {
+        decibel_grid_tui::GasStationConfig::resolve(
+            &self.network,
+            self.geomi_gas_station_api_key.as_deref(),
+            self.geomi_gas_station_url.as_deref(),
+        )
+    }
+
     pub(crate) fn api_client(&self) -> Result<DecibelClient> {
         if self.api_key.trim().is_empty() {
             anyhow::bail!("API key is required. Select API Key and press Enter to set it.")

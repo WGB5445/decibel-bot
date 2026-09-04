@@ -109,6 +109,7 @@ async fn main() -> Result<()> {
             engine_cli(
                 Settings::from(&cli.args),
                 cli.args.confirm_mainnet.as_deref(),
+                log_path.clone(),
             )
             .await
         }
@@ -135,7 +136,6 @@ async fn main() -> Result<()> {
             stop_client(
                 Settings::from(&cli.args),
                 cli.args.confirm_mainnet.as_deref(),
-                cli.args.exit_mode.as_deref(),
             )
             .await
         }

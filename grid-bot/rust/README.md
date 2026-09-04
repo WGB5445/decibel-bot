@@ -117,13 +117,16 @@ TUI 只用于配置、预览和监控：**不能提交 bulk ladder，也不会�
 `attach` 是独立的实时 ratatui 面板，通过 Unix socket 订阅类型化状态，不会调用或解析其它 CLI 命令的输出。连接后先收到完整快照，随后只接收引擎主动广播的状态变化；socket 断开后会显示“连接已断开，重连中”并以 1/2/4/8/16/30 秒退避自动重订阅：
 
 - 顶部按层次显示 `Connected` / `Subscribed`、账户/网络/REST 快照健康度，以及 `[S]` 或 `[P]` 市场标签、订阅序号、更新时间和 mid；中部是包含 PFS 余额、完整 ladder 和事件的**单一全页快照**；底部显示控制提示、可见行范围和连接状态；
+- **宽屏（终端宽度 ≥ 113 列）**且**引擎已启用日志**时，中部自动分为左右两列：左侧为 ladder 与状态，右侧为彩色 **Logs** 侧栏，实时 tail 引擎通过控制面广播的 `log_path`（与 `logs -f` 同源；若引擎未配置 `--log-file` 且非 `engine` 子进程则不会显示侧栏）；窄屏时隐藏日志列，主区底部仍保留精简 **Events**（最多 10 条），避免信息完全丢失；
+- 日志颜色：绿色 = 成功（submitted/filled/started 等）、黄色 = 警告（paused/retry/disconnect 等）、红色加粗 = 错误（failed/rejected/blocked 等）、灰色 = 普通信息；
 - `↑` / `↓`、`PgUp` / `PgDn`、`Home` / `End` 在同一页面内滚动全部内容；向上滚动会退出“跟随最新”，回到底部会恢复；鼠标滚轮不由应用捕获，交给宿主终端；事件只改变状态，界面最多以 30 FPS 的固定 tick 重绘，终端 resize 会在下一帧重新布局；
-- `c` 将当前完整的 ladder、余额与**最新 10 条 events** 快照复制到 macOS 剪贴板；`q`、`Esc` 或 `Ctrl+C` 退出 attach；`s` 打开“停止并清仓”确认框，只有在框内按 `y` 才会发送 `stop --exit-mode liquidate` 请求，`n` / `Esc` 取消；
+- 宽屏且日志侧栏可见时，`[` / `]` 滚动日志列，`f` 切换日志跟随模式（默认跟随最新行）；
+- `c` 将当前完整的 ladder、余额、**最新 10 条 events** 以及最近 engine.log 行复制到 macOS 剪贴板；`q`、`Esc` 或 `Ctrl+C` 退出 attach；`s` 打开“停止并清仓”确认框，只有在框内按 `y` 才会发送 `stop --exit-mode liquidate` 请求，`n` / `Esc` 取消；
 - 验证 panic 恢复：运行 `GRID_ATTACH_PANIC_TEST=1 cargo run -- attach --subaccount 0x...`。终端应在 panic 文本出现前退出 raw mode、alternate screen 并关闭鼠标捕获。
 
 #### Attach TUI 实时监控
 
-attach TUI 使用可靠的 **alternate screen** 全屏重绘，避免状态更新时文字在主终端缓冲区相互覆盖。动态重绘的 TUI 不能同时支持可靠的原生鼠标框选，因此按 `c` 会将当前完整的 ladder、余额和**最新 10 条 events**（不受屏幕大小和滚动位置影响）直接复制到 macOS 剪贴板。
+attach TUI 使用可靠的 **alternate screen** 全屏重绘，避免状态更新时文字在主终端缓冲区相互覆盖。动态重绘的 TUI 不能同时支持可靠的原生鼠标框选，因此按 `c` 会将当前完整的 ladder、余额、**最新 10 条 events** 以及最近 engine.log 行（不受屏幕大小和滚动位置影响）直接复制到 macOS 剪贴板。
 
 ```
 cargo run -- attach --subaccount 0x...
@@ -133,8 +136,9 @@ cargo run -- attach --subaccount 0x...
 - 连接与订阅栏：`Connected` / `Subscribed` 分别表达 socket 可用与收到完整快照；账户、网络与 REST 快照健康度独立显示
 - 市场元数据：Spot 为黄色 `[S]`、Perp 为青色 `[P]`；市场名和价格加粗白色；显示本地订阅序号、最后更新时间和 mid
 - PFS 余额 / PnL / reconciliation 摘要
-- Ladder 表格：`Side`、`Qty (BASE)`、`Price (QUOTE)`、`Status` 明确分列；数量保留 6 位、价格保留 8 位且右对齐；BID 绿、ASK 红、价格白色加粗、取消黄、失败红
-- Events 日志（按时间倒序，最新的在最上方；最多显示 10 条）
+- Ladder 表格：`Side`、`Qty (BASE)`、`Price (QUOTE)`、`Status` 列宽随终端自适应；数量保留 6 位、价格保留 8 位且右对齐；BID 绿、ASK 红、价格白色加粗、取消黄、失败红
+- **宽屏（≥ 113 列）**且引擎报告了日志路径：右侧 **Logs** 列 tail 该文件，按严重程度着色；主区不再重复显示 Events
+- **窄屏**：无日志侧栏，主区底部保留 Events 日志（按时间倒序，最新的在最上方；最多显示 10 条）
 
 为检查网格几何，表格始终按 **BID 价格升序，然后 ASK 价格升序** 排列；标题会明确标注 `Price order: BID low→high, ASK low→high`。
 
@@ -146,7 +150,9 @@ cargo run -- attach --subaccount 0x...
 | `PgUp` / `PgDn` | 翻一页 |
 | `Home` / `g` | 回到顶部 |
 | `End` / `Shift+G` | 跳到底部 |
-| `c` | 复制完整 ladder、余额和最新 10 条 events 快照到 macOS 剪贴板 |
+| `c` | 复制完整 ladder、余额、最新 10 条 events 及最近 engine.log 行到 macOS 剪贴板 |
+| `[` / `]` | 宽屏日志侧栏可见时，逐行滚动日志 |
+| `f` | 宽屏日志侧栏可见时，切换日志跟随模式 |
 | `s` | 打开清仓确认框 |
 | `q` / `Esc` / `Ctrl+C` | 退出 attach（引擎继续运行） |
 
@@ -321,6 +327,25 @@ PRICE_SOURCE=prices
 ```
 
 `DECIBEL_API_KEY` 必需;`SUBACCOUNT_ADDRESS` 可选,但如果设置,程序才能读取该账户的仓位、可用保证金、挂单和成交记录。
+
+### 可选：Geomi Gas Station 代付 gas
+
+`GEOMI_GAS_STATION_API_KEY` **可省略**。未设置时与历史行为完全一致：签名账户自付 APT gas。设置非空 key 后，所有链上提交走 Aptos `/gs/v1` fee-payer 路径，由 Gas Station 代付 gas（签名账户仍消耗 sequence number）。
+
+| 变量 | 必需 | 说明 |
+| --- | --- | --- |
+| `DECIBEL_API_KEY` | 是 | Decibel REST/WS 行情与账户 |
+| `GEOMI_GAS_STATION_API_KEY` | 否 | Geomi Gas Station API key；空/未设 = 自付 |
+| `GEOMI_GAS_STATION_URL` | 否 | 覆盖默认 `https://api.{network}.aptoslabs.com/gs/v1` |
+
+启动日志会打印 `gas station: off` 或 `gas station: geomi {network}`（不打印 key）。`doctor` 不因缺少 Geomi key 失败；启用代付且 signer APT 很低时仅提示。
+
+在 [geomi.dev](https://geomi.dev/docs/gas-stations) 为 **testnet** 与 **mainnet** 各建一个 Gas Station（一站一网），建议导入 [Decibel Gas Station 模板](https://docs.decibel.trade/quickstart/gas-station)，**关闭 reCAPTCHA**，并在 allowlist 中覆盖 bot 实际调用的入口：
+
+- `dex_accounts_entry::{place_bulk_orders_to_subaccount, cancel_bulk_order_to_subaccount, place_order_to_subaccount, transfer_assets_between_non_collateral_and_collateral}`
+- `dex_accounts_spot_entry::{place_spot_bulk_order_to_subaccount, cancel_spot_bulk_order_to_subaccount, place_spot_order_to_subaccount, cancel_spot_order_to_subaccount}`
+
+包地址随 `NETWORK` 变化；testnet/mainnet 须分别配置。用小额 `doctor` + `start` 在对应网络验证一笔代付交易。
 
 ### 检查 API Key
 

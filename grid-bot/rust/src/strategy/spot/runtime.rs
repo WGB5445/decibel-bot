@@ -10,8 +10,8 @@ use chrono::Utc;
 use rust_decimal::Decimal;
 
 use crate::{
-    GridConfig, GridPlan, MonitorSnapshot, RangeBreakoutAction, SpotFeeRates, exit_sell_assets,
-    journal, simulation, spot_lifecycle,
+    GasStationConfig, GridConfig, GridPlan, MonitorSnapshot, RangeBreakoutAction, SpotFeeRates,
+    exit_sell_assets, journal, simulation, spot_lifecycle,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -28,6 +28,7 @@ pub struct SpotCycleContext<'a> {
     pub network: &'a str,
     pub api_key: &'a str,
     pub aptos_private_key: &'a str,
+    pub gas_station: Option<&'a GasStationConfig>,
     pub subaccount: &'a str,
     pub config: &'a mut GridConfig,
     pub journal: Option<&'a journal::Journal>,
@@ -103,6 +104,7 @@ pub async fn run_spot_cycle(ctx: &mut SpotCycleContext<'_>) -> Result<SpotCycleO
                         .as_ref()
                         .expect("live Spot execution fetched fee rates"),
                 )),
+                ctx.gas_station,
             )
             .await
             {
@@ -135,6 +137,7 @@ pub async fn run_spot_cycle(ctx: &mut SpotCycleContext<'_>) -> Result<SpotCycleO
                         ctx.aptos_private_key,
                         ctx.subaccount,
                         &ctx.snapshot.market,
+                        ctx.gas_station,
                     )
                     .await
                     {

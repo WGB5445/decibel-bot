@@ -109,6 +109,8 @@ pub struct EngineStatus {
     pub perp_blocked_reason: Option<String>,
     pub out_of_range_action: Option<String>,
     pub paused_by_out_of_range: bool,
+    /// Absolute path of this engine process's stdout/stderr log file, when logging is enabled.
+    pub log_path: Option<String>,
     pub ladder: Vec<LadderLevel>,
     pub events: Vec<EngineEvent>,
 }

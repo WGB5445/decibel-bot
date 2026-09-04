@@ -6,7 +6,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use aptos_sdk::{
     Aptos, AptosConfig,
     account::Ed25519Account,
-    transaction::{InputEntryFunctionData, TransactionBuilder, move_none, sign_transaction},
+    transaction::{InputEntryFunctionData, TransactionBuilder, move_none},
     types::AccountAddress,
 };
 use chrono::{DateTime, Utc};
@@ -21,12 +21,15 @@ use tokio_tungstenite::{
     tungstenite::{Message, client::IntoClientRequest, http::HeaderValue},
 };
 
+pub mod aptos_tx;
 pub mod attach_tui;
 pub mod client;
 pub mod control;
 pub mod events;
+pub mod geomi;
 pub mod i18n;
 pub mod journal;
+pub mod monitor_log;
 pub mod network;
 pub mod process_lock;
 pub mod profile;
@@ -35,6 +38,8 @@ pub mod simulation;
 pub mod spot_lifecycle;
 pub mod spot_taker;
 pub mod strategy;
+
+pub use geomi::GasStationConfig;
 
 /// Decibel's per-side protocol limit. This is separate from the bot policy below.
 pub const MAX_LEVELS_PER_SIDE: usize = 30;
@@ -478,6 +483,7 @@ pub async fn execute_bulk_grid(
     subaccount: &str,
     market: &Market,
     plan: &GridPlan,
+    gas_station: Option<&GasStationConfig>,
 ) -> Result<ExecutionResult> {
     let subaccount_str = subaccount.trim();
     if subaccount_str.is_empty() {
@@ -594,25 +600,25 @@ pub async fn execute_bulk_grid(
         .sequence_number(sequence_number)
         .payload(payload)
         .max_gas_amount(max_gas_amount)
-        .gas_unit_price(gas_price)
+.gas_unit_price(gas_price)
         .chain_id(chain_id)
-        .expiration_from_now(600)
-        .build()
-        .context("build Perp bulk-order transaction with 0.5 APT gas cap")?;
-    let signed = sign_transaction(&raw, &signer).with_context(|| {
-        format!("sign {product_label} bulk-order transaction ({entry_function})")
-    })?;
-    let response = aptos
-        .submit_and_wait(&signed, Some(Duration::from_secs(60)))
-        .await
-        .with_context(|| {
-            format!(
-                "submit {product_label} bulk-order transaction ({entry_function}); signer={} subaccount={} market={} required_permission={required_permission}",
-                signer.address(), subaccount_str, market.address
-            )
-        })?;
+        .expiration_from_now(aptos_tx::expiration_seconds(gas_station))
+.build()
+        .context("build bulk-order transaction")?;
+    let response = aptos_tx::submit_raw_and_wait(
+        &aptos,
+        raw,
+        &signer,
+        gas_station,
+        &format!(
+            "submit {product_label} bulk-order transaction ({entry_function}); signer={} subaccount={} market={} required_permission={required_permission}",
+            signer.address(),
+            subaccount_str,
+            market.address
+        ),
+    )
+    .await?;
     if !response
-        .data
         .get("success")
         .and_then(Value::as_bool)
         .unwrap_or(false)
@@ -620,7 +626,6 @@ pub async fn execute_bulk_grid(
         bail!(
             "Perp bulk-order transaction failed: {}",
             response
-                .data
                 .get("vm_status")
                 .and_then(Value::as_str)
                 .unwrap_or("unknown VM status")
@@ -628,7 +633,6 @@ pub async fn execute_bulk_grid(
     }
     Ok(ExecutionResult {
         transaction_hash: response
-            .data
             .get("hash")
             .and_then(Value::as_str)
             .unwrap_or_default()
@@ -661,6 +665,7 @@ pub async fn exit_sell_assets(
     subaccount: &str,
     market: &Market,
     spot_guard: Option<(&SpotExecutionConfig, &SpotFeeRates)>,
+    gas_station: Option<&GasStationConfig>,
 ) -> Result<Vec<String>> {
     let client = DecibelClient::new(network, api_key)?;
     let package = package_for_network(network)?;
@@ -710,25 +715,24 @@ pub async fn exit_sell_assets(
         .max_gas_amount(max_gas_amount)
         .gas_unit_price(gas_price)
         .chain_id(chain_id)
-        .expiration_from_now(600)
+        .expiration_from_now(aptos_tx::expiration_seconds(gas_station))
         .build()?;
-    let response = aptos
-        .submit_and_wait(
-            &sign_transaction(&raw, &signer)?,
-            Some(Duration::from_secs(60)),
-        )
-        .await
-        .context("submit exit bulk cancellation transaction")?;
+    let response = aptos_tx::submit_raw_and_wait(
+        &aptos,
+        raw,
+        &signer,
+        gas_station,
+        "submit exit bulk cancellation transaction",
+    )
+    .await?;
     sequence = sequence.saturating_add(1);
     if response
-        .data
         .get("success")
         .and_then(Value::as_bool)
         .unwrap_or(false)
     {
         hashes.push(
             response
-                .data
                 .get("hash")
                 .and_then(Value::as_str)
                 .unwrap_or_default()
@@ -738,7 +742,6 @@ pub async fn exit_sell_assets(
         bail!(
             "exit bulk cancellation failed; refusing liquidation while the ladder may remain live: {}",
             response
-                .data
                 .get("vm_status")
                 .and_then(Value::as_str)
                 .unwrap_or("unknown status")
@@ -802,6 +805,7 @@ pub async fn exit_sell_assets(
                     None,
                     fees,
                     guard_config,
+                    gas_station,
                 )
                 .await
                 .context("execute guarded Spot liquidation")?;
@@ -827,6 +831,7 @@ pub async fn exit_sell_assets(
                     price,
                     quantity,
                     false,
+                    gas_station,
                 )
                 .await
                 .context("submit Spot IOC liquidation order")?;
@@ -876,23 +881,23 @@ pub async fn exit_sell_assets(
                     .max_gas_amount(max_gas_amount)
                     .gas_unit_price(gas_price)
                     .chain_id(chain_id)
-                    .expiration_from_now(600)
+                    .expiration_from_now(aptos_tx::expiration_seconds(gas_station))
                     .build()?;
-                let response = aptos
-                    .submit_and_wait(
-                        &sign_transaction(&raw, &signer)?,
-                        Some(Duration::from_secs(60)),
-                    )
-                    .await?;
+                let response = aptos_tx::submit_raw_and_wait(
+                    &aptos,
+                    raw,
+                    &signer,
+                    gas_station,
+                    "submit reduce-only Perp exit transaction",
+                )
+                .await?;
                 if response
-                    .data
                     .get("success")
                     .and_then(Value::as_bool)
                     .unwrap_or(false)
                 {
                     hashes.push(
                         response
-                            .data
                             .get("hash")
                             .and_then(Value::as_str)
                             .unwrap_or_default()
@@ -902,7 +907,6 @@ pub async fn exit_sell_assets(
                     bail!(
                         "Perp exit transaction failed: {}",
                         response
-                            .data
                             .get("vm_status")
                             .and_then(Value::as_str)
                             .unwrap_or("unknown status")
@@ -1062,6 +1066,7 @@ pub async fn fund_spot_base_for_grid(
     subaccount: &str,
     market: &Market,
     plan: &GridPlan,
+    gas_station: Option<&GasStationConfig>,
 ) -> Result<SpotFundingResult> {
     if market.product != Product::Spot {
         bail!("automatic base funding is only available for Spot markets")
@@ -1073,7 +1078,15 @@ pub async fn fund_spot_base_for_grid(
     let client = DecibelClient::new(network, api_key)?;
     // An older build could have left a resting POST_ONLY funding bid. That order is standalone,
     // so it would block bulk replacement; clear any locally recorded one before funding.
-    cancel_recorded_spot_funding_order(network, private_key, subaccount, market, &client).await?;
+    cancel_recorded_spot_funding_order(
+        network,
+        private_key,
+        subaccount,
+        market,
+        &client,
+        gas_station,
+    )
+    .await?;
     let initial = client.account(Some(subaccount), market).await?;
     let mut funds = initial.spot_funds.ok_or_else(|| {
         anyhow!(
@@ -1136,6 +1149,7 @@ pub async fn fund_spot_base_for_grid(
             funding.limit_price,
             slice,
             true,
+            gas_station,
         )
         .await
         {
@@ -1233,6 +1247,7 @@ pub async fn fund_spot_quote_for_grid(
     subaccount: &str,
     market: &Market,
     plan: &GridPlan,
+    gas_station: Option<&GasStationConfig>,
 ) -> Result<SpotQuoteFundingResult> {
     if market.product != Product::Spot {
         bail!("automatic quote funding is only available for Spot markets")
@@ -1287,6 +1302,7 @@ pub async fn fund_spot_quote_for_grid(
             funding.limit_price,
             funding.quantity,
             false,
+            gas_station,
         )
         .await?;
         println!(
@@ -1406,6 +1422,7 @@ async fn submit_spot_ioc_order(
     price: Decimal,
     quantity: Decimal,
     is_buy: bool,
+    gas_station: Option<&GasStationConfig>,
 ) -> Result<String> {
     const IOC: u8 = 2;
     const MAX_GAS_OCTAS: u64 = 50_000_000;
@@ -1451,17 +1468,18 @@ async fn submit_spot_ioc_order(
         .max_gas_amount(max_gas_amount)
         .gas_unit_price(gas_price)
         .chain_id(aptos.ensure_chain_id().await?)
-        .expiration_from_now(600)
+        .expiration_from_now(aptos_tx::expiration_seconds(gas_station))
         .build()
         .context("build Spot IOC funding transaction with 0.5 APT gas cap")?;
-    let signed = sign_transaction(&raw, &signer)
-        .with_context(|| format!("sign Spot funding transaction ({entry_function})"))?;
-    let response = aptos
-        .submit_and_wait(&signed, Some(Duration::from_secs(60)))
-        .await
-        .with_context(|| format!("submit Spot funding transaction ({entry_function})"))?;
+    let response = aptos_tx::submit_raw_and_wait(
+        &aptos,
+        raw,
+        &signer,
+        gas_station,
+        &format!("submit Spot IOC transaction ({entry_function})"),
+    )
+    .await?;
     if !response
-        .data
         .get("success")
         .and_then(Value::as_bool)
         .unwrap_or(false)
@@ -1469,14 +1487,12 @@ async fn submit_spot_ioc_order(
         bail!(
             "Spot funding transaction failed: {}",
             response
-                .data
                 .get("vm_status")
                 .and_then(Value::as_str)
                 .unwrap_or("unknown VM status")
         )
     }
     Ok(response
-        .data
         .get("hash")
         .and_then(Value::as_str)
         .unwrap_or_default()
@@ -1493,6 +1509,7 @@ pub(crate) async fn submit_perp_ioc_order(
     quantity: Decimal,
     is_buy: bool,
     reduce_only: bool,
+    gas_station: Option<&GasStationConfig>,
 ) -> Result<String> {
     const IOC: u8 = 2;
     const MAX_GAS_OCTAS: u64 = 50_000_000;
@@ -1544,17 +1561,18 @@ pub(crate) async fn submit_perp_ioc_order(
         .max_gas_amount(max_gas_amount)
         .gas_unit_price(gas_price)
         .chain_id(aptos.ensure_chain_id().await?)
-        .expiration_from_now(600)
+        .expiration_from_now(aptos_tx::expiration_seconds(gas_station))
         .build()
         .context("build Perp IOC transaction with 0.5 APT gas cap")?;
-    let signed = sign_transaction(&raw, &signer)
-        .with_context(|| format!("sign Perp IOC transaction ({entry_function})"))?;
-    let response = aptos
-        .submit_and_wait(&signed, Some(Duration::from_secs(60)))
-        .await
-        .with_context(|| format!("submit Perp IOC transaction ({entry_function})"))?;
+    let response = aptos_tx::submit_raw_and_wait(
+        &aptos,
+        raw,
+        &signer,
+        gas_station,
+        &format!("submit Perp IOC transaction ({entry_function})"),
+    )
+    .await?;
     if !response
-        .data
         .get("success")
         .and_then(Value::as_bool)
         .unwrap_or(false)
@@ -1562,14 +1580,12 @@ pub(crate) async fn submit_perp_ioc_order(
         bail!(
             "Perp IOC transaction failed: {}",
             response
-                .data
                 .get("vm_status")
                 .and_then(Value::as_str)
                 .unwrap_or("unknown VM status")
         )
     }
     Ok(response
-        .data
         .get("hash")
         .and_then(Value::as_str)
         .unwrap_or_default()
@@ -1585,6 +1601,7 @@ async fn cancel_recorded_spot_funding_order(
     subaccount: &str,
     market: &Market,
     client: &DecibelClient,
+    gas_station: Option<&GasStationConfig>,
 ) -> Result<()> {
     let mut store = FundingOrderStore::load()?;
     let Some(record) = store
@@ -1612,7 +1629,15 @@ async fn cancel_recorded_spot_funding_order(
             "Cancelling prior automatic Spot funding order {} for {} before recalculating the grid.",
             order_id, market.name
         );
-        cancel_spot_order(network, private_key, subaccount, market, &order_id).await?;
+        cancel_spot_order(
+            network,
+            private_key,
+            subaccount,
+            market,
+            &order_id,
+            gas_station,
+        )
+        .await?;
     }
     store.remove(network, subaccount, &market.address);
     store.save()?;
@@ -1646,6 +1671,7 @@ async fn cancel_spot_order(
     subaccount: &str,
     market: &Market,
     order_id: &str,
+    gas_station: Option<&GasStationConfig>,
 ) -> Result<()> {
     const MAX_GAS_OCTAS: u64 = 50_000_000;
     let order_id: u128 = order_id.parse().context("Spot order_id is not a u128")?;
@@ -1685,23 +1711,23 @@ async fn cancel_spot_order(
         .max_gas_amount(max_gas_amount)
         .gas_unit_price(gas_price)
         .chain_id(aptos.ensure_chain_id().await?)
-        .expiration_from_now(600)
+        .expiration_from_now(aptos_tx::expiration_seconds(gas_station))
         .build()
         .context("build Spot funding-order cancellation transaction with 0.5 APT gas cap")?;
-    let signed = sign_transaction(&raw, &signer)
-        .with_context(|| format!("sign Spot funding cancellation ({entry_function})"))?;
-    let response = aptos
-        .submit_and_wait(&signed, Some(Duration::from_secs(60)))
-        .await
-        .with_context(|| format!("submit Spot funding cancellation ({entry_function})"))?;
+    let response = aptos_tx::submit_raw_and_wait(
+        &aptos,
+        raw,
+        &signer,
+        gas_station,
+        &format!("submit Spot funding cancellation ({entry_function})"),
+    )
+    .await?;
     if !response
-        .data
         .get("success")
         .and_then(Value::as_bool)
         .unwrap_or(false)
     {
         let status = response
-            .data
             .get("vm_status")
             .and_then(Value::as_str)
             .unwrap_or("unknown VM status");
@@ -1720,6 +1746,7 @@ pub async fn transfer_spot_cross_pfs(
     subaccount: &str,
     metadata: &str,
     amount: i64,
+    gas_station: Option<&GasStationConfig>,
 ) -> Result<String> {
     submit_spot_account_management_entry(
         network,
@@ -1728,6 +1755,7 @@ pub async fn transfer_spot_cross_pfs(
         subaccount,
         metadata,
         Some(amount),
+        gas_station,
     )
     .await
 }
@@ -1739,6 +1767,7 @@ async fn submit_spot_account_management_entry(
     subaccount: &str,
     metadata: &str,
     amount: Option<i64>,
+    gas_station: Option<&GasStationConfig>,
 ) -> Result<String> {
     let key = normalize_private_key(private_key)?;
     let signer =
@@ -1779,19 +1808,18 @@ async fn submit_spot_account_management_entry(
         .max_gas_amount(max_gas_amount)
         .gas_unit_price(gas_price)
         .chain_id(aptos.ensure_chain_id().await?)
-        .expiration_from_now(600)
+        .expiration_from_now(aptos_tx::expiration_seconds(gas_station))
         .build()
         .context("build Spot account-management transaction with 0.5 APT gas cap")?;
-    let signed = sign_transaction(&raw, &signer)
-        .with_context(|| format!("sign Spot account-management transaction ({entry_function})"))?;
-    let response = aptos
-        .submit_and_wait(&signed, Some(Duration::from_secs(60)))
-        .await
-        .with_context(|| {
-            format!("submit Spot account-management transaction ({entry_function})")
-        })?;
+    let response = aptos_tx::submit_raw_and_wait(
+        &aptos,
+        raw,
+        &signer,
+        gas_station,
+        &format!("submit Spot account-management transaction ({entry_function})"),
+    )
+    .await?;
     if !response
-        .data
         .get("success")
         .and_then(Value::as_bool)
         .unwrap_or(false)
@@ -1799,14 +1827,12 @@ async fn submit_spot_account_management_entry(
         bail!(
             "Spot account-management transaction failed: {}",
             response
-                .data
                 .get("vm_status")
                 .and_then(Value::as_str)
                 .unwrap_or("unknown VM status")
         )
     }
     Ok(response
-        .data
         .get("hash")
         .and_then(Value::as_str)
         .unwrap_or_default()

@@ -20,6 +20,9 @@ use crossterm::{
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
 use decibel_grid_tui::i18n::{self, Key as TKey, Language};
+use decibel_grid_tui::monitor_log::{
+    LogPanelState, MIN_LOG_WIDTH, MIN_MAIN_WIDTH, render_log_panel, split_layout,
+};
 use decibel_grid_tui::process_lock::SubaccountRunLock;
 use decibel_grid_tui::profile::{self, DEFAULT_PROFILE, ProfileData, ProfileStore};
 use decibel_grid_tui::*;
@@ -445,6 +448,11 @@ pub struct App {
     market_list_area: Rect,
     /// Exact grid geometry produced during the last render, reused for mouse hit testing.
     grid_geometry: Option<GridGeometry>,
+    /// Engine log sidebar state for the Monitor tab.
+    log_panel: LogPanelState,
+    /// Whether the Monitor tab currently shows the log sidebar.
+    log_split_visible: bool,
+    engine_log_polled_at: Option<tokio::time::Instant>,
 }
 impl App {
     /// Preserve the complete anyhow error chain separately from the compact header status.
@@ -492,7 +500,37 @@ impl App {
             form_width: 0,
             market_list_area: Rect::default(),
             grid_geometry: None,
+            log_panel: LogPanelState::default(),
+            log_split_visible: false,
+            engine_log_polled_at: None,
         }
+    }
+
+    fn engine_log_poll_due(&self) -> bool {
+        if self.tab != TAB_MONITOR || self.settings.subaccount.trim().is_empty() {
+            return false;
+        }
+        self.engine_log_polled_at
+            .map(|at| at.elapsed() >= Duration::from_secs(2))
+            .unwrap_or(true)
+    }
+
+    async fn poll_engine_log_path(&mut self) {
+        self.engine_log_polled_at = Some(tokio::time::Instant::now());
+        let subaccount = self.settings.subaccount.trim();
+        if subaccount.is_empty() {
+            self.log_panel.sync_engine_log_path(None);
+            return;
+        }
+        let path = match decibel_grid_tui::client::EngineClient::for_subaccount(subaccount) {
+            Ok(client) => client
+                .get_status()
+                .await
+                .ok()
+                .and_then(|status| status.log_path),
+            Err(_) => None,
+        };
+        self.log_panel.sync_engine_log_path(path.as_deref());
     }
 
     /// Persists the current settings, encrypting the API key with the supplied password.
@@ -896,6 +934,13 @@ async fn tui_loop(
             app.snapshot = None;
             app.snapshot_pending = false;
             app.refresh_now = true;
+            app.engine_log_polled_at = None;
+        }
+        if app.tab == TAB_MONITOR {
+            if app.engine_log_poll_due() {
+                app.poll_engine_log_path().await;
+            }
+            let _ = app.log_panel.tailer.as_mut().map(|tailer| tailer.poll());
         }
         // Apply completed background fetches without blocking input or rendering.
         while let Ok(result) = fetch_rx.try_recv() {
@@ -1012,6 +1057,8 @@ async fn tui_loop(
                     app.settings.network.clone(),
                     app.settings.api_key.clone(),
                     app.settings.aptos_private_key.clone(),
+                    app.settings.geomi_gas_station_api_key.clone(),
+                    app.settings.geomi_gas_station_url.clone(),
                     app.settings.subaccount.clone(),
                     snapshot.market.clone(),
                     snapshot.plan.clone(),
@@ -1019,14 +1066,31 @@ async fn tui_loop(
                 )
             });
             match execution {
-                Some((network, api_key, private_key, subaccount, market, plan, revision))
-                    if !api_key.trim().is_empty()
-                        && !private_key.trim().is_empty()
-                        && !subaccount.trim().is_empty() =>
+                Some((
+                    network,
+                    api_key,
+                    private_key,
+                    geomi_api_key,
+                    geomi_url,
+                    subaccount,
+                    market,
+                    plan,
+                    revision,
+                )) if !api_key.trim().is_empty()
+                    && !private_key.trim().is_empty()
+                    && !subaccount.trim().is_empty() =>
                 {
                     app.execution_pending = true;
                     let tx = fetch_tx.clone();
                     tokio::spawn(async move {
+                        let gas_station = GasStationConfig::resolve(
+                            &network,
+                            geomi_api_key.as_deref(),
+                            geomi_url.as_deref(),
+                        )
+                        .ok()
+                        .flatten();
+                        let gas_station_ref = gas_station.as_ref();
                         let result = execute_bulk_grid(
                             &network,
                             &api_key,
@@ -1034,6 +1098,7 @@ async fn tui_loop(
                             &subaccount,
                             &market,
                             &plan,
+                            gas_station_ref,
                         )
                         .await;
                         let _ = tx.send(MarketFetch::Execution {
@@ -1217,7 +1282,7 @@ async fn tui_loop(
         } else {
             None
         };
-        terminal.draw(|frame| render(frame.area(), frame, &app, config.as_ref()))?;
+        terminal.draw(|frame| render(frame.area(), frame, &mut app, config.as_ref()))?;
         if event::poll(Duration::from_millis(120))? && handle_event(&mut app)? {
             // The TUI intentionally never mutates a live ladder during shutdown. Use the explicit
             // `stop --exit-asset-policy retain|sell` lifecycle command, which performs the
@@ -1480,6 +1545,15 @@ fn handle_event(app: &mut App) -> Result<bool> {
                 }
             }
             KeyCode::Char(' ') if app.tab == TAB_CONFIG => app.cycle_field(1),
+            KeyCode::Char('[') if app.tab == TAB_MONITOR && app.log_split_visible => {
+                app.log_panel.scroll_up(1);
+            }
+            KeyCode::Char(']') if app.tab == TAB_MONITOR && app.log_split_visible => {
+                app.log_panel.scroll_down(1);
+            }
+            KeyCode::Char('f') if app.tab == TAB_MONITOR && app.log_split_visible => {
+                app.log_panel.toggle_follow();
+            }
             KeyCode::Char('[') if app.tab == TAB_CONFIG => app.cycle_field(-1),
             KeyCode::Char('f') => {
                 app.refresh_now = true;
@@ -1801,7 +1875,7 @@ fn render_refresh_indicator(area: Rect, frame: &mut ratatui::Frame, app: &App) {
     frame.render_widget(Paragraph::new(label).style(style), indicator);
 }
 
-fn render(area: Rect, frame: &mut ratatui::Frame, app: &App, config: Option<&GridConfig>) {
+fn render(area: Rect, frame: &mut ratatui::Frame, app: &mut App, config: Option<&GridConfig>) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -2647,7 +2721,22 @@ fn field_explanation(app: &App, field: Field) -> String {
     text
 }
 
-fn render_grid(area: Rect, frame: &mut ratatui::Frame, app: &App, config: Option<&GridConfig>) {
+fn render_grid(area: Rect, frame: &mut ratatui::Frame, app: &mut App, config: Option<&GridConfig>) {
+    let (content_area, log_area) = if app.tab == TAB_MONITOR && app.log_panel.has_engine_log() {
+        let (main, log) = split_layout(area, MIN_MAIN_WIDTH, MIN_LOG_WIDTH);
+        app.log_split_visible = log.is_some();
+        if let Some(log_rect) = log {
+            let viewport = log_rect.height.saturating_sub(2) as usize;
+            let content_width = log_rect.width.saturating_sub(2) as usize;
+            app.log_panel.update_scroll_bounds(viewport, content_width);
+            render_log_panel(frame, log_rect, &app.log_panel);
+        }
+        (main, log)
+    } else {
+        app.log_split_visible = false;
+        (area, None)
+    };
+    let _ = log_area;
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -2655,7 +2744,7 @@ fn render_grid(area: Rect, frame: &mut ratatui::Frame, app: &App, config: Option
             Constraint::Min(6),
             Constraint::Length(8),
         ])
-        .split(area);
+        .split(content_area);
     let title = if app.tab == TAB_PREVIEW {
         ui(
             app.settings.language,
@@ -2675,7 +2764,7 @@ fn render_grid(area: Rect, frame: &mut ratatui::Frame, app: &App, config: Option
                 .style(Style::default().fg(Color::Red))
                 .wrap(Wrap { trim: true })
                 .block(Block::default().borders(Borders::ALL).title(title)),
-            area,
+            content_area,
         );
         return;
     };
@@ -2683,11 +2772,11 @@ fn render_grid(area: Rect, frame: &mut ratatui::Frame, app: &App, config: Option
         frame.render_widget(
             Paragraph::new("Waiting for valid configuration...")
                 .block(Block::default().borders(Borders::ALL).title(title)),
-            area,
+            content_area,
         );
         return;
     };
-    let execute_button = preview_execute_button(area);
+    let execute_button = preview_execute_button(content_area);
     let execute_label = if app.execution_pending {
         "  EXECUTING...  "
     } else {

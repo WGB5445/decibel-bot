@@ -69,6 +69,14 @@ pub async fn run_cli(
     }
     let mut config = settings.to_grid_config()?;
     let api = settings.api_client()?;
+    let gas_station_config = settings.gas_station_config()?;
+    let gas_station = gas_station_config.as_ref();
+    if execute {
+        match gas_station {
+            None => println!("gas station: off"),
+            Some(_) => println!("gas station: geomi {}", settings.network),
+        }
+    }
     let spot_fee_rates = if execute && config.product == Product::Spot {
         let rates = api
             .spot_fee_rates(&settings.subaccount)
@@ -270,7 +278,15 @@ pub async fn run_cli(
         let snapshot = match fetch_snapshot(&api, &config, optional_subaccount(&settings)).await {
             Ok(s) => s,
             Err(e) => {
-                eprintln!("grid refresh failed: {e:#}");
+                let error = format!("{e:#}");
+                eprintln!("grid refresh failed: {error}");
+                if let Some(runtime) = &engine_runtime {
+                    runtime
+                        .update_status(|status| {
+                            status.last_error = Some(error.clone());
+                        })
+                        .await;
+                }
                 check_cancel!();
                 tokio::time::sleep(config.refresh).await;
                 continue;
@@ -404,6 +420,7 @@ pub async fn run_cli(
                 network: &settings.network,
                 api_key: &settings.api_key,
                 aptos_private_key: &settings.aptos_private_key,
+                gas_station,
                 subaccount: &settings.subaccount,
                 config: &mut config,
                 journal: journal.as_ref(),
@@ -450,6 +467,7 @@ pub async fn run_cli(
                         &snapshot.market,
                         &api,
                         execute,
+                        gas_station,
                     )
                     .await?;
                 }
@@ -538,6 +556,7 @@ pub async fn run_cli(
                         .as_ref()
                         .expect("live Spot execution fetched fee rates"),
                     &config.spot,
+                    gas_station,
                 )
                 .await;
                 check_cancel!();
@@ -795,6 +814,7 @@ pub async fn run_cli(
                         &snapshot.market,
                         &exec_plan,
                         &config.spot,
+                        gas_station,
                     )
                     .await
                     {
@@ -949,6 +969,7 @@ pub async fn run_cli(
                                 journal.as_ref(),
                                 &mut run_state,
                                 execute,
+                                gas_station,
                             )
                             .await?;
                         } else {
@@ -959,6 +980,7 @@ pub async fn run_cli(
                                 &settings.subaccount,
                                 &snapshot.market,
                                 &exec_plan,
+                                gas_station,
                             )
                             .await
                             {
@@ -1026,6 +1048,7 @@ pub async fn run_cli(
                                             &settings.aptos_private_key,
                                             &settings.subaccount,
                                             &snapshot.market,
+                                            gas_station,
                                         )
                                         .await
                                         {
@@ -1157,6 +1180,7 @@ pub async fn run_cli(
                                     .expect("live Spot execution fetched fee rates"),
                             )
                         }),
+                        gas_station,
                     )
                     .await
                     {
@@ -1177,6 +1201,7 @@ pub async fn run_cli(
                         &settings.aptos_private_key,
                         &settings.subaccount,
                         &market,
+                        gas_station,
                     )
                     .await
                     {

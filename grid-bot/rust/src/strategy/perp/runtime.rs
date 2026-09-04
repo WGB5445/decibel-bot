@@ -10,8 +10,8 @@ use super::{
     risk::{apply_perp_risk_trim, perp_margin_is_safe, perp_position_is_safe},
 };
 use crate::{
-    DecibelClient, GridConfig, GridPlan, Market, MonitorSnapshot, SpotExecutionConfig, build_plan,
-    journal, spot_lifecycle,
+    DecibelClient, GasStationConfig, GridConfig, GridPlan, Market, MonitorSnapshot,
+    SpotExecutionConfig, build_plan, journal, spot_lifecycle,
 };
 
 pub fn rebuild_perp_plan(config: &GridConfig, snapshot: &mut MonitorSnapshot) -> Result<()> {
@@ -102,6 +102,7 @@ pub async fn run_perp_convergence(
     market: &Market,
     plan: &GridPlan,
     guard: &SpotExecutionConfig,
+    gas_station: Option<&GasStationConfig>,
 ) -> Result<super::convergence::ConvergencePlan> {
     super::convergence::execute_perp_convergence_ioc(
         network,
@@ -111,6 +112,7 @@ pub async fn run_perp_convergence(
         market,
         plan,
         guard,
+        gas_station,
     )
     .await
 }
@@ -124,6 +126,7 @@ pub async fn handle_perp_out_of_range(
     market: &Market,
     client: &DecibelClient,
     execute: bool,
+    gas_station: Option<&GasStationConfig>,
 ) -> Result<()> {
     if plan.out_of_range_action_applied.is_none() {
         return Ok(());
@@ -135,15 +138,25 @@ pub async fn handle_perp_out_of_range(
     match action {
         crate::OutOfRangeAction::Pause => {}
         crate::OutOfRangeAction::CancelOrders => {
-            let hash =
-                spot_lifecycle::cancel_bulk_ladder(network, aptos_private_key, subaccount, market)
-                    .await?;
+            let hash = spot_lifecycle::cancel_bulk_ladder(
+                network,
+                aptos_private_key,
+                subaccount,
+                market,
+                gas_station,
+            )
+            .await?;
             println!("Perp out-of-range cancelled ladder in tx {hash}");
         }
         crate::OutOfRangeAction::ClosePosition => {
-            let hash =
-                spot_lifecycle::cancel_bulk_ladder(network, aptos_private_key, subaccount, market)
-                    .await?;
+            let hash = spot_lifecycle::cancel_bulk_ladder(
+                network,
+                aptos_private_key,
+                subaccount,
+                market,
+                gas_station,
+            )
+            .await?;
             println!("Perp out-of-range cancelled ladder in tx {hash}");
             let overview = client.account(Some(subaccount), market).await?;
             if overview.position.size != Decimal::ZERO {
@@ -158,6 +171,7 @@ pub async fn handle_perp_out_of_range(
                         ..plan.clone()
                     },
                     &guard_from_config(config),
+                    gas_station,
                 )
                 .await?;
             }
@@ -180,6 +194,7 @@ pub async fn record_perp_risk_rejection(
     journal: Option<&journal::Journal>,
     run_state: &mut journal::RunState,
     execute: bool,
+    gas_station: Option<&GasStationConfig>,
 ) -> Result<()> {
     eprintln!("RISK REJECTED: {reason}");
     if let Some(journal) = journal {
@@ -192,8 +207,14 @@ pub async fn record_perp_risk_rejection(
         journal.save_state(run_state)?;
     }
     if execute {
-        match spot_lifecycle::cancel_bulk_ladder(network, aptos_private_key, subaccount, market)
-            .await
+        match spot_lifecycle::cancel_bulk_ladder(
+            network,
+            aptos_private_key,
+            subaccount,
+            market,
+            gas_station,
+        )
+        .await
         {
             Ok(hash) => println!("Perp risk gate cancelled ladder in tx {hash}"),
             Err(error) => eprintln!("Perp risk gate ladder cancellation failed: {error:#}"),

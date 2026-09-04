@@ -1,5 +1,7 @@
 //! Typed client for the local grid-engine control socket. No terminal rendering belongs here.
 
+use std::path::Path;
+
 use anyhow::{Result, bail};
 use tokio::sync::mpsc;
 
@@ -39,6 +41,10 @@ impl EngineClient {
     /// Returns a typed status stream backed by one long-lived local control subscription.
     pub async fn subscribe_updates(&self) -> Result<mpsc::Receiver<Result<EngineStatus>>> {
         crate::control::subscribe(&self.paths).await
+    }
+
+    pub fn log_path(&self) -> &Path {
+        &self.paths.log
     }
 }
 

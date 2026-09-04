@@ -4,8 +4,8 @@ use anyhow::{Result, anyhow, bail};
 use rust_decimal::Decimal;
 
 use crate::{
-    DecibelClient, GridPlan, Market, OrderBook, SpotExecutionConfig, round_down, round_up,
-    submit_perp_ioc_order,
+    DecibelClient, GasStationConfig, GridPlan, Market, OrderBook, SpotExecutionConfig, round_down,
+    round_up, submit_perp_ioc_order,
 };
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -39,6 +39,7 @@ pub async fn execute_perp_convergence_ioc(
     market: &Market,
     plan: &GridPlan,
     guard: &SpotExecutionConfig,
+    gas_station: Option<&GasStationConfig>,
 ) -> Result<ConvergencePlan> {
     let target = plan
         .target_position
@@ -77,6 +78,7 @@ pub async fn execute_perp_convergence_ioc(
             attempt.size,
             side_buy,
             false,
+            gas_station,
         )
         .await?;
         attempts += 1;

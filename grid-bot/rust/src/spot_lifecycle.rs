@@ -4,16 +4,16 @@
 //! decision: retain leaves released PFS funds untouched, while liquidation is handled by the
 //! guarded IOC executor.
 
-use std::time::Duration;
-
 use anyhow::{Context, Result, anyhow, bail};
 use aptos_sdk::{
     account::Ed25519Account,
-    transaction::{InputEntryFunctionData, TransactionBuilder, sign_transaction},
+    transaction::{InputEntryFunctionData, TransactionBuilder},
     types::AccountAddress,
 };
 use serde_json::Value;
 
+use crate::aptos_tx;
+use crate::geomi::GasStationConfig;
 use crate::network::{self, default_registry};
 use crate::{Market, Product, normalize_private_key, package_for_network};
 
@@ -26,6 +26,7 @@ pub async fn cancel_bulk_ladder(
     private_key: &str,
     subaccount: &str,
     market: &Market,
+    gas_station: Option<&GasStationConfig>,
 ) -> Result<String> {
     let package = package_for_network(network)?;
     let key = normalize_private_key(private_key)?;
@@ -66,18 +67,19 @@ pub async fn cancel_bulk_ladder(
         .max_gas_amount(max_gas_amount)
         .gas_unit_price(gas_price)
         .chain_id(aptos.ensure_chain_id().await?)
-        .expiration_from_now(600)
+        .expiration_from_now(aptos_tx::expiration_seconds(gas_station))
         .build()
         .context("build bulk cancellation transaction")?;
-    let response = aptos
-        .submit_and_wait(
-            &sign_transaction(&raw, &signer)?,
-            Some(Duration::from_secs(60)),
-        )
-        .await
-        .context("submit bulk cancellation transaction")?;
+    let response = aptos_tx::submit_raw_and_wait(
+        &aptos,
+        raw,
+        &signer,
+        gas_station,
+        "submit bulk cancellation transaction",
+    )
+    .await
+    .context("submit bulk cancellation transaction")?;
     if !response
-        .data
         .get("success")
         .and_then(Value::as_bool)
         .unwrap_or(false)
@@ -85,14 +87,12 @@ pub async fn cancel_bulk_ladder(
         bail!(
             "bulk cancellation failed: {}",
             response
-                .data
                 .get("vm_status")
                 .and_then(Value::as_str)
                 .unwrap_or("unknown VM status")
         )
     }
     let hash = response
-        .data
         .get("hash")
         .and_then(Value::as_str)
         .ok_or_else(|| anyhow!("bulk cancellation response has no transaction hash"))?;

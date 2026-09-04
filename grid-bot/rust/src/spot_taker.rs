@@ -6,8 +6,8 @@ use rust_decimal::Decimal;
 use tokio::time::Instant;
 
 use crate::{
-    AccountOverview, BookLevel, DecibelClient, Market, OrderBook, SpotExecutionConfig,
-    SpotFeeRates, round_down, round_up, submit_spot_ioc_order,
+    AccountOverview, BookLevel, DecibelClient, GasStationConfig, Market, OrderBook,
+    SpotExecutionConfig, SpotFeeRates, round_down, round_up, submit_spot_ioc_order,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -141,6 +141,7 @@ pub async fn execute_guarded_spot_ioc(
     max_quote_spend: Option<Decimal>,
     fees: &SpotFeeRates,
     config: &SpotExecutionConfig,
+    gas_station: Option<&GasStationConfig>,
 ) -> Result<GuardedTakerOutcome> {
     if target_size < market.min_size {
         return Ok(GuardedTakerOutcome {
@@ -196,6 +197,7 @@ pub async fn execute_guarded_spot_ioc(
             attempt.limit_price,
             attempt.size,
             side == TakerSide::Buy,
+            gas_station,
         )
         .await?;
         outcome.attempts += 1;

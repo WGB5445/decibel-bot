@@ -7,6 +7,7 @@
 use crate::{
     client::{ClientCommand, EngineClient},
     control::{EngineStatus, ExitMode, LadderLevel},
+    monitor_log::{LogPanelState, MIN_LOG_WIDTH, MIN_MAIN_WIDTH, render_log_panel, split_layout},
 };
 use anyhow::{Context, Result};
 use crossterm::{
@@ -91,18 +92,44 @@ impl TerminalGuard {
         }
     }
 
-    fn height(&self) -> Result<u16> {
-        Ok(self.terminal.size()?.height)
-    }
-
     fn draw(&mut self, app: &mut App) -> Result<()> {
-        let terminal_height = self.height()?;
-        let viewport_height = terminal_height.saturating_sub(10) as usize;
-        let content = snapshot_lines(&app.status);
+        let terminal_size = self.terminal.size()?;
+        let term_width = terminal_size.width;
+        let term_height = terminal_size.height;
+        let (_, log_rect) = split_layout(
+            Rect::new(0, 0, term_width, 1),
+            MIN_MAIN_WIDTH,
+            MIN_LOG_WIDTH,
+        );
+        let width_ok = log_rect.is_some();
+        let engine_has_log = app.log_panel.has_engine_log();
+        let split_visible = width_ok && engine_has_log;
+        let main_width = log_rect
+            .map(|rect| term_width.saturating_sub(rect.width).saturating_sub(1))
+            .unwrap_or(term_width);
+        if split_visible {
+            let log_width = log_rect
+                .map(|rect| rect.width.saturating_sub(2) as usize)
+                .unwrap_or(0);
+            app.log_panel
+                .update_scroll_bounds(term_height.saturating_sub(10) as usize, log_width);
+        }
+        let viewport_height = term_height.saturating_sub(10) as usize;
+        let recent_log_errors = if split_visible {
+            app.log_panel.recent_error_lines(12)
+        } else {
+            Vec::new()
+        };
+        let content = snapshot_lines(
+            &app.status,
+            !split_visible,
+            main_width,
+            &recent_log_errors,
+        );
         let max_scroll = content.len().saturating_sub(viewport_height.max(1));
         app.update_scroll_bounds(max_scroll);
         self.terminal
-            .draw(|frame| render(frame, app, &content, max_scroll))?;
+            .draw(|frame| render(frame, app, &content, max_scroll, split_visible))?;
         Ok(())
     }
 }
@@ -119,6 +146,7 @@ struct App {
     scroll: usize,
     max_scroll: usize,
     follow_latest: bool,
+    log_panel: LogPanelState,
     confirm_liquidate: bool,
     connected: bool,
     subscribed: bool,
@@ -187,6 +215,9 @@ pub async fn run(client: EngineClient) -> Result<()> {
             biased;
             _ = tick.tick() => {
                 let now = Instant::now();
+                if app.log_panel.tailer.as_mut().is_some_and(|tailer| tailer.poll()) {
+                    needs_redraw = true;
+                }
                 if updates.is_none() && now >= reconnect_at {
                     match client.subscribe_updates().await {
                         Ok(receiver) => {
@@ -231,6 +262,8 @@ pub async fn run(client: EngineClient) -> Result<()> {
                     // Keep the last complete snapshot during later reconnects. This update is
                     // the authoritative initial snapshot or a subsequent full state broadcast.
                     app.status = status;
+                    app.log_panel
+                        .sync_engine_log_path(app.status.log_path.as_deref());
                     app.connected = true;
                     app.subscribed = true;
                     app.received_snapshot = true;
@@ -267,8 +300,20 @@ pub async fn run(client: EngineClient) -> Result<()> {
                 // wheel reports. Ignore them without querying terminal size or requesting a draw.
                 Some(Ok(Event::Mouse(_))) => {}
                 Some(Ok(event)) => {
-                    let term_height = guard.height()?;
-                    match handle_event(event, &mut app, &client, term_height).await? {
+                    let term_size = guard.terminal.size()?;
+                    let (_, log_rect) = split_layout(
+                        Rect::new(0, 0, term_size.width, 1),
+                        MIN_MAIN_WIDTH,
+                        MIN_LOG_WIDTH,
+                    );
+                    match handle_event(
+                        event,
+                        &mut app,
+                        &client,
+                        term_size.height,
+                        log_rect.is_some(),
+                    )
+                    .await? {
                         EventOutcome::Quit => break,
                         EventOutcome::Redraw => needs_redraw = true,
                         EventOutcome::Continue => {}
@@ -297,6 +342,7 @@ async fn handle_event(
     app: &mut App,
     client: &EngineClient,
     term_height: u16,
+    log_split_visible: bool,
 ) -> Result<EventOutcome> {
     let outcome = match event {
         Event::Key(key) if key.kind == KeyEventKind::Press => match key.code {
@@ -322,10 +368,22 @@ async fn handle_event(
                 EventOutcome::Redraw
             }
             KeyCode::Char('c') if !app.confirm_liquidate => {
-                app.notice = match copy_snapshot_to_clipboard(&app.status) {
+                app.notice = match copy_snapshot_to_clipboard(&app.status, &app.log_panel) {
                     Ok(()) => "Copied the complete snapshot to the clipboard.".to_owned(),
                     Err(error) => format!("Could not copy snapshot: {error:#}"),
                 };
+                EventOutcome::Redraw
+            }
+            KeyCode::Char('[') if log_split_visible && !app.confirm_liquidate => {
+                app.log_panel.scroll_up(1);
+                EventOutcome::Redraw
+            }
+            KeyCode::Char(']') if log_split_visible && !app.confirm_liquidate => {
+                app.log_panel.scroll_down(1);
+                EventOutcome::Redraw
+            }
+            KeyCode::Char('f') if log_split_visible && !app.confirm_liquidate => {
+                app.log_panel.toggle_follow();
                 EventOutcome::Redraw
             }
             // Content starts at the top when scroll=0. Going down means a larger offset.
@@ -368,7 +426,12 @@ fn page_step(term_height: u16) -> usize {
     (term_height.saturating_sub(10) as usize).max(1)
 }
 
-fn snapshot_lines(status: &EngineStatus) -> Vec<Line<'static>> {
+fn snapshot_lines(
+    status: &EngineStatus,
+    include_events: bool,
+    main_width: u16,
+    recent_log_errors: &[String],
+) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
     let base_symbol = status.pfs_base_symbol.as_deref().unwrap_or("BASE");
     let base_balance = status.pfs_base_balance.as_deref().unwrap_or("-");
@@ -428,6 +491,16 @@ fn snapshot_lines(status: &EngineStatus) -> Vec<Line<'static>> {
             ),
             Span::styled(error.clone(), Style::default().fg(Color::Red)),
         ]));
+    } else if !recent_log_errors.is_empty() {
+        lines.push(Line::styled(
+            "ENGINE LOG ERRORS (latest)",
+            Style::default()
+                .fg(Color::Red)
+                .add_modifier(Modifier::BOLD),
+        ));
+        for error in recent_log_errors {
+            lines.push(Line::styled(error.clone(), Style::default().fg(Color::Red)));
+        }
     }
 
     lines.push(Line::raw(""));
@@ -437,15 +510,23 @@ fn snapshot_lines(status: &EngineStatus) -> Vec<Line<'static>> {
             .fg(Color::Cyan)
             .add_modifier(Modifier::BOLD),
     ));
+    let columns = ladder_columns_for_width(main_width);
     lines.push(Line::styled(
         format!(
-            "{:<8} {:>18} {:>16} {:>12}",
-            "SIDE", "PRICE (QUOTE)", "QTY (BASE)", "STATUS"
+            "{:<width_side$} {:>width_price$} {:>width_size$} {:>width_status$}",
+            "SIDE",
+            "PRICE (QUOTE)",
+            "QTY (BASE)",
+            "STATUS",
+            width_side = columns.side,
+            width_price = columns.price,
+            width_size = columns.size,
+            width_status = columns.status,
         ),
         Style::default().fg(Color::DarkGray),
     ));
     lines.push(Line::styled(
-        "------------------------------------------------------------",
+        "-".repeat(columns.total().min(main_width as usize)),
         Style::default().fg(Color::DarkGray),
     ));
 
@@ -457,40 +538,42 @@ fn snapshot_lines(status: &EngineStatus) -> Vec<Line<'static>> {
         ));
     } else {
         for level in levels {
-            lines.push(ladder_line(level));
+            lines.push(ladder_line(level, columns));
         }
     }
 
-    let rendered_event_count = status.events.len().min(MAX_RENDERED_EVENTS);
-    lines.push(Line::raw(""));
-    lines.push(Line::styled(
-        format!(
-            "EVENTS (latest {rendered_event_count} / {})",
-            status.events.len()
-        ),
-        Style::default()
-            .fg(Color::Cyan)
-            .add_modifier(Modifier::BOLD),
-    ));
-    lines.push(Line::styled(
-        "------------------------------------------------------------",
-        Style::default().fg(Color::DarkGray),
-    ));
-    if status.events.is_empty() {
+    if include_events {
+        let rendered_event_count = status.events.len().min(MAX_RENDERED_EVENTS);
+        lines.push(Line::raw(""));
         lines.push(Line::styled(
-            "(no events in the latest snapshot)",
+            format!(
+                "EVENTS (latest {rendered_event_count} / {})",
+                status.events.len()
+            ),
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ));
+        lines.push(Line::styled(
+            "-".repeat(columns.total().min(main_width as usize)),
             Style::default().fg(Color::DarkGray),
         ));
-    } else {
-        for event in status.events.iter().rev().take(MAX_RENDERED_EVENTS) {
-            lines.push(Line::from(vec![
-                Span::styled(
-                    event.at.format("%H:%M:%S").to_string(),
-                    Style::default().fg(Color::DarkGray),
-                ),
-                Span::raw("  "),
-                Span::raw(event.message.clone()),
-            ]));
+        if status.events.is_empty() {
+            lines.push(Line::styled(
+                "(no events in the latest snapshot)",
+                Style::default().fg(Color::DarkGray),
+            ));
+        } else {
+            for event in status.events.iter().rev().take(MAX_RENDERED_EVENTS) {
+                lines.push(Line::from(vec![
+                    Span::styled(
+                        event.at.format("%H:%M:%S").to_string(),
+                        Style::default().fg(Color::DarkGray),
+                    ),
+                    Span::raw("  "),
+                    Span::raw(event.message.clone()),
+                ]));
+            }
         }
     }
     lines
@@ -522,7 +605,59 @@ fn ordered_levels(levels: &[LadderLevel]) -> Vec<&LadderLevel> {
     bids
 }
 
-fn ladder_line(level: &LadderLevel) -> Line<'static> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct LadderColumns {
+    side: usize,
+    price: usize,
+    size: usize,
+    status: usize,
+}
+
+impl LadderColumns {
+    fn total(&self) -> usize {
+        self.side + self.price + self.size + self.status + 3
+    }
+}
+
+fn ladder_columns_for_width(available: u16) -> LadderColumns {
+    const MIN_SIDE: usize = 4;
+    const MIN_STATUS: usize = 8;
+    const MIN_PRICE: usize = 6;
+    const MIN_SIZE: usize = 6;
+    const GAPS: usize = 3;
+
+    let available = available.max(1) as usize;
+    if available <= MIN_SIDE + MIN_STATUS + GAPS {
+        return LadderColumns {
+            side: MIN_SIDE.min(available.saturating_sub(MIN_STATUS + GAPS)),
+            price: 1,
+            size: 1,
+            status: MIN_STATUS.min(available.saturating_sub(MIN_SIDE + GAPS)),
+        };
+    }
+
+    let fixed = MIN_SIDE + MIN_STATUS + GAPS;
+    let flex = available.saturating_sub(fixed);
+    let mut price = ((flex as f64) * 0.55).round() as usize;
+    let mut size = flex.saturating_sub(price);
+    price = price.clamp(MIN_PRICE, flex);
+    size = size.clamp(MIN_SIZE, flex);
+    let mut columns = LadderColumns {
+        side: MIN_SIDE,
+        price,
+        size,
+        status: MIN_STATUS,
+    };
+    while columns.total() > available && columns.price > 1 {
+        columns.price -= 1;
+    }
+    while columns.total() > available && columns.size > 1 {
+        columns.size -= 1;
+    }
+    columns
+}
+
+fn ladder_line(level: &LadderLevel, columns: LadderColumns) -> Line<'static> {
     let side_is_bid = level.side.eq_ignore_ascii_case("BID");
     let side_is_ask = level.side.eq_ignore_ascii_case("ASK");
     let side_style = if side_is_bid {
@@ -550,18 +685,33 @@ fn ladder_line(level: &LadderLevel) -> Line<'static> {
 
     Line::from(vec![
         Span::styled(
-            format!("{:<8}", level.side.to_ascii_uppercase()),
+            format!(
+                "{:<width$}",
+                level.side.to_ascii_uppercase(),
+                width = columns.side
+            ),
             side_style,
         ),
         Span::styled(
-            format!("{:>18}", format_decimal(&level.price, 8)),
+            format!(
+                "{:>width$}",
+                format_decimal(&level.price, 8),
+                width = columns.price
+            ),
             price_style,
         ),
         Span::styled(
-            format!("{:>16}", format_decimal(&level.size, 6)),
+            format!(
+                "{:>width$}",
+                format_decimal(&level.size, 6),
+                width = columns.size
+            ),
             side_style,
         ),
-        Span::styled(format!("{:>12}", state), state_style),
+        Span::styled(
+            format!("{:>width$}", state, width = columns.status),
+            state_style,
+        ),
     ])
 }
 
@@ -707,20 +857,27 @@ fn product_tag(product: &str) -> (&'static str, Style) {
     }
 }
 
-fn snapshot_plain_text(status: &EngineStatus) -> String {
-    snapshot_lines(status)
+fn snapshot_plain_text(status: &EngineStatus, include_events: bool, main_width: u16) -> String {
+    snapshot_lines(status, include_events, main_width, &[])
         .into_iter()
         .map(|line| line.to_string())
         .collect::<Vec<_>>()
         .join("\n")
 }
 
-fn copy_snapshot_to_clipboard(status: &EngineStatus) -> Result<()> {
+fn copy_snapshot_to_clipboard(status: &EngineStatus, log_panel: &LogPanelState) -> Result<()> {
     let mut child = Command::new("pbcopy")
         .stdin(Stdio::piped())
         .spawn()
         .context("start macOS clipboard command (pbcopy)")?;
-    let text = snapshot_plain_text(status);
+    let mut text = snapshot_plain_text(status, true, u16::MAX);
+    let recent_logs = log_panel.recent_lines(200);
+    if !recent_logs.is_empty() {
+        text.push_str("\n\nENGINE LOG (recent)\n");
+        text.push_str(&"-".repeat(40));
+        text.push('\n');
+        text.push_str(&recent_logs.join("\n"));
+    }
     child
         .stdin
         .as_mut()
@@ -738,7 +895,7 @@ fn copy_snapshot_to_clipboard(status: &EngineStatus) -> Result<()> {
 fn snapshot_indicator(app: &App) -> Span<'static> {
     if let Some(error) = &app.status.last_error {
         Span::styled(
-            format!("REST snapshot FAILED: {}", compact_text(error, 56)),
+            format!("REST snapshot FAILED: {error}"),
             Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
         )
     } else if app.received_snapshot {
@@ -758,18 +915,13 @@ fn snapshot_indicator(app: &App) -> Span<'static> {
     }
 }
 
-fn compact_text(value: &str, max_chars: usize) -> String {
-    let compact = value.split_whitespace().collect::<Vec<_>>().join(" ");
-    let mut chars = compact.chars();
-    let shortened = chars.by_ref().take(max_chars).collect::<String>();
-    if chars.next().is_some() {
-        format!("{shortened}...")
-    } else {
-        shortened
-    }
-}
-
-fn render(frame: &mut ratatui::Frame, app: &App, content: &[Line<'static>], max_scroll: usize) {
+fn render(
+    frame: &mut ratatui::Frame,
+    app: &App,
+    content: &[Line<'static>],
+    max_scroll: usize,
+    split_visible: bool,
+) {
     let area = frame.area();
     let header_height = if app.status.perp_mode.is_some() { 6 } else { 5 };
     let rows = Layout::default()
@@ -868,6 +1020,11 @@ fn render(frame: &mut ratatui::Frame, app: &App, content: &[Line<'static>], max_
         rows[0],
     );
 
+    let (main_rect, log_rect) = if split_visible {
+        split_layout(rows[1], MIN_MAIN_WIDTH, MIN_LOG_WIDTH)
+    } else {
+        (rows[1], None)
+    };
     frame.render_widget(
         Paragraph::new(content.to_vec())
             .block(
@@ -877,10 +1034,13 @@ fn render(frame: &mut ratatui::Frame, app: &App, content: &[Line<'static>], max_
             )
             .scroll((app.scroll.min(u16::MAX as usize) as u16, 0))
             .wrap(Wrap { trim: false }),
-        rows[1],
+        main_rect,
     );
+    if let Some(log_area) = log_rect {
+        render_log_panel(frame, log_area, &app.log_panel);
+    }
 
-    let viewport_height = rows[1].height.saturating_sub(2) as usize;
+    let viewport_height = main_rect.height.saturating_sub(2) as usize;
     let start = app.scroll.min(max_scroll).saturating_add(1);
     let end = start
         .saturating_add(viewport_height)
@@ -891,8 +1051,13 @@ fn render(frame: &mut ratatui::Frame, app: &App, content: &[Line<'static>], max_
     } else {
         "manual scroll"
     };
+    let log_controls = if split_visible {
+        "  |  [ / ] log scroll  f follow"
+    } else {
+        ""
+    };
     let controls = format!(
-        "Lines {start}-{end} / {} ({scroll_mode})  |  Up/Down scroll  PgUp/PgDn page  Home/End bounds  c copy  s liquidate  q/Esc/Ctrl+C quit",
+        "Lines {start}-{end} / {} ({scroll_mode})  |  Up/Down scroll  PgUp/PgDn page  Home/End bounds  c copy  s liquidate  q/Esc/Ctrl+C quit{log_controls}",
         content.len(),
     );
     let notice_style = if app.connected {
@@ -954,7 +1119,7 @@ mod tests {
             ..EngineStatus::default()
         };
 
-        let snapshot = snapshot_plain_text(&status);
+        let snapshot = snapshot_plain_text(&status, true, 120);
         assert!(snapshot.contains("Perp: LONG"));
         assert!(snapshot.contains("pos=0.002"));
         assert!(snapshot.contains("max=0.01"));
@@ -972,7 +1137,7 @@ mod tests {
             ..EngineStatus::default()
         };
 
-        let snapshot = snapshot_plain_text(&status);
+        let snapshot = snapshot_plain_text(&status, true, 120);
         assert!(snapshot.contains("BID"));
         assert!(snapshot.contains("ASK"));
         assert!(snapshot.contains("reconciled"));
@@ -990,7 +1155,7 @@ mod tests {
             ..EngineStatus::default()
         };
 
-        let snapshot = snapshot_plain_text(&status);
+        let snapshot = snapshot_plain_text(&status, true, 120);
         assert!(snapshot.contains("EVENTS (latest 10 / 11)"));
         assert!(snapshot.contains("event-10"));
         assert!(snapshot.contains("event-01"));
@@ -1024,6 +1189,36 @@ mod tests {
     fn page_step_is_a_full_viewport() {
         assert_eq!(page_step(1), 1);
         assert_eq!(page_step(24), 14);
+    }
+
+    #[test]
+    fn split_snapshot_omits_events_when_requested() {
+        let status = EngineStatus {
+            events: vec![EngineEvent {
+                at: Utc::now(),
+                message: "reconciled".into(),
+            }],
+            ..EngineStatus::default()
+        };
+
+        let with_events = snapshot_plain_text(&status, true, 120);
+        let without_events = snapshot_plain_text(&status, false, 120);
+        assert!(with_events.contains("EVENTS"));
+        assert!(with_events.contains("reconciled"));
+        assert!(!without_events.contains("EVENTS"));
+        assert!(!without_events.contains("reconciled"));
+    }
+
+    #[test]
+    fn ladder_columns_for_width_allocates_flex_space() {
+        let narrow = ladder_columns_for_width(30);
+        assert!(narrow.total() <= 30);
+
+        let wide = ladder_columns_for_width(120);
+        assert!(wide.price >= 6);
+        assert!(wide.size >= 6);
+        assert_eq!(wide.side, 4);
+        assert_eq!(wide.status, 8);
     }
 
     #[test]

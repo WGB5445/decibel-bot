@@ -159,16 +159,15 @@ pub async fn status_client(settings: Settings) -> Result<()> {
 pub async fn stop_client(
     settings: Settings,
     confirm_mainnet: Option<&str>,
-    exit_mode: Option<&str>,
 ) -> Result<()> {
     if settings.network.eq_ignore_ascii_case("mainnet") && confirm_mainnet != Some("MAINNET") {
         anyhow::bail!("mainnet stop requires --confirm-mainnet MAINNET")
     }
-    let mode = match exit_mode.unwrap_or("hold") {
-        "hold" => control::ExitMode::Hold,
-        "liquidate" => control::ExitMode::Liquidate,
-        _ => anyhow::bail!("--exit-mode must be hold or liquidate"),
+    let mode = match settings.exit_asset_policy {
+        ExitAssetPolicy::Retain => control::ExitMode::Hold,
+        ExitAssetPolicy::Sell => control::ExitMode::Liquidate,
     };
+    println!("Sending stop request to engine (mode: {mode:?})...");
     match control_request(&settings, control::Request::Stop { exit_mode: mode }).await? {
         control::Response::Accepted { message } => {
             println!("{message}");
@@ -277,7 +276,11 @@ pub async fn start_cli(settings: Settings, confirm_mainnet: Option<&str>) -> Res
     )
 }
 
-pub async fn engine_cli(settings: Settings, confirm_mainnet: Option<&str>) -> Result<()> {
+pub async fn engine_cli(
+    settings: Settings,
+    confirm_mainnet: Option<&str>,
+    active_log_path: Option<PathBuf>,
+) -> Result<()> {
     let _subaccount_lock = SubaccountRunLock::acquire(&settings.network, &settings.subaccount)?;
     let paths = control_paths(&settings)?;
     paths.ensure_directory()?;
@@ -295,6 +298,7 @@ pub async fn engine_cli(settings: Settings, confirm_mainnet: Option<&str>) -> Re
         market: settings.market.clone(),
         product: format!("{:?}", settings.product).to_lowercase(),
         phase: "starting".to_owned(),
+        log_path: active_log_path.map(|path| path.display().to_string()),
         ..Default::default()
     });
     paths.write_pid(std::process::id())?;
@@ -338,6 +342,8 @@ async fn stop_cli(settings: Settings, confirm_mainnet: Option<&str>) -> Result<(
     let _lock = SubaccountRunLock::acquire(&settings.network, &settings.subaccount)?;
     let mut config = settings.to_grid_config()?;
     let api = settings.api_client()?;
+    let gas_station_config = settings.gas_station_config()?;
+    let gas_station = gas_station_config.as_ref();
     let market = api.market(&config.market_name, config.product).await?;
     match settings.exit_asset_policy {
         ExitAssetPolicy::Retain => {
@@ -346,6 +352,7 @@ async fn stop_cli(settings: Settings, confirm_mainnet: Option<&str>) -> Result<(
                 &settings.aptos_private_key,
                 &settings.subaccount,
                 &market,
+                gas_station,
             )
             .await?;
             println!("Grid stopped: ladder cancelled in tx {hash}; assets retained.");
@@ -366,6 +373,7 @@ async fn stop_cli(settings: Settings, confirm_mainnet: Option<&str>) -> Result<(
                 &settings.subaccount,
                 &market,
                 guard_refs,
+                gas_station,
             )
             .await?;
             println!(
@@ -411,12 +419,15 @@ pub async fn spot_funding_setup_cli(
         .to_i64()
         .ok_or_else(|| anyhow::anyhow!("--spot-funding-amount is outside the supported range"))?;
     println!("Transferring {amount_decimal} USDC from Cross to PFS...");
+    let gas_station_config = settings.gas_station_config()?;
+    let gas_station = gas_station_config.as_ref();
     let transfer_tx = decibel_grid_tui::transfer_spot_cross_pfs(
         &settings.network,
         &settings.aptos_private_key,
         &settings.subaccount,
         &metadata,
         -raw,
+        gas_station,
     )
     .await?;
     println!("  Transfer submitted. tx {transfer_tx}");
@@ -431,9 +442,25 @@ pub async fn doctor_cli(settings: Settings) -> Result<()> {
     }
     let config = settings.to_grid_config()?;
     let api = settings.api_client()?;
+    let gas_station_enabled = settings.gas_station_config()?.is_some();
     api.verify_api_key()
         .await
         .context("API key verification failed")?;
+    if gas_station_enabled && !settings.aptos_private_key.trim().is_empty() {
+        use aptos_sdk::account::Ed25519Account;
+
+        let signer = Ed25519Account::from_private_key_hex(settings.aptos_private_key.trim())
+            .context("invalid Aptos Ed25519 private key")?;
+        let profile = settings.network_profile()?;
+        let aptos = decibel_grid_tui::network::default_registry().aptos(profile)?;
+        let balance = aptos.get_balance(signer.address()).await?;
+        const LOW_APT_OCTAS: u64 = 100_000;
+        if balance < LOW_APT_OCTAS {
+            println!(
+                "  note: signer APT balance is low ({balance} octas); Geomi Gas Station sponsors on-chain gas"
+            );
+        }
+    }
     let (snapshot, result) = reconcile_snapshot(&api, &config, &settings.subaccount).await?;
     println!(
         "DOCTOR OK — {} {} on {}",
