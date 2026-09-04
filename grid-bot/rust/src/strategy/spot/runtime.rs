@@ -197,6 +197,7 @@ mod tests {
             price_source: crate::PriceSource::Prices,
             spot: crate::SpotExecutionConfig::default(),
             max_position: None,
+            out_of_range_action: crate::OutOfRangeAction::default(),
         };
         let market = crate::Market {
             address: "0xspot".to_owned(),

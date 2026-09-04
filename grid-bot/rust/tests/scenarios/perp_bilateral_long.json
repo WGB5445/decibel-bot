@@ -1,10 +1,10 @@
 {
-  "name": "perp_long_only_bids",
+  "name": "perp_bilateral_long",
   "product": "perp",
   "config": {
-    "total_count": 10,
+    "total_count": 4,
     "perp_mode": "long",
-    "range": { "kind": "percent", "percent": "10" },
+    "range": { "kind": "bounds", "lower": "90", "upper": "110" },
     "allocation": { "kind": "fixed_size", "value": "0.01" },
     "maker_fee_rate": "0.0001",
     "preview_leverage": "1"
@@ -21,9 +21,9 @@
     {
       "mid": "100",
       "expect": {
-        "bid_count": 10,
-        "ask_count": 0,
-        "perp_blocked": false
+        "bid_count": 2,
+        "ask_count": 2,
+        "perp_blocked": true
       }
     }
   ]

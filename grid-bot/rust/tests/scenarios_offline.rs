@@ -1,8 +1,8 @@
 //! L0 offline scenario tests — zero network, embedded JSON fixtures.
 
 use decibel_grid_tui::{
-    Allocation, GridConfig, PerpMode, PriceSource, Product, RangeSpec, SpotExecutionConfig,
-    build_plan, reconcile, simulation, strategy,
+    Allocation, GridConfig, OutOfRangeAction, PerpMode, PriceSource, Product, RangeSpec,
+    SpotExecutionConfig, build_plan, reconcile, simulation, strategy,
 };
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
@@ -14,7 +14,7 @@ fn load_scenario(name: &str) -> simulation::Scenario {
         "spot_pin_sweep" => include_str!("scenarios/spot_pin_sweep.json"),
         "spot_breakout_pause" => include_str!("scenarios/spot_breakout_pause.json"),
         "perp_neutral_mid50" => include_str!("scenarios/perp_neutral_mid50.json"),
-        "perp_long_only_bids" => include_str!("scenarios/perp_long_only_bids.json"),
+        "perp_bilateral_long" => include_str!("scenarios/perp_bilateral_long.json"),
         "perp_max_position_block" => include_str!("scenarios/perp_max_position_block.json"),
         "reconcile_bulk_match" => include_str!("scenarios/reconcile_bulk_match.json"),
         other => panic!("unknown scenario fixture: {other}"),
@@ -37,7 +37,7 @@ fn spot_breakout_pause() {
 #[test]
 fn perp_modes_level_counts() {
     load_scenario("perp_neutral_mid50").run().expect("neutral");
-    load_scenario("perp_long_only_bids").run().expect("long");
+    load_scenario("perp_bilateral_long").run().expect("long");
 }
 
 #[test]
@@ -149,6 +149,7 @@ fn strategy_registry_spot_unchanged() {
         price_source: PriceSource::Prices,
         spot: SpotExecutionConfig::default(),
         max_position: None,
+        out_of_range_action: OutOfRangeAction::default(),
     };
     let market = decibel_grid_tui::Market {
         address: "0xspot".to_owned(),

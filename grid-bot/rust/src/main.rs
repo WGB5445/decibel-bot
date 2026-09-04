@@ -13,17 +13,17 @@ use clap::Parser;
 use crossterm::{
     event::DisableMouseCapture,
     execute,
-    terminal::{disable_raw_mode, LeaveAlternateScreen},
+    terminal::{LeaveAlternateScreen, disable_raw_mode},
 };
 use dotenvy::dotenv;
 
-use cli::{redirect_output_to_log, Cmd, Cli, Settings, control_paths};
 use cli::settings::has_complete_grid_config;
+use cli::{Cli, Cmd, Settings, control_paths, redirect_output_to_log};
 use cli::{
-    attach_client, check_api_key, doctor_cli, engine_cli, logs_client, reconcile_cli,
-    shadow_cli, simulate_cli, spot_funding_setup_cli, start_cli, status_client, stop_client,
+    attach_client, check_api_key, doctor_cli, engine_cli, logs_client, reconcile_cli, shadow_cli,
+    simulate_cli, spot_funding_setup_cli, start_cli, status_client, stop_client,
 };
-use tui::{run_tui, save_error_report, TAB_CONFIG, TAB_MONITOR, TAB_PREVIEW};
+use tui::{TAB_CONFIG, TAB_MONITOR, TAB_PREVIEW, run_tui, save_error_report};
 
 fn install_panic_reporter() {
     let previous = panic::take_hook();

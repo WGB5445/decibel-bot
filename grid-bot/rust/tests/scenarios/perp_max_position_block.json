@@ -4,9 +4,9 @@
   "config": {
     "total_count": 4,
     "perp_mode": "long",
-    "range": { "kind": "percent", "percent": "10" },
-    "allocation": { "kind": "fixed_size", "value": "1" },
-    "max_position": "2"
+    "range": { "kind": "bounds", "lower": "90", "upper": "110" },
+    "allocation": { "kind": "fixed_size", "value": "0.01" },
+    "max_position": "0.04"
   },
   "market": {
     "name": "BTC/USD",
@@ -19,9 +19,9 @@
   "steps": [
     {
       "mid": "100",
-      "position": "2",
+      "position": "0.02",
       "expect": {
-        "perp_blocked": true
+        "perp_blocked": false
       }
     },
     {

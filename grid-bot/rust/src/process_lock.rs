@@ -97,7 +97,10 @@ impl SubaccountRunLock {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{Mutex, atomic::{AtomicU64, Ordering}};
+    use std::sync::{
+        Mutex,
+        atomic::{AtomicU64, Ordering},
+    };
 
     use super::*;
 
@@ -105,7 +108,9 @@ mod tests {
     static TEST_COUNTER: AtomicU64 = AtomicU64::new(0);
 
     fn with_temp_lock_dir<F: FnOnce()>(test: F) {
-        let _guard = LOCK_TEST_MUTEX.lock().unwrap_or_else(|err| err.into_inner());
+        let _guard = LOCK_TEST_MUTEX
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
         let id = TEST_COUNTER.fetch_add(1, Ordering::Relaxed);
         let temp = std::env::temp_dir().join(format!(
             "decibel-grid-lock-test-{}-{}",
@@ -133,7 +138,10 @@ mod tests {
             let subaccount = "0xabc123";
             let first = SubaccountRunLock::acquire(network, subaccount).expect("first acquire");
             let second = SubaccountRunLock::acquire(network, subaccount);
-            assert!(second.is_err(), "second acquire should fail while first is held");
+            assert!(
+                second.is_err(),
+                "second acquire should fail while first is held"
+            );
             drop(first);
         });
     }
@@ -143,10 +151,12 @@ mod tests {
         with_temp_lock_dir(|| {
             let network = "testnet";
             let subaccount = "0xabc123";
-            let first =
-                SubaccountStartupLock::acquire(network, subaccount).expect("first acquire");
+            let first = SubaccountStartupLock::acquire(network, subaccount).expect("first acquire");
             let second = SubaccountStartupLock::acquire(network, subaccount);
-            assert!(second.is_err(), "second acquire should fail while first is held");
+            assert!(
+                second.is_err(),
+                "second acquire should fail while first is held"
+            );
             drop(first);
         });
     }

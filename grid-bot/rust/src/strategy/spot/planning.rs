@@ -93,6 +93,7 @@ pub fn build(config: &GridConfig, market: &Market, ctx: &StrategyContext) -> Res
         quote_required,
         base_required,
         estimated_margin: None,
+        ..Default::default()
     };
     plan.enforce_min_net_margin(config.maker_fee_rate, config.spot.min_net_margin_bps)?;
     plan.enforce_spot_budget(config)?;

@@ -8,8 +8,8 @@ use serde::Deserialize;
 
 use crate::simulation::cycle::{OfflineCycleInput, OfflineCycleOutput, run_offline_cycle};
 use crate::{
-    AccountOverview, Allocation, GridConfig, Market, PerpMode, Position, PriceSource, Product,
-    RangeBreakoutAction, RangeSpec, SpotExecutionConfig, SpotFunds,
+    AccountOverview, Allocation, GridConfig, Market, OutOfRangeAction, PerpMode, Position,
+    PriceSource, Product, RangeBreakoutAction, RangeSpec, SpotExecutionConfig, SpotFunds,
 };
 
 #[derive(Clone, Debug, Deserialize)]
@@ -233,6 +233,7 @@ impl Scenario {
                 ..SpotExecutionConfig::default()
             },
             max_position: self.config.max_position,
+            out_of_range_action: OutOfRangeAction::default(),
         })
     }
 

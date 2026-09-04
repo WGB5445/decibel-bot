@@ -34,7 +34,7 @@ use ratatui::{
 use rust_decimal::{Decimal, prelude::ToPrimitive};
 use tokio::sync::mpsc;
 
-use crate::cli::settings::{Args, Settings, RangeKind, AllocationKind};
+use crate::cli::settings::{AllocationKind, Args, RangeKind, Settings};
 use crate::engine::optional_subaccount;
 
 /// Cross USDC balance below this threshold is treated as zero for UI warnings and display.
@@ -242,6 +242,7 @@ pub enum Field {
     Market,
     Subaccount,
     PerpMode,
+    OutOfRangeAction,
     RangeKind,
     RangeValue,
     UpperBound,
@@ -255,7 +256,7 @@ pub enum Field {
     ExitAssetPolicy,
     MaxPosition,
 }
-const FIELDS: [Field; 20] = [
+const FIELDS: [Field; 21] = [
     Field::ApiKey,
     Field::AptosPrivateKey,
     Field::Language,
@@ -264,6 +265,7 @@ const FIELDS: [Field; 20] = [
     Field::Market,
     Field::Subaccount,
     Field::PerpMode,
+    Field::OutOfRangeAction,
     Field::RangeKind,
     Field::RangeValue,
     Field::UpperBound,
@@ -291,6 +293,7 @@ impl Field {
                 Self::Market => TKey::FieldMarket,
                 Self::Subaccount => TKey::FieldSubaccount,
                 Self::PerpMode => TKey::FieldPerpMode,
+                Self::OutOfRangeAction => TKey::FieldOutOfRangeAction,
                 Self::RangeKind => TKey::FieldRangeKind,
                 Self::RangeValue => TKey::FieldRangeValue,
                 Self::UpperBound => TKey::FieldUpperBound,
@@ -328,6 +331,7 @@ impl Field {
             // Direction is meaningful only for perpetual grids. Spot grids are always
             // two-sided inventory grids, so hiding this avoids a misleading setting.
             Self::PerpMode => settings.product == Product::Perp,
+            Self::OutOfRangeAction => settings.product == Product::Perp,
             Self::PreviewLeverage => settings.product == Product::Perp,
             Self::MaxPosition => settings.product == Product::Perp,
             Self::UpperBound => settings.range_kind == RangeKind::Bounds,
@@ -650,6 +654,13 @@ impl App {
                 }
             }
             Field::PerpMode => format!("{:?}", self.settings.perp_mode),
+            Field::OutOfRangeAction => match self.settings.out_of_range_action {
+                OutOfRangeAction::Pause => "pause",
+                OutOfRangeAction::CancelOrders => "cancel_orders",
+                OutOfRangeAction::ClosePosition => "close_position",
+                OutOfRangeAction::ClampContinue => "clamp_continue",
+            }
+            .to_owned(),
             Field::RangeKind => self
                 .settings
                 .tr(match self.settings.range_kind {
@@ -763,6 +774,22 @@ impl App {
                     (PerpMode::Long, true) | (PerpMode::Neutral, false) => PerpMode::Short,
                     _ => PerpMode::Neutral,
                 }
+            }
+            Field::OutOfRangeAction => {
+                self.settings.out_of_range_action =
+                    match (self.settings.out_of_range_action, direction >= 0) {
+                        (OutOfRangeAction::Pause, true)
+                        | (OutOfRangeAction::ClosePosition, false) => {
+                            OutOfRangeAction::CancelOrders
+                        }
+                        (OutOfRangeAction::CancelOrders, true)
+                        | (OutOfRangeAction::ClampContinue, false) => {
+                            OutOfRangeAction::ClosePosition
+                        }
+                        (OutOfRangeAction::ClosePosition, true)
+                        | (OutOfRangeAction::Pause, false) => OutOfRangeAction::ClampContinue,
+                        _ => OutOfRangeAction::Pause,
+                    };
             }
             Field::RangeKind => {
                 self.settings.range_kind = match (self.settings.range_kind, direction >= 0) {
@@ -2489,7 +2516,10 @@ fn field_explanation(app: &App, field: Field) -> String {
             "Choose a market from the Markets tab. Its tick size, lot size, and minimum order size determine the final grid."
         }
         Field::PerpMode => {
-            "Neutral: bids and asks. Long: bids only. Short: asks only. This setting is hidden for Spot."
+            "All Perp modes place bilateral grids. The mode changes the target-position formula."
+        }
+        Field::OutOfRangeAction => {
+            "Unified Perp action outside the range. Pause is the safe default; clamp_continue must be selected explicitly."
         }
         Field::RangeKind => {
             "Choose how prices are generated: midpoint ± percent, percent per step, or fixed lower/upper prices."
@@ -2553,7 +2583,8 @@ fn field_explanation(app: &App, field: Field) -> String {
         Field::Network => "实验使用 testnet，真实行情使用 mainnet。切换后会重新加载市场。",
         Field::Product => "Spot 使用现货库存并始终显示双边；Perp 才有中性、做多、做空模式。",
         Field::Market => "请在 Markets 页选择市场。Tick、Lot 和最小下单量决定最终网格。",
-        Field::PerpMode => "Neutral 双边；Long 仅买单；Short 仅卖单。Spot 不显示此项。",
+        Field::PerpMode => "所有 Perp 模式均挂双边网格；模式仅改变目标仓位公式。",
+        Field::OutOfRangeAction => "Perp 越界统一动作。默认 pause；clamp_continue 必须显式选择。",
         Field::RangeKind => "选择价格生成方式：中间价上下百分比、每格百分比、固定上下界。",
         Field::RangeValue => match app.settings.range_kind {
             RangeKind::Percent => "例：10 表示当前中间价的 [90%, 110%]，不是美元价格。",

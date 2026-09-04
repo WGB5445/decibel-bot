@@ -303,6 +303,36 @@ pub async fn run_cli(
             } else {
                 None
             };
+            let target_position = if is_perp {
+                snapshot.plan.target_position.map(|value| value.to_string())
+            } else {
+                None
+            };
+            let planning_price = if is_perp {
+                snapshot.plan.planning_price.map(|value| value.to_string())
+            } else {
+                None
+            };
+            let worst_long = if is_perp {
+                snapshot.plan.worst_long.map(|value| value.to_string())
+            } else {
+                None
+            };
+            let worst_short = if is_perp {
+                snapshot.plan.worst_short.map(|value| value.to_string())
+            } else {
+                None
+            };
+            let perp_blocked = if is_perp {
+                snapshot.plan.perp_blocked_reason.clone()
+            } else {
+                None
+            };
+            let out_of_range_action = if is_perp {
+                snapshot.plan.out_of_range_action_applied.clone()
+            } else {
+                None
+            };
             let available_margin = if is_perp {
                 snapshot
                     .account
@@ -328,6 +358,13 @@ pub async fn run_cli(
                     status.perp_mode = perp_mode.clone();
                     status.max_position = max_position.clone();
                     status.position = position.clone();
+                    status.target_position = target_position.clone();
+                    status.planning_price = planning_price.clone();
+                    status.worst_long = worst_long.clone();
+                    status.worst_short = worst_short.clone();
+                    status.perp_blocked_reason = perp_blocked.clone();
+                    status.out_of_range_action = out_of_range_action.clone();
+                    status.paused_by_out_of_range = is_perp && snapshot.plan.paused_by_out_of_range;
                     status.available_margin = available_margin.clone();
                     status.estimated_margin = estimated_margin.clone();
                     if let Some((base_symbol, base_balance, quote_symbol, quote_balance)) = funds {
@@ -395,6 +432,65 @@ pub async fn run_cli(
                 },
             )?;
             snapshot.plan = offline.plan;
+            if snapshot.market.product == Product::Perp {
+                snapshot.plan =
+                    decibel_grid_tui::strategy::perp::runtime::prepare_perp_executable_plan(
+                        &config,
+                        snapshot.plan.clone(),
+                        snapshot.account.position.size,
+                        snapshot.account.available_margin,
+                    )?;
+                if execute {
+                    decibel_grid_tui::strategy::perp::runtime::handle_perp_out_of_range(
+                        &config,
+                        &snapshot.plan,
+                        &settings.network,
+                        &settings.aptos_private_key,
+                        &settings.subaccount,
+                        &snapshot.market,
+                        &api,
+                        execute,
+                    )
+                    .await?;
+                }
+            }
+        }
+
+        if snapshot.market.product == Product::Perp
+            && let Some(runtime) = &engine_runtime
+        {
+            let configured_action = match config.out_of_range_action {
+                decibel_grid_tui::OutOfRangeAction::Pause => "pause",
+                decibel_grid_tui::OutOfRangeAction::CancelOrders => "cancel_orders",
+                decibel_grid_tui::OutOfRangeAction::ClosePosition => "close_position",
+                decibel_grid_tui::OutOfRangeAction::ClampContinue => "clamp_continue",
+            };
+            let blocked = decibel_grid_tui::strategy::perp::runtime::perp_submission_blocked(
+                &config,
+                &snapshot.plan,
+                snapshot.account.position.size,
+                snapshot.account.available_margin,
+                snapshot.market.lot_size,
+            );
+            runtime
+                .update_status(|status| {
+                    status.planning_price =
+                        snapshot.plan.planning_price.map(|value| value.to_string());
+                    status.position = Some(snapshot.account.position.size.to_string());
+                    status.target_position =
+                        snapshot.plan.target_position.map(|value| value.to_string());
+                    status.convergence_delta = snapshot
+                        .plan
+                        .convergence_delta
+                        .map(|value| value.to_string());
+                    status.worst_long = snapshot.plan.worst_long.map(|value| value.to_string());
+                    status.worst_short = snapshot.plan.worst_short.map(|value| value.to_string());
+                    status.perp_blocked_reason =
+                        snapshot.plan.perp_blocked_reason.clone().or(blocked);
+                    status.out_of_range_action = Some(configured_action.to_owned());
+                    status.paused_by_out_of_range = snapshot.plan.paused_by_out_of_range;
+                })
+                .await;
         }
 
         // Read the resting orders BEFORE funding or fitting a Spot plan. The executable Spot
@@ -684,7 +780,59 @@ pub async fn run_cli(
 
                 // The Spot plan is pinned for this run. Rebalancing (IOC) already ran earlier in
                 // the cycle when inventory was short, so this is the post-rebalance state.
-                let exec_plan = snapshot.plan.clone();
+                let mut exec_plan = snapshot.plan.clone();
+
+                if snapshot.market.product == Product::Perp
+                    && execute
+                    && !exec_plan.paused_by_out_of_range
+                    && !reconcile_result.missing.is_empty()
+                {
+                    match decibel_grid_tui::strategy::perp::runtime::run_perp_convergence(
+                        &settings.network,
+                        &api,
+                        &settings.aptos_private_key,
+                        &settings.subaccount,
+                        &snapshot.market,
+                        &exec_plan,
+                        &config.spot,
+                    )
+                    .await
+                    {
+                        Ok(convergence) => {
+                            println!(
+                                "  Perp convergence: position {} -> target {} (delta {})",
+                                convergence.current, convergence.target, convergence.delta
+                            );
+                            let account = api
+                                .account(Some(&settings.subaccount), &snapshot.market)
+                                .await?;
+                            exec_plan =
+                                decibel_grid_tui::strategy::perp::runtime::finalize_perp_executable_plan(
+                                    &config,
+                                    exec_plan,
+                                    account.position.size,
+                                    account.available_margin,
+                                )?;
+                            snapshot.account = account;
+                        }
+                        Err(error) => {
+                            let reason = format!("Perp convergence failed: {error:#}");
+                            eprintln!("  {reason}");
+                            if let Some(journal) = &journal {
+                                let event = journal::JournalEvent::RiskRejected {
+                                    at: Utc::now(),
+                                    reason: reason.clone(),
+                                };
+                                journal.append(&event)?;
+                                run_state.apply(&event);
+                                journal.save_state(&run_state)?;
+                            }
+                            check_cancel!();
+                            tokio::time::sleep(config.refresh).await;
+                            continue;
+                        }
+                    }
+                }
 
                 // Spot bulk orders source PFS only. On replacement, the existing bulk escrow is
                 // credited by the Move entry function, so the currently reserved side counts
@@ -789,6 +937,7 @@ pub async fn run_cli(
                                     &exec_plan,
                                     snapshot.account.position.size,
                                     snapshot.account.available_margin,
+                                    snapshot.market.lot_size,
                                 )
                         {
                             decibel_grid_tui::strategy::perp::runtime::record_perp_risk_rejection(

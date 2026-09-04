@@ -3,7 +3,7 @@
 use anyhow::Result;
 use rust_decimal::Decimal;
 
-use crate::strategy::perp::runtime::perp_submission_blocked;
+use crate::strategy::perp::runtime::{perp_submission_blocked, prepare_perp_executable_plan};
 use crate::{
     AccountOverview, GridConfig, GridPlan, Market, Product, RangeBreakoutAction, RangeSpec,
     build_plan, build_plan_with_per_grid_base_size,
@@ -153,13 +153,18 @@ fn run_perp_offline_cycle(input: OfflineCycleInput) -> Result<OfflineCycleOutput
     let config = input.config;
     let market = input.market;
     let mid = input.mid;
+    let position = input.account.position.size;
     let plan = build_plan(&config, &market, mid)?;
+    let plan =
+        prepare_perp_executable_plan(&config, plan, position, input.account.available_margin)?;
     let perp_blocked = perp_submission_blocked(
         &config,
         &plan,
-        input.account.position.size,
+        position,
         input.account.available_margin,
+        market.lot_size,
     );
+    let paused = plan.paused_by_out_of_range;
     Ok(OfflineCycleOutput {
         plan,
         pinned_spot_plan: None,
@@ -168,6 +173,6 @@ fn run_perp_offline_cycle(input: OfflineCycleInput) -> Result<OfflineCycleOutput
         spot_breakout: None,
         spot_stop_loss_triggered: false,
         budget_rejected: None,
-        paused: false,
+        paused,
     })
 }

@@ -338,24 +338,36 @@ cargo run -- check-key
 
 该检查会验证 key 非空、无空白/控制字符且长度合理,然后同时检查当前网络的 REST `/markets` 和官方 WebSocket `all_market_prices` 连接。只有两者都成功才会报告 key 已被 API 接受;无效或无权限的 key 会明确返回 REST HTTP 401/403 或 WebSocket 网关错误,不会打印 key 或响应正文。
 
-## Perp 方向模式
+## Perp 方向模式（语义变更）
 
-Perp 网格通过 `PERP_GRID_MODE`（CLI：`--perp-mode`）选择方向。三种模式对档位分配的影响如下：
+> **重要：** Long / Short 已不再是单边吸筹语义。三种模式都会在固定区间内生成**同一套双边网格**，由 `planning_price` 划分 bid/ask，并由档位计数推导 `target_position`。若你曾用旧版 Long/Short 单边场景做过 `simulate`，请**重新 simulate**，不要沿用旧结果。
 
-| 模式 | 行为 |
+Perp 网格通过 `PERP_GRID_MODE`（CLI：`--perp-mode`）选择方向。三种模式共享同一套区间档位，差异体现在目标仓位公式：
+
+| 模式 | 目标仓位 `target` |
 | --- | --- |
-| `neutral` | 双边网格，按 mid 比例分配 bid/ask |
-| `long` | 仅买单档位 |
-| `short` | 仅卖单档位 |
+| `long` | `ask_levels × grid_size` |
+| `short` | `-bid_levels × grid_size` |
+| `neutral` | `(ask_levels - bid_levels) × grid_size / 2` |
+
+每次提交 bulk 前，引擎会先尝试 IOC 将当前仓位收敛到舍入后的 `target`；收敛失败、未知挂单、或 worst-case 风控不通过时会 **blocked**，本周期不提交 bulk。
+
+### `GRID_OUT_OF_RANGE_ACTION`（默认 `pause`）
+
+当 `planning_price` 落在区间 `[lower, upper]` 之外时：
+
+| 动作 | 行为 |
+| --- | --- |
+| `pause`（默认） | 不挂新 grid，保留仓位与已有 bulk |
+| `cancel_orders` | 撤销 grid，保留仓位 |
+| `close_position` | 撤销 grid 并 IOC 平仓 |
+| `clamp_continue` | 显式开启后，将 `planning_price` 夹到边界并继续规划 |
+
+未配置时**不会**自动 clamp 到边界继续运行。
 
 ### `GRID_MAX_POSITION` 风控
 
-`GRID_MAX_POSITION`（CLI：`--max-position`）设置 Perp 仓位的绝对上限（base 单位）。引擎在每轮执行前检查：
-
-- 当前仓位 `|position|` 是否已超限；
-- 若全部 resting bid/ask 成交后的最坏情况敞口是否会超限。
-
-任一条件触发时，引擎拒绝提交新的 bulk ladder，并在 journal / attach 状态中可见。未设置该值时不启用仓位上限检查。
+`GRID_MAX_POSITION`（CLI：`--max-position`）设置 Perp 仓位的绝对上限（base 单位）。引擎按模式检查 worst-case 不等式（`worst_long` / `worst_short`），并使用 worst-case 仓位估算保证金。仅裁剪 pending 档位，不修改 `target_position`。
 
 ### Perp 必须用 `start` 启动
 
@@ -739,10 +751,9 @@ Monitor 页按刷新间隔持续更新市场、账户、仓位、订单和成交
 | 参数 | Neutral 结果 |
 | ---: | --- |
 | `10` | 5 Bid + 5 Ask |
-| `40` | 20 Bid + 20 Ask |
-| `80` | 策略总计 40 档；单边仍不得超过 30 档 |
+| `40` | 20 Bid + 20 Ask（Perp Long/Short/Neutral 均为双边合计） |
 
-Long Perp 将总数都作为 Bid，Short Perp 将总数都作为 Ask。
+`GRID_TOTAL_COUNT` 为双边合计档位数（最多 40，每侧最多 30）。越界默认 `pause`；`clamp_continue` 须显式配置。
 
 ### 总预算
 

@@ -24,11 +24,11 @@ use tokio_tungstenite::{
 pub mod attach_tui;
 pub mod client;
 pub mod control;
-pub mod process_lock;
 pub mod events;
 pub mod i18n;
 pub mod journal;
 pub mod network;
+pub mod process_lock;
 pub mod profile;
 pub mod reconcile;
 pub mod simulation;
@@ -92,6 +92,22 @@ pub enum ExitAssetPolicy {
 pub enum RangeBreakoutAction {
     PauseAndAlert,
     ExtendGrid,
+}
+
+/// Perp-only action when [`planning_price`](GridPlan::planning_price) leaves the configured grid
+/// range. Default is [`Pause`](Self::Pause); [`ClampContinue`](Self::ClampContinue) must be set
+/// explicitly — the bot never clamps silently.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum, Default)]
+pub enum OutOfRangeAction {
+    #[default]
+    #[value(name = "pause")]
+    Pause,
+    #[value(name = "cancel_orders")]
+    CancelOrders,
+    #[value(name = "close_position")]
+    ClosePosition,
+    #[value(name = "clamp_continue")]
+    ClampContinue,
 }
 
 #[derive(Clone, Debug)]
@@ -180,6 +196,8 @@ pub struct GridConfig {
     /// Perp-only absolute position cap. When set, live execution refuses plans that would breach
     /// current or worst-case exposure after resting bids/asks fill.
     pub max_position: Option<Decimal>,
+    /// Perp-only behaviour when planning price is outside the resolved grid range.
+    pub out_of_range_action: OutOfRangeAction,
 }
 
 impl GridConfig {
@@ -194,14 +212,6 @@ impl GridConfig {
     pub fn validate(&self) -> Result<()> {
         if !(2..=MAX_TOTAL_LEVELS).contains(&self.total_count) {
             bail!("grid count must be between 2 and {MAX_TOTAL_LEVELS}")
-        }
-        if self.product == Product::Perp
-            && self.perp_mode != PerpMode::Neutral
-            && self.total_count > MAX_LEVELS_PER_SIDE
-        {
-            bail!(
-                "directional Perp grids use one side and therefore allow at most {MAX_LEVELS_PER_SIDE} levels"
-            )
         }
         if self.maker_fee_rate.is_sign_negative() || self.maker_fee_rate >= Decimal::ONE {
             bail!("maker fee rate must be >= 0 and < 1")
@@ -453,20 +463,9 @@ pub fn aptos_for_network(network: &str) -> Result<Aptos> {
     network::default_registry().aptos(profile)
 }
 
-/// Returns false when `max_position` is set and current or worst-case exposure would breach it.
-pub fn perp_position_is_safe(
-    position: Decimal,
-    plan: &GridPlan,
-    max_position: Option<Decimal>,
-) -> bool {
-    let Some(max) = max_position else {
-        return true;
-    };
-    let bid_sum: Decimal = plan.bids.iter().map(|level| level.size).sum();
-    let ask_sum: Decimal = plan.asks.iter().map(|level| level.size).sum();
-    let worst_long = position + bid_sum;
-    let worst_short = position - ask_sum;
-    position.abs() < max && worst_long.abs() <= max && worst_short.abs() <= max
+/// Returns false when worst-case exposure or mode direction constraints would be breached.
+pub fn perp_position_is_safe(position: Decimal, plan: &GridPlan, config: &GridConfig) -> bool {
+    strategy::perp::risk::perp_position_is_safe(position, plan, config)
 }
 
 /// Build, sign, submit, and wait for an official Spot or Perp bulk order transaction.
@@ -1484,6 +1483,99 @@ async fn submit_spot_ioc_order(
         .to_owned())
 }
 
+/// Submit a reduce-only or opening Perp IOC via the official dex entry function.
+pub(crate) async fn submit_perp_ioc_order(
+    network: &str,
+    private_key: &str,
+    subaccount: &str,
+    market: &Market,
+    price: Decimal,
+    quantity: Decimal,
+    is_buy: bool,
+    reduce_only: bool,
+) -> Result<String> {
+    const IOC: u8 = 2;
+    const MAX_GAS_OCTAS: u64 = 50_000_000;
+    let key = normalize_private_key(private_key)?;
+    let signer =
+        Ed25519Account::from_private_key_hex(&key).context("invalid Aptos Ed25519 private key")?;
+    let subaccount_addr: AccountAddress =
+        subaccount.parse().context("invalid subaccount address")?;
+    let market_addr: AccountAddress = market.address.parse().context("invalid market address")?;
+    let package = package_for_network(network)?;
+    let aptos = aptos_for_network(network)?;
+    let entry_function = format!("{package}::dex_accounts_entry::place_order_to_subaccount");
+    let payload = InputEntryFunctionData::new(&entry_function)
+        .arg(subaccount_addr)
+        .arg(market_addr)
+        .arg(scale_chain_amount(price, market.px_decimals)?)
+        .arg(scale_chain_amount(quantity, market.sz_decimals)?)
+        .arg(is_buy)
+        .arg(IOC)
+        .arg(reduce_only)
+        .arg_raw(move_none())
+        .arg_raw(move_none())
+        .arg_raw(move_none())
+        .arg_raw(move_none())
+        .arg_raw(move_none())
+        .arg_raw(move_none())
+        .arg_raw(move_none())
+        .arg_raw(move_none())
+        .build()
+        .context("build Perp IOC transaction")?;
+    let sequence_number = aptos.get_sequence_number(signer.address()).await?;
+    let gas_price = aptos
+        .fullnode()
+        .estimate_gas_price()
+        .await?
+        .data
+        .recommended();
+    if gas_price == 0 {
+        bail!("Aptos returned a zero gas unit price")
+    }
+    let max_gas_amount = MAX_GAS_OCTAS / gas_price;
+    if max_gas_amount == 0 {
+        bail!("gas price {gas_price} octas exceeds the 0.5 APT transaction cap")
+    }
+    let raw = TransactionBuilder::new()
+        .sender(signer.address())
+        .sequence_number(sequence_number)
+        .payload(payload)
+        .max_gas_amount(max_gas_amount)
+        .gas_unit_price(gas_price)
+        .chain_id(aptos.ensure_chain_id().await?)
+        .expiration_from_now(600)
+        .build()
+        .context("build Perp IOC transaction with 0.5 APT gas cap")?;
+    let signed = sign_transaction(&raw, &signer)
+        .with_context(|| format!("sign Perp IOC transaction ({entry_function})"))?;
+    let response = aptos
+        .submit_and_wait(&signed, Some(Duration::from_secs(60)))
+        .await
+        .with_context(|| format!("submit Perp IOC transaction ({entry_function})"))?;
+    if !response
+        .data
+        .get("success")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        bail!(
+            "Perp IOC transaction failed: {}",
+            response
+                .data
+                .get("vm_status")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown VM status")
+        )
+    }
+    Ok(response
+        .data
+        .get("hash")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_owned())
+}
+
 /// Cancel a prior funding bid left by this bot for this exact network/subaccount/Spot market.
 /// The store records its submitted price and quantity, then `/open_orders` supplies its on-chain
 /// u128 order ID. A missing row means the order filled or was already cancelled, which is safe.
@@ -1797,7 +1889,7 @@ fn validate_bulk_side(levels: &[&GridLevel], side: Side, market: &Market) -> Res
     Ok(())
 }
 
-fn normalize_private_key(private_key: &str) -> Result<String> {
+pub(crate) fn normalize_private_key(private_key: &str) -> Result<String> {
     let key = private_key.trim();
     if key.is_empty() {
         bail!("Aptos private key is required")
@@ -1824,7 +1916,7 @@ where
         .collect()
 }
 
-fn scale_chain_amount(value: Decimal, decimals: u32) -> Result<u64> {
+pub(crate) fn scale_chain_amount(value: Decimal, decimals: u32) -> Result<u64> {
     if value <= Decimal::ZERO {
         bail!("chain amount must be positive, got {value}")
     }
@@ -1887,6 +1979,53 @@ pub struct GridPlan {
     pub quote_required: Decimal,
     pub base_required: Decimal,
     pub estimated_margin: Option<Decimal>,
+    /// Perp planning reference for this cycle (after any explicit clamp).
+    #[serde(default)]
+    pub planning_price: Option<Decimal>,
+    /// Raw planning input before out-of-range handling.
+    #[serde(default)]
+    pub raw_planning_price: Option<Decimal>,
+    /// Inventory target derived from level counts and rounded grid size.
+    #[serde(default)]
+    pub target_position: Option<Decimal>,
+    #[serde(default)]
+    pub worst_long: Option<Decimal>,
+    #[serde(default)]
+    pub worst_short: Option<Decimal>,
+    #[serde(default)]
+    pub paused_by_out_of_range: bool,
+    #[serde(default)]
+    pub out_of_range_action_applied: Option<String>,
+    /// `target - current` when convergence is pending.
+    #[serde(default)]
+    pub convergence_delta: Option<Decimal>,
+    #[serde(default)]
+    pub perp_blocked_reason: Option<String>,
+}
+
+impl Default for GridPlan {
+    fn default() -> Self {
+        Self {
+            mid: Decimal::ZERO,
+            lower: Decimal::ZERO,
+            upper: Decimal::ZERO,
+            per_grid_base_size: None,
+            bids: Vec::new(),
+            asks: Vec::new(),
+            quote_required: Decimal::ZERO,
+            base_required: Decimal::ZERO,
+            estimated_margin: None,
+            planning_price: None,
+            raw_planning_price: None,
+            target_position: None,
+            worst_long: None,
+            worst_short: None,
+            paused_by_out_of_range: false,
+            out_of_range_action_applied: None,
+            convergence_delta: None,
+            perp_blocked_reason: None,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -2055,6 +2194,7 @@ impl GridPlan {
             quote_required,
             base_required,
             estimated_margin: self.estimated_margin,
+            ..self.clone()
         })
     }
 
@@ -2260,54 +2400,38 @@ pub(crate) fn side_counts(
     mid: Decimal,
 ) -> (usize, usize, Decimal, Decimal) {
     let total = Decimal::from(config.total_count);
-    match (config.product, config.perp_mode) {
-        (Product::Perp, PerpMode::Long) => (
-            config.total_count,
-            0,
-            config.budget_or_zero(),
-            Decimal::ZERO,
-        ),
-        (Product::Perp, PerpMode::Short) => (
-            0,
-            config.total_count,
-            Decimal::ZERO,
-            config.budget_or_zero(),
-        ),
-        _ => {
-            let mid = mid.clamp(lower, upper);
-            let range = upper - lower;
-            if range <= Decimal::ZERO {
-                let half = config.total_count / 2;
-                let budget = config.budget_or_zero();
-                return (
-                    half,
-                    config.total_count - half,
-                    budget / Decimal::TWO,
-                    budget / Decimal::TWO,
-                );
-            }
-            let bid_ratio = (mid - lower) / range;
-            // Preserve the configured combined level count while respecting the venue's 30-level
-            // per-side ceiling. Near a boundary the unconstrained allocation could otherwise put
-            // all forty levels on one side and either exceed the ABI limit or silently drop
-            // levels.
-            let min_bid = config
-                .total_count
-                .saturating_sub(MAX_LEVELS_PER_SIDE)
-                .max(1);
-            let max_bid = MAX_LEVELS_PER_SIDE.min(config.total_count.saturating_sub(1));
-            let bid = (total * bid_ratio)
-                .round_dp(0)
-                .to_u64()
-                .unwrap_or(1)
-                .clamp(min_bid as u64, max_bid as u64) as usize;
-            let ask = config.total_count - bid;
-            let budget = config.budget_or_zero();
-            let bid_budget = budget * bid_ratio;
-            let ask_budget = budget - bid_budget;
-            (bid, ask, bid_budget, ask_budget)
-        }
+    let mid = mid.clamp(lower, upper);
+    let range = upper - lower;
+    if range <= Decimal::ZERO {
+        let half = config.total_count / 2;
+        let budget = config.budget_or_zero();
+        return (
+            half,
+            config.total_count - half,
+            budget / Decimal::TWO,
+            budget / Decimal::TWO,
+        );
     }
+    let bid_ratio = (mid - lower) / range;
+    // Preserve the configured combined level count while respecting the venue's 30-level
+    // per-side ceiling. Near a boundary the unconstrained allocation could otherwise put
+    // all forty levels on one side and either exceed the ABI limit or silently drop
+    // levels.
+    let min_bid = config
+        .total_count
+        .saturating_sub(MAX_LEVELS_PER_SIDE)
+        .max(1);
+    let max_bid = MAX_LEVELS_PER_SIDE.min(config.total_count.saturating_sub(1));
+    let bid = (total * bid_ratio)
+        .round_dp(0)
+        .to_u64()
+        .unwrap_or(1)
+        .clamp(min_bid as u64, max_bid as u64) as usize;
+    let ask = config.total_count - bid;
+    let budget = config.budget_or_zero();
+    let bid_budget = budget * bid_ratio;
+    let ask_budget = budget - bid_budget;
+    (bid, ask, bid_budget, ask_budget)
 }
 
 pub(crate) fn resolve_range(
@@ -3538,6 +3662,7 @@ mod tests {
             price_source: PriceSource::Prices,
             spot: SpotExecutionConfig::default(),
             max_position: None,
+            out_of_range_action: OutOfRangeAction::default(),
         }
     }
 
@@ -3721,6 +3846,7 @@ mod tests {
     fn step_grid_is_compounded() {
         let plan = build_plan(
             &GridConfig {
+                product: Product::Spot,
                 range: RangeSpec::StepPercent { percent: dec!(1) },
                 total_count: 4,
                 allocation: Allocation::FixedSize(dec!(1)),
@@ -3791,6 +3917,7 @@ mod tests {
             quote_required,
             base_required,
             estimated_margin: None,
+            ..Default::default()
         }
     }
 
@@ -4095,6 +4222,7 @@ mod tests {
             quote_required,
             base_required,
             estimated_margin: None,
+            ..Default::default()
         }
     }
 
@@ -4365,6 +4493,7 @@ mod tests {
             quote_required: dec!(1000),
             base_required: dec!(1),
             estimated_margin: None,
+            ..Default::default()
         };
         let market = Market {
             address: "0x1".to_owned(),
@@ -4408,6 +4537,7 @@ mod tests {
             quote_required: dec!(400),
             base_required: dec!(100),
             estimated_margin: None,
+            ..Default::default()
         };
         let market = Market {
             address: "0x1".to_owned(),
@@ -4450,6 +4580,7 @@ mod tests {
             quote_required: dec!(500),
             base_required: dec!(1),
             estimated_margin: None,
+            ..Default::default()
         };
         let market = Market {
             address: "0x1".to_owned(),
@@ -4493,6 +4624,7 @@ mod tests {
             quote_required: dec!(99.995),
             base_required: dec!(0.011),
             estimated_margin: None,
+            ..Default::default()
         };
         let market = Market {
             address: "0x1".to_owned(),
@@ -4536,6 +4668,7 @@ mod tests {
             quote_required: dec!(99.995),
             base_required: dec!(2),
             estimated_margin: None,
+            ..Default::default()
         };
         let market = Market {
             address: "0x1".to_owned(),
@@ -4577,6 +4710,7 @@ mod tests {
             quote_required: dec!(500),
             base_required: dec!(1),
             estimated_margin: None,
+            ..Default::default()
         };
         let market = Market {
             address: "0x1".to_owned(),
@@ -4734,6 +4868,7 @@ mod tests {
             quote_required: dec!(99),
             base_required: dec!(2),
             estimated_margin: None,
+            ..Default::default()
         };
         let resized = plan
             .resize_asks_to_available_base(dec!(1), &market)
@@ -4744,55 +4879,45 @@ mod tests {
     }
 
     #[test]
-    fn perp_long_places_bids_only() {
-        let plan = build_plan(
-            &GridConfig {
-                perp_mode: PerpMode::Long,
-                total_count: 10,
-                ..config()
+    fn perp_long_places_bilateral_grid_with_target() {
+        let cfg = GridConfig {
+            perp_mode: PerpMode::Long,
+            total_count: 4,
+            allocation: Allocation::FixedSize(dec!(0.01)),
+            range: RangeSpec::Bounds {
+                lower: dec!(90),
+                upper: dec!(110),
             },
-            &market(),
-            dec!(100),
-        )
-        .unwrap();
-        assert_eq!(plan.bids.len(), 10);
-        assert!(plan.asks.is_empty());
-        assert!(plan.bids.iter().all(|level| level.size > Decimal::ZERO));
+            ..config()
+        };
+        let plan = build_plan(&cfg, &market(), dec!(100)).unwrap();
+        assert!(!plan.bids.is_empty());
+        assert!(!plan.asks.is_empty());
+        assert_eq!(plan.bids.len() + plan.asks.len(), 4);
+        assert_eq!(plan.target_position, Some(dec!(0.02)));
     }
 
     #[test]
-    fn perp_short_places_asks_only() {
-        let plan = build_plan(
-            &GridConfig {
-                perp_mode: PerpMode::Short,
-                total_count: 10,
-                ..config()
+    fn perp_short_target_is_negative_bid_inventory() {
+        let cfg = GridConfig {
+            perp_mode: PerpMode::Short,
+            total_count: 4,
+            allocation: Allocation::FixedSize(dec!(0.01)),
+            range: RangeSpec::Bounds {
+                lower: dec!(90),
+                upper: dec!(110),
             },
-            &market(),
-            dec!(100),
-        )
-        .unwrap();
-        assert_eq!(plan.asks.len(), 10);
-        assert!(plan.bids.is_empty());
-        assert!(plan.asks.iter().all(|level| level.size > Decimal::ZERO));
+            ..config()
+        };
+        let plan = build_plan(&cfg, &market(), dec!(100)).unwrap();
+        assert_eq!(plan.target_position, Some(dec!(-0.02)));
     }
 
     #[test]
-    fn perp_neutral_splits_by_mid_ratio() {
+    fn perp_neutral_uniform_split_at_midpoint() {
         let lower = dec!(1);
         let upper = dec!(100);
-        let mid = dec!(25);
-        let (bid, ask, _, _) = side_counts(
-            &GridConfig {
-                perp_mode: PerpMode::Neutral,
-                total_count: 40,
-                ..config()
-            },
-            lower,
-            upper,
-            mid,
-        );
-        assert_eq!((bid, ask), (10, 30));
+        let mid = dec!(50);
         let plan = build_plan(
             &GridConfig {
                 perp_mode: PerpMode::Neutral,
@@ -4804,45 +4929,68 @@ mod tests {
             mid,
         )
         .unwrap();
-        assert_eq!(plan.bids.len(), 10);
-        assert_eq!(plan.asks.len(), 30);
+        assert_eq!(plan.bids.len(), 20);
+        assert_eq!(plan.asks.len(), 20);
+        assert_eq!(plan.target_position, Some(Decimal::ZERO));
     }
 
     #[test]
-    fn perp_directional_rejects_over_30_levels() {
+    fn perp_rejects_more_than_forty_total_levels() {
         let err = GridConfig {
-            perp_mode: PerpMode::Long,
-            total_count: 31,
+            total_count: 41,
             ..config()
         }
         .validate()
         .unwrap_err();
-        assert!(err.to_string().contains("30"));
+        assert!(err.to_string().contains("40"));
     }
 
     #[test]
-    fn perp_position_is_safe_respects_worst_case_exposure() {
-        let plan = build_plan(
-            &GridConfig {
-                perp_mode: PerpMode::Long,
-                total_count: 4,
-                allocation: Allocation::FixedSize(dec!(1)),
-                ..config()
+    fn perp_position_is_safe_respects_mode_constraints_at_target() {
+        let cfg = GridConfig {
+            perp_mode: PerpMode::Long,
+            total_count: 4,
+            allocation: Allocation::FixedSize(dec!(1)),
+            max_position: Some(dec!(4)),
+            range: RangeSpec::Bounds {
+                lower: dec!(90),
+                upper: dec!(110),
             },
-            &market(),
-            dec!(100),
-        )
-        .unwrap();
-        let max = dec!(2);
-        let bid_sum: Decimal = plan.bids.iter().map(|level| level.size).sum();
-        assert!(bid_sum > max);
-        assert!(!perp_position_is_safe(dec!(2), &plan, Some(max)));
-        assert!(!perp_position_is_safe(
-            Decimal::ZERO,
-            &plan,
-            Some(bid_sum - dec!(0.01))
-        ));
-        assert!(perp_position_is_safe(Decimal::ZERO, &plan, Some(bid_sum)));
+            ..config()
+        };
+        let plan = build_plan(&cfg, &market(), dec!(100)).unwrap();
+        let target = plan.target_position.unwrap();
+        assert!(perp_position_is_safe(target, &plan, &cfg));
+        assert!(!perp_position_is_safe(Decimal::ZERO, &plan, &cfg));
+    }
+
+    #[test]
+    fn shared_perp_contract_table() {
+        let cases = [
+            (PerpMode::Long, dec!(100), dec!(0.02)),
+            (PerpMode::Short, dec!(100), dec!(-0.02)),
+            (PerpMode::Neutral, dec!(100), Decimal::ZERO),
+        ];
+        for (mode, mid, expected_target) in cases {
+            let plan = build_plan(
+                &GridConfig {
+                    perp_mode: mode,
+                    total_count: 4,
+                    allocation: Allocation::FixedSize(dec!(0.01)),
+                    range: RangeSpec::Bounds {
+                        lower: dec!(90),
+                        upper: dec!(110),
+                    },
+                    ..config()
+                },
+                &market(),
+                mid,
+            )
+            .unwrap();
+            assert_eq!(plan.bids.len(), 2);
+            assert_eq!(plan.asks.len(), 2);
+            assert_eq!(plan.target_position, Some(expected_target));
+        }
     }
 
     #[test]
@@ -4860,6 +5008,7 @@ mod tests {
             price_source: PriceSource::Prices,
             spot: SpotExecutionConfig::default(),
             max_position: None,
+            out_of_range_action: OutOfRangeAction::default(),
         };
         let market = Market {
             address: "0xspot".to_owned(),

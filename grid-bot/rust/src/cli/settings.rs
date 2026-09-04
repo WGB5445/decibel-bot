@@ -248,6 +248,14 @@ pub struct Args {
         default_value_t = 5
     )]
     max_consecutive_bulk_failures: usize,
+    #[arg(
+        long,
+        global = true,
+        env = "GRID_OUT_OF_RANGE_ACTION",
+        value_enum,
+        default_value = "pause"
+    )]
+    out_of_range_action: OutOfRangeAction,
     /// Perp-only absolute position cap.
     #[arg(long, global = true, env = "GRID_MAX_POSITION")]
     pub(crate) max_position: Option<String>,
@@ -309,6 +317,7 @@ pub struct Settings {
     pub(crate) price_buffer_bps: String,
     pub(crate) max_consecutive_bulk_failures: usize,
     pub(crate) max_position: Option<String>,
+    pub(crate) out_of_range_action: OutOfRangeAction,
 }
 
 impl From<&Args> for Settings {
@@ -369,10 +378,10 @@ impl From<&Args> for Settings {
             price_buffer_bps: args.price_buffer_bps.clone(),
             max_consecutive_bulk_failures: args.max_consecutive_bulk_failures,
             max_position: args.max_position.clone(),
+            out_of_range_action: args.out_of_range_action,
         }
     }
 }
-
 
 fn masked_secret(secret: &str, show_suffix: bool) -> String {
     if secret.is_empty() {
@@ -428,10 +437,13 @@ impl Settings {
             price_buffer_bps: "5".to_owned(),
             max_consecutive_bulk_failures: 5,
             max_position: None,
+            out_of_range_action: OutOfRangeAction::default(),
         }
     }
 
-    pub(crate) fn network_profile(&self) -> Result<&'static decibel_grid_tui::network::NetworkProfile> {
+    pub(crate) fn network_profile(
+        &self,
+    ) -> Result<&'static decibel_grid_tui::network::NetworkProfile> {
         decibel_grid_tui::network::default_registry().resolve(&self.network)
     }
 
@@ -448,6 +460,13 @@ impl Settings {
             market: self.market.clone(),
             subaccount: self.subaccount.clone(),
             perp_mode: format!("{:?}", self.perp_mode).to_lowercase(),
+            out_of_range_action: match self.out_of_range_action {
+                OutOfRangeAction::Pause => "pause",
+                OutOfRangeAction::CancelOrders => "cancel_orders",
+                OutOfRangeAction::ClosePosition => "close_position",
+                OutOfRangeAction::ClampContinue => "clamp_continue",
+            }
+            .to_owned(),
             range_kind: match self.range_kind {
                 RangeKind::Percent => "percent",
                 RangeKind::Step => "step",
@@ -553,6 +572,13 @@ impl Settings {
             "neutral" => self.perp_mode = PerpMode::Neutral,
             _ => {}
         }
+        match data.out_of_range_action.as_str() {
+            "pause" => self.out_of_range_action = OutOfRangeAction::Pause,
+            "cancel_orders" => self.out_of_range_action = OutOfRangeAction::CancelOrders,
+            "close_position" => self.out_of_range_action = OutOfRangeAction::ClosePosition,
+            "clamp_continue" => self.out_of_range_action = OutOfRangeAction::ClampContinue,
+            _ => {}
+        }
         match data.range_kind.as_str() {
             "percent" => self.range_kind = RangeKind::Percent,
             "step" => self.range_kind = RangeKind::Step,
@@ -647,6 +673,7 @@ impl Settings {
                 max_consecutive_bulk_failures: self.max_consecutive_bulk_failures,
             },
             max_position: self.max_position.as_deref().map(decimal).transpose()?,
+            out_of_range_action: self.out_of_range_action,
         })
     }
     pub(crate) fn api_client(&self) -> Result<DecibelClient> {
@@ -702,4 +729,30 @@ pub(crate) fn has_complete_grid_config(args: &Args) -> bool {
     ) || (args.product == Product::Spot
         && (args.total_quote_budget.is_some() || args.total_base_budget.is_some()));
     range && allocation
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn profile_round_trips_perp_out_of_range_action() {
+        let mut settings = Settings::defaults();
+        settings.out_of_range_action = OutOfRangeAction::ClosePosition;
+        let profile = settings.to_profile();
+        assert_eq!(profile.out_of_range_action, "close_position");
+
+        let mut restored = Settings::defaults();
+        restored.apply_profile(&profile);
+        assert_eq!(
+            restored.out_of_range_action,
+            OutOfRangeAction::ClosePosition
+        );
+    }
+
+    #[test]
+    fn legacy_profile_defaults_out_of_range_action_to_pause() {
+        let profile: ProfileData = serde_json::from_str("{}").unwrap();
+        assert_eq!(profile.out_of_range_action, "pause");
+    }
 }

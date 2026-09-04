@@ -14,9 +14,8 @@ use decibel_grid_tui::*;
 use rust_decimal::{Decimal, prelude::ToPrimitive};
 
 use crate::cli::settings::Settings;
-use crate::tui::USDC_CROSS_DUST;
 use crate::engine::{optional_subaccount, print_snapshot, run_cli};
-
+use crate::tui::USDC_CROSS_DUST;
 
 /// Send this process's stdout and stderr to `path`, replacing any previous contents.
 ///
@@ -226,10 +225,7 @@ pub async fn start_cli(settings: Settings, confirm_mainnet: Option<&str>) -> Res
     }
     // Preflight and hold the startup lock until the child engine responds. This serializes
     // concurrent `start` invocations without blocking the engine's long-lived run lock.
-    let _startup_lock = SubaccountStartupLock::acquire(
-        &settings.network,
-        &settings.subaccount,
-    )?;
+    let _startup_lock = SubaccountStartupLock::acquire(&settings.network, &settings.subaccount)?;
     let executable = std::env::current_exe().context("resolve grid-bot executable")?;
     let mut args = std::env::args_os().skip(1).collect::<Vec<_>>();
     let Some(index) = args.iter().position(|arg| arg == "start") else {
@@ -511,7 +507,7 @@ pub async fn doctor_cli(settings: Settings) -> Result<()> {
             println!("  position: {}", position);
             if let Some(max) = config.max_position {
                 println!("  max_position: {}", max);
-                if !perp_position_is_safe(position, &snapshot.plan, Some(max)) {
+                if !perp_position_is_safe(position, &snapshot.plan, &config) {
                     anyhow::bail!(
                         "Perp position {position} or worst-case exposure exceeds max_position {max}"
                     )

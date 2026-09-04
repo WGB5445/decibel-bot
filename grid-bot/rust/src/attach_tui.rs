@@ -602,22 +602,56 @@ fn short_account(account: &str) -> String {
 fn perp_summary_text(status: &EngineStatus) -> Option<String> {
     let mode = status.perp_mode.as_deref()?;
     let position = status.position.as_deref().unwrap_or("-");
+    let target = status.target_position.as_deref().unwrap_or("-");
+    let delta = status.convergence_delta.as_deref().unwrap_or("-");
+    let planning = status.planning_price.as_deref().unwrap_or("-");
     let max_position = status.max_position.as_deref().unwrap_or("-");
     let available = status.available_margin.as_deref().unwrap_or("-");
     let estimated = status.estimated_margin.as_deref().unwrap_or("-");
-    Some(format!(
-        "Perp: {}  pos={}  max={}  margin={}/{} USDC",
+    let worst_long = status.worst_long.as_deref().unwrap_or("-");
+    let worst_short = status.worst_short.as_deref().unwrap_or("-");
+    let mut summary = format!(
+        "Perp: {}  plan={}  pos={}  target={}  ioc_delta={}  worst=({},{})  max={}  margin={}/{} USDC",
         mode.to_ascii_uppercase(),
+        planning,
         position,
+        target,
+        delta,
+        worst_long,
+        worst_short,
         max_position,
         available,
         estimated,
-    ))
+    );
+    if status.paused_by_out_of_range {
+        summary.push_str("  PAUSED(out-of-range)");
+    }
+    if let Some(action) = &status.out_of_range_action {
+        summary.push_str(&format!("  oor={action}"));
+    }
+    if let Some(reason) = &status.perp_blocked_reason {
+        summary.push_str(&format!("  blocked={reason}"));
+    }
+    Some(summary)
 }
 
 fn perp_summary_line(status: &EngineStatus) -> Option<Line<'static>> {
     let mode = status.perp_mode.as_deref()?;
     let position = status.position.as_deref().unwrap_or("-").to_owned();
+    let target = status.target_position.as_deref().unwrap_or("-").to_owned();
+    let delta = status
+        .convergence_delta
+        .as_deref()
+        .unwrap_or("-")
+        .to_owned();
+    let planning = status.planning_price.as_deref().unwrap_or("-").to_owned();
+    let worst_long = status.worst_long.as_deref().unwrap_or("-").to_owned();
+    let worst_short = status.worst_short.as_deref().unwrap_or("-").to_owned();
+    let action = status
+        .out_of_range_action
+        .as_deref()
+        .unwrap_or("-")
+        .to_owned();
     let max_position = status.max_position.as_deref().unwrap_or("-").to_owned();
     let available = status.available_margin.as_deref().unwrap_or("-").to_owned();
     let estimated = status.estimated_margin.as_deref().unwrap_or("-").to_owned();
@@ -625,12 +659,28 @@ fn perp_summary_line(status: &EngineStatus) -> Option<Line<'static>> {
         Span::styled("Perp: ", Style::default().fg(Color::DarkGray)),
         Span::styled(
             format!(
-                "{}  pos={}  max={}  margin={}/{} USDC",
+                "{} plan={} pos/target={}/{} Δ={} worst={}/{} max={} margin={}/{} oor={}{}{}",
                 mode.to_ascii_uppercase(),
+                planning,
                 position,
+                target,
+                delta,
+                worst_long,
+                worst_short,
                 max_position,
                 available,
                 estimated,
+                action,
+                if status.paused_by_out_of_range {
+                    " PAUSED"
+                } else {
+                    ""
+                },
+                status
+                    .perp_blocked_reason
+                    .as_deref()
+                    .map(|reason| format!(" blocked={reason}"))
+                    .unwrap_or_default(),
             ),
             Style::default()
                 .fg(Color::Cyan)

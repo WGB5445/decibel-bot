@@ -101,6 +101,14 @@ pub struct EngineStatus {
     pub position: Option<String>,
     pub available_margin: Option<String>,
     pub estimated_margin: Option<String>,
+    pub planning_price: Option<String>,
+    pub target_position: Option<String>,
+    pub convergence_delta: Option<String>,
+    pub worst_long: Option<String>,
+    pub worst_short: Option<String>,
+    pub perp_blocked_reason: Option<String>,
+    pub out_of_range_action: Option<String>,
+    pub paused_by_out_of_range: bool,
     pub ladder: Vec<LadderLevel>,
     pub events: Vec<EngineEvent>,
 }
@@ -787,6 +795,7 @@ mod tests {
             quote_required: dec!(49.5),
             base_required: dec!(0.25),
             estimated_margin: None,
+            ..Default::default()
         };
 
         let ladder = ladder_from_plan(&plan);
