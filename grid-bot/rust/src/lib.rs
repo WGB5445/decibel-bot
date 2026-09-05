@@ -691,7 +691,7 @@ pub async fn exit_sell_assets(
     }
     let max_gas_amount = 50_000_000u64 / gas_price;
     let chain_id = aptos.ensure_chain_id().await?;
-    let mut sequence = aptos.get_sequence_number(signer.address()).await?;
+    let sequence = aptos.get_sequence_number(signer.address()).await?;
     let mut hashes = Vec::new();
 
     println!(
@@ -725,7 +725,6 @@ pub async fn exit_sell_assets(
         "submit exit bulk cancellation transaction",
     )
     .await?;
-    sequence = sequence.saturating_add(1);
     if response
         .get("success")
         .and_then(Value::as_bool)
@@ -773,10 +772,6 @@ pub async fn exit_sell_assets(
             "  settle poll {attempt}/{EXIT_SETTLE_POLL_ATTEMPTS}: {observed} -> {settled} released"
         );
     }
-    let book = client
-        .order_book(market, 1)
-        .await
-        .context("refresh order book for exit cleanup")?;
     match market.product {
         Product::Spot => {
             let Some(funds) = account.spot_funds else {
@@ -817,6 +812,10 @@ pub async fn exit_sell_assets(
             } else {
                 // Compatibility path for the interactive TUI, which does not yet have a live
                 // fee-rate fetch. CLI execution always supplies the guarded policy above.
+                let book = client
+                    .order_book(market, 1)
+                    .await
+                    .context("refresh order book for Spot exit cleanup")?;
                 let reference = book
                     .bids
                     .first()
@@ -844,74 +843,19 @@ pub async fn exit_sell_assets(
             if position == Decimal::ZERO {
                 println!("Exit cleanup: Perp position is already flat; nothing to close.");
             } else {
-                let reference = if position.is_sign_negative() {
-                    book.asks.first()
-                } else {
-                    book.bids.first()
-                }
-                .ok_or_else(|| anyhow!("cannot close Perp: executable book side is empty"))?;
-                let price = if position.is_sign_negative() {
-                    round_up(reference.price * Decimal::new(1003, 3), market.tick_size)
-                } else {
-                    round_down(reference.price * Decimal::new(997, 3), market.tick_size)
-                };
-                let entry = format!("{package}::dex_accounts_entry::place_order_to_subaccount");
-                let payload = InputEntryFunctionData::new(&entry)
-                    .arg(subaccount_addr)
-                    .arg(market_addr)
-                    .arg(scale_chain_amount(price, market.px_decimals)?)
-                    .arg(scale_chain_amount(position.abs(), market.sz_decimals)?)
-                    .arg(position.is_sign_negative())
-                    .arg(2u8)
-                    .arg(true)
-                    .arg_raw(move_none())
-                    .arg_raw(move_none())
-                    .arg_raw(move_none())
-                    .arg_raw(move_none())
-                    .arg_raw(move_none())
-                    .arg_raw(move_none())
-                    .arg_raw(move_none())
-                    .arg_raw(move_none())
-                    .build()
-                    .context("build reduce-only Perp exit transaction")?;
-                let raw = TransactionBuilder::new()
-                    .sender(signer.address())
-                    .sequence_number(sequence)
-                    .payload(payload)
-                    .max_gas_amount(max_gas_amount)
-                    .gas_unit_price(gas_price)
-                    .chain_id(chain_id)
-                    .expiration_from_now(aptos_tx::expiration_seconds(gas_station))
-                    .build()?;
-                let response = aptos_tx::submit_raw_and_wait(
-                    &aptos,
-                    raw,
-                    &signer,
+                let hash = submit_perp_market_order(
+                    network,
+                    private_key,
+                    subaccount,
+                    market,
+                    position.abs(),
+                    position.is_sign_negative(),
+                    true,
                     gas_station,
-                    "submit reduce-only Perp exit transaction",
                 )
                 .await?;
-                if response
-                    .get("success")
-                    .and_then(Value::as_bool)
-                    .unwrap_or(false)
-                {
-                    hashes.push(
-                        response
-                            .get("hash")
-                            .and_then(Value::as_str)
-                            .unwrap_or_default()
-                            .to_owned(),
-                    );
-                } else {
-                    bail!(
-                        "Perp exit transaction failed: {}",
-                        response
-                            .get("vm_status")
-                            .and_then(Value::as_str)
-                            .unwrap_or("unknown status")
-                    );
-                }
+                println!("Exit cleanup: Perp market close submitted in tx {hash}");
+                hashes.push(hash);
             }
         }
     }
@@ -1499,19 +1443,22 @@ async fn submit_spot_ioc_order(
         .to_owned())
 }
 
-/// Submit a reduce-only or opening Perp IOC via the official dex entry function.
-pub(crate) async fn submit_perp_ioc_order(
+/// Submit a reduce-only or opening Perp market order via the official dex entry function.
+///
+/// The market-order entry has no price or time-in-force argument. Those belong
+/// to `place_order_to_subaccount`, which is the limit-order ABI and rejects a
+/// zero price. The following eight `Option` arguments are all `none`, so this
+/// is neither a stop order nor a TP/SL order.
+pub(crate) async fn submit_perp_market_order(
     network: &str,
     private_key: &str,
     subaccount: &str,
     market: &Market,
-    price: Decimal,
     quantity: Decimal,
     is_buy: bool,
     reduce_only: bool,
     gas_station: Option<&GasStationConfig>,
 ) -> Result<String> {
-    const IOC: u8 = 2;
     const MAX_GAS_OCTAS: u64 = 50_000_000;
     let key = normalize_private_key(private_key)?;
     let signer =
@@ -1521,15 +1468,14 @@ pub(crate) async fn submit_perp_ioc_order(
     let market_addr: AccountAddress = market.address.parse().context("invalid market address")?;
     let package = package_for_network(network)?;
     let aptos = aptos_for_network(network)?;
-    let entry_function = format!("{package}::dex_accounts_entry::place_order_to_subaccount");
+    let entry_function = format!("{package}::dex_accounts_entry::place_market_order_to_subaccount");
     let payload = InputEntryFunctionData::new(&entry_function)
         .arg(subaccount_addr)
         .arg(market_addr)
-        .arg(scale_chain_amount(price, market.px_decimals)?)
         .arg(scale_chain_amount(quantity, market.sz_decimals)?)
         .arg(is_buy)
-        .arg(IOC)
         .arg(reduce_only)
+        // All optional trigger fields (stop, TP, SL, and remaining ABI slots) are None.
         .arg_raw(move_none())
         .arg_raw(move_none())
         .arg_raw(move_none())
@@ -1539,7 +1485,7 @@ pub(crate) async fn submit_perp_ioc_order(
         .arg_raw(move_none())
         .arg_raw(move_none())
         .build()
-        .context("build Perp IOC transaction")?;
+        .context("build Perp market-order transaction")?;
     let sequence_number = aptos.get_sequence_number(signer.address()).await?;
     let gas_price = aptos
         .fullnode()
@@ -1563,13 +1509,13 @@ pub(crate) async fn submit_perp_ioc_order(
         .chain_id(aptos.ensure_chain_id().await?)
         .expiration_from_now(aptos_tx::expiration_seconds(gas_station))
         .build()
-        .context("build Perp IOC transaction with 0.5 APT gas cap")?;
+        .context("build Perp market-order transaction with 0.5 APT gas cap")?;
     let response = aptos_tx::submit_raw_and_wait(
         &aptos,
         raw,
         &signer,
         gas_station,
-        &format!("submit Perp IOC transaction ({entry_function})"),
+        &format!("submit Perp market-order transaction ({entry_function})"),
     )
     .await?;
     if !response
@@ -1578,7 +1524,7 @@ pub(crate) async fn submit_perp_ioc_order(
         .unwrap_or(false)
     {
         bail!(
-            "Perp IOC transaction failed: {}",
+            "Perp market-order transaction failed: {}",
             response
                 .get("vm_status")
                 .and_then(Value::as_str)

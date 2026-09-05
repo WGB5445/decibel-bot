@@ -70,6 +70,52 @@ pub fn ladder_from_plan(plan: &crate::GridPlan) -> Vec<LadderLevel> {
         .collect()
 }
 
+/// Build rows from the latest exchange reconciliation. Matched desired levels are
+/// resting on the venue; missing levels remain planned. Unmanaged orders are
+/// appended so attach never hides orders that block a replacement.
+pub fn ladder_from_reconciliation(
+    desired: &[crate::reconcile::DesiredOrder],
+    reconciliation: &crate::reconcile::Reconciliation,
+) -> Vec<LadderLevel> {
+    let mut ladder = desired
+        .iter()
+        .map(|wanted| LadderLevel {
+            side: format!("{:?}", wanted.side),
+            price: wanted.price.to_string(),
+            size: wanted.size.to_string(),
+            state: if reconciliation
+                .matched
+                .iter()
+                .any(|matched| matched.desired == *wanted)
+            {
+                "Resting".to_owned()
+            } else {
+                "Planned".to_owned()
+            },
+        })
+        .collect::<Vec<_>>();
+    ladder.extend(reconciliation.unmanaged.iter().map(|order| LadderLevel {
+        side: format!("{:?}", order.side),
+        price: order.price.to_string(),
+        size: order.remaining_size.to_string(),
+        state: "Unmanaged".to_owned(),
+    }));
+    ladder
+}
+
+/// A successful bulk transaction atomically replaces the complete ladder, so
+/// every submitted level is already resting even before the indexer catches up.
+pub fn ladder_from_submitted_plan(plan: &crate::GridPlan) -> Vec<LadderLevel> {
+    plan.all_levels()
+        .map(|level| LadderLevel {
+            side: format!("{:?}", level.side),
+            price: level.price.to_string(),
+            size: level.size.to_string(),
+            state: "Resting".to_owned(),
+        })
+        .collect()
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct EngineEvent {
     pub at: DateTime<Utc>,
@@ -810,5 +856,51 @@ mod tests {
         assert_eq!(ladder[1].price, "101");
         assert_eq!(ladder[1].size, "0.25");
         assert_eq!(ladder[1].state, "Selected");
+    }
+
+    #[test]
+    fn reconciliation_ladder_marks_resting_missing_and_unmanaged_levels() {
+        use crate::{
+            Side,
+            reconcile::{ActualOrder, DesiredOrder, MatchedOrder, OrderOrigin, Reconciliation},
+        };
+        use rust_decimal_macros::dec;
+
+        let bid = DesiredOrder {
+            side: Side::Bid,
+            price: dec!(99),
+            size: dec!(1),
+        };
+        let ask = DesiredOrder {
+            side: Side::Ask,
+            price: dec!(101),
+            size: dec!(1),
+        };
+        let reconciliation = Reconciliation {
+            matched: vec![MatchedOrder {
+                desired: bid.clone(),
+                actual: ActualOrder {
+                    order_id: "bulk:1:Bid:0".to_owned(),
+                    side: Side::Bid,
+                    price: dec!(99),
+                    remaining_size: dec!(1),
+                    origin: OrderOrigin::Bulk,
+                },
+            }],
+            missing: vec![ask.clone()],
+            unmanaged: vec![ActualOrder {
+                order_id: "manual".to_owned(),
+                side: Side::Ask,
+                price: dec!(102),
+                remaining_size: dec!(2),
+                origin: OrderOrigin::Standalone,
+            }],
+        };
+
+        let ladder = ladder_from_reconciliation(&[bid, ask], &reconciliation);
+        assert_eq!(ladder.len(), 3);
+        assert_eq!(ladder[0].state, "Resting");
+        assert_eq!(ladder[1].state, "Planned");
+        assert_eq!(ladder[2].state, "Unmanaged");
     }
 }

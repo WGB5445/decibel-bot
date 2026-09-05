@@ -37,13 +37,16 @@ pub(crate) fn perp_theoretical_limits(
     }
     let total = bid_levels + ask_levels;
     match config.perp_mode {
-        PerpMode::Long => (Decimal::from(ask_levels) * grid_size, Decimal::ZERO),
-        PerpMode::Short => (Decimal::ZERO, Decimal::from(bid_levels) * grid_size),
-        // Neutral has no directional bias: both sides can grow to whichever is larger,
-        // limited by max_position if explicitly set.
+        // Long and short converge to a directional starting position, then their
+        // same-direction orders can all fill. Neutral starts at its midpoint.
+        // Every mode therefore has a maximum absolute endpoint of half the
+        // total grid quantity on each side, except directional modes where the
+        // opposite endpoint is zero.
+        PerpMode::Long => (Decimal::from(total) * grid_size, Decimal::ZERO),
+        PerpMode::Short => (Decimal::ZERO, Decimal::from(total) * grid_size),
         PerpMode::Neutral => {
-            let max_side = bid_levels.max(ask_levels);
-            (Decimal::from(max_side) * grid_size, Decimal::from(max_side) * grid_size)
+            let max_side = Decimal::from(total) * grid_size / Decimal::TWO;
+            (max_side, max_side)
         }
     }
 }
@@ -86,18 +89,23 @@ fn mode_constraints_hold(
 pub(crate) fn perp_estimated_margin(
     config: &GridConfig,
     planning_price: Decimal,
+    position: Decimal,
     worst_long: Decimal,
     worst_short: Decimal,
     plan: &GridPlan,
 ) -> Decimal {
-    let margin_position = worst_long.abs().max(worst_short.abs());
+    // `cross_available_to_trade` is free collateral: the exchange has already
+    // reserved margin for `position`. Only charge the ladder for the additional
+    // margin needed to reach its worst-case endpoint.
+    let worst_case_position = worst_long.abs().max(worst_short.abs());
+    let additional_position = (worst_case_position - position.abs()).max(Decimal::ZERO);
     let pending_notional: Decimal = plan
         .bids
         .iter()
         .chain(plan.asks.iter())
         .map(|level| level.notional)
         .sum();
-    margin_position * planning_price / config.preview_leverage
+    additional_position * planning_price / config.preview_leverage
         + pending_notional * config.maker_fee_rate
 }
 
@@ -254,5 +262,42 @@ mod tests {
         assert!(!plan.bids.is_empty());
         assert_eq!(plan.asks.len(), 2);
         assert!(perp_position_is_safe(dec!(-0.01), &plan, &short_config()));
+    }
+
+    #[test]
+    fn margin_check_excludes_margin_already_locked_for_position() {
+        let plan = GridPlan {
+            bids: vec![level(Side::Bid, dec!(100), dec!(1)); 2],
+            asks: vec![level(Side::Ask, dec!(100), dec!(1)); 1],
+            ..GridPlan::default()
+        };
+        let config = short_config();
+
+        // A one-unit short is already funded by the exchange. Filling both bids
+        // moves it to a one-unit long, so only one additional unit needs margin.
+        assert_eq!(
+            perp_estimated_margin(&config, dec!(100), dec!(-1), dec!(1), dec!(-2), &plan),
+            dec!(100.03)
+        );
+    }
+
+    #[test]
+    fn long_target_and_bid_ladder_are_safe_together() {
+        let plan = GridPlan {
+            bids: vec![level(Side::Bid, dec!(100), dec!(1)); 2],
+            asks: vec![level(Side::Ask, dec!(100), dec!(1)); 1],
+            target_position: Some(dec!(1)),
+            per_grid_base_size: Some(dec!(1)),
+            ..GridPlan::default()
+        };
+        let config = GridConfig {
+            perp_mode: PerpMode::Long,
+            max_position: None,
+            ..short_config()
+        };
+
+        // The initial one-unit long covers the ask. Both bids may subsequently
+        // fill, taking the position to the three-unit grid maximum.
+        assert!(perp_position_is_safe(dec!(1), &plan, &config));
     }
 }

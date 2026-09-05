@@ -7,7 +7,10 @@
 use crate::{
     client::{ClientCommand, EngineClient},
     control::{EngineStatus, ExitMode, LadderLevel},
-    monitor_log::{LogPanelState, MIN_LOG_WIDTH, MIN_MAIN_WIDTH, render_log_panel, split_layout},
+    monitor_log::{
+        LogPanelState, MIN_LOG_WIDTH, MIN_MAIN_WIDTH, fold_log_line, render_log_panel,
+        split_layout,
+    },
 };
 use anyhow::{Context, Result};
 use crossterm::{
@@ -114,7 +117,9 @@ impl TerminalGuard {
             app.log_panel
                 .update_scroll_bounds(term_height.saturating_sub(10) as usize, log_width);
         }
-        let viewport_height = term_height.saturating_sub(10) as usize;
+        // The main paragraph is inside a bordered panel. Its usable height also
+        // depends on whether the Perp header contributes a fourth header line.
+        let viewport_height = main_viewport_height(term_height, app.status.perp_mode.is_some());
         let recent_log_errors = if split_visible {
             app.log_panel.recent_error_lines(12)
         } else {
@@ -123,7 +128,7 @@ impl TerminalGuard {
         let content = snapshot_lines(
             &app.status,
             !split_visible,
-            main_width,
+            main_width.saturating_sub(2),
             &recent_log_errors,
         );
         let max_scroll = content.len().saturating_sub(viewport_height.max(1));
@@ -374,6 +379,20 @@ async fn handle_event(
                 };
                 EventOutcome::Redraw
             }
+            KeyCode::Char('m') if !app.confirm_liquidate => {
+                app.notice = match copy_monitor_to_clipboard(&app.status) {
+                    Ok(()) => "Copied the monitor pane to the clipboard.".to_owned(),
+                    Err(error) => format!("Could not copy monitor pane: {error:#}"),
+                };
+                EventOutcome::Redraw
+            }
+            KeyCode::Char('l') if !app.confirm_liquidate => {
+                app.notice = match copy_log_to_clipboard(&app.log_panel) {
+                    Ok(()) => "Copied the log pane to the clipboard.".to_owned(),
+                    Err(error) => format!("Could not copy log pane: {error:#}"),
+                };
+                EventOutcome::Redraw
+            }
             KeyCode::Char('[') if log_split_visible && !app.confirm_liquidate => {
                 app.log_panel.scroll_up(1);
                 EventOutcome::Redraw
@@ -426,6 +445,14 @@ fn page_step(term_height: u16) -> usize {
     (term_height.saturating_sub(10) as usize).max(1)
 }
 
+fn main_viewport_height(term_height: u16, is_perp: bool) -> usize {
+    let header_height = if is_perp { 6 } else { 5 };
+    // Header + footer + main-panel borders.
+    term_height
+        .saturating_sub(header_height + 3 + 2)
+        .max(1) as usize
+}
+
 fn snapshot_lines(
     status: &EngineStatus,
     include_events: bool,
@@ -439,12 +466,14 @@ fn snapshot_lines(
     let quote_balance = status.pfs_quote_balance.as_deref().unwrap_or("-");
 
     if let Some(summary) = perp_summary_text(status) {
-        lines.push(Line::styled(
-            summary,
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        ));
+        for row in fold_log_line(&summary, main_width as usize) {
+            lines.push(Line::styled(
+                row,
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ));
+        }
     }
 
     lines.push(Line::from(vec![
@@ -484,13 +513,11 @@ fn snapshot_lines(
         )),
     ]));
     if let Some(error) = &status.last_error {
-        lines.push(Line::from(vec![
-            Span::styled(
-                "Last engine error: ",
-                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(error.clone(), Style::default().fg(Color::Red)),
-        ]));
+        lines.push(Line::styled(
+            "Last engine error:",
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+        ));
+        append_wrapped_error(&mut lines, error, main_width as usize);
     } else if !recent_log_errors.is_empty() {
         lines.push(Line::styled(
             "ENGINE LOG ERRORS (latest)",
@@ -499,8 +526,15 @@ fn snapshot_lines(
                 .add_modifier(Modifier::BOLD),
         ));
         for error in recent_log_errors {
-            lines.push(Line::styled(error.clone(), Style::default().fg(Color::Red)));
+            append_wrapped_error(&mut lines, error, main_width as usize);
         }
+    }
+    if let Some(reason) = &status.perp_blocked_reason {
+        lines.push(Line::styled(
+            "Perp blocked:",
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+        ));
+        append_wrapped_error(&mut lines, reason, main_width as usize);
     }
 
     lines.push(Line::raw(""));
@@ -565,18 +599,31 @@ fn snapshot_lines(
             ));
         } else {
             for event in status.events.iter().rev().take(MAX_RENDERED_EVENTS) {
-                lines.push(Line::from(vec![
-                    Span::styled(
-                        event.at.format("%H:%M:%S").to_string(),
-                        Style::default().fg(Color::DarkGray),
-                    ),
-                    Span::raw("  "),
-                    Span::raw(event.message.clone()),
-                ]));
+                let event_rows = fold_log_line(&event.message, (main_width as usize).saturating_sub(10));
+                for (index, row) in event_rows.into_iter().enumerate() {
+                    let prefix = if index == 0 {
+                        event.at.format("%H:%M:%S").to_string()
+                    } else {
+                        "        ".to_owned()
+                    };
+                    lines.push(Line::from(vec![
+                        Span::styled(prefix, Style::default().fg(Color::DarkGray)),
+                        Span::raw("  "),
+                        Span::raw(row),
+                    ]));
+                }
             }
         }
     }
     lines
+}
+
+fn append_wrapped_error(lines: &mut Vec<Line<'static>>, error: &str, width: usize) {
+    for source_line in error.lines() {
+        for row in fold_log_line(source_line, width.max(1)) {
+            lines.push(Line::styled(row, Style::default().fg(Color::Red)));
+        }
+    }
 }
 
 fn ordered_levels(levels: &[LadderLevel]) -> Vec<&LadderLevel> {
@@ -675,7 +722,11 @@ fn ladder_line(level: &LadderLevel, columns: LadderColumns) -> Line<'static> {
         .fg(Color::White)
         .add_modifier(Modifier::BOLD);
     let state = display_state(&level.state);
-    let state_style = if state == "Cancelled" {
+    let state_style = if state == "Active" {
+        Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)
+    } else if state == "Planned" {
+        Style::default().fg(Color::Yellow)
+    } else if state == "Unmanaged" || state == "Cancelled" {
         Style::default().fg(Color::Yellow)
     } else if state == "Failed" || state == "Rejected" {
         Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)
@@ -716,7 +767,7 @@ fn ladder_line(level: &LadderLevel, columns: LadderColumns) -> Line<'static> {
 }
 
 fn display_state(state: &str) -> &str {
-    if state.eq_ignore_ascii_case("placed") {
+    if state.eq_ignore_ascii_case("placed") || state.eq_ignore_ascii_case("resting") {
         "Active"
     } else if state.eq_ignore_ascii_case("planned") {
         "Planned"
@@ -754,35 +805,19 @@ fn perp_summary_text(status: &EngineStatus) -> Option<String> {
     let position = status.position.as_deref().unwrap_or("-");
     let target = status.target_position.as_deref().unwrap_or("-");
     let delta = status.convergence_delta.as_deref().unwrap_or("-");
-    let planning = status.planning_price.as_deref().unwrap_or("-");
     let max_position = status.max_position.as_deref().unwrap_or("-");
     let available = status.available_margin.as_deref().unwrap_or("-");
     let estimated = status.estimated_margin.as_deref().unwrap_or("-");
-    let worst_long = status.worst_long.as_deref().unwrap_or("-");
-    let worst_short = status.worst_short.as_deref().unwrap_or("-");
-    let mut summary = format!(
-        "Perp: {}  plan={}  pos={}  target={}  ioc_delta={}  worst=({},{})  max={}  margin={}/{} USDC",
+    Some(format!(
+        "Perp: {}  pos={}  target={}  Δ={}  max={}  margin={}/{} USDC",
         mode.to_ascii_uppercase(),
-        planning,
         position,
         target,
         delta,
-        worst_long,
-        worst_short,
         max_position,
         available,
         estimated,
-    );
-    if status.paused_by_out_of_range {
-        summary.push_str("  PAUSED(out-of-range)");
-    }
-    if let Some(action) = &status.out_of_range_action {
-        summary.push_str(&format!("  oor={action}"));
-    }
-    if let Some(reason) = &status.perp_blocked_reason {
-        summary.push_str(&format!("  blocked={reason}"));
-    }
-    Some(summary)
+    ))
 }
 
 fn perp_summary_line(status: &EngineStatus) -> Option<Line<'static>> {
@@ -794,30 +829,22 @@ fn perp_summary_line(status: &EngineStatus) -> Option<Line<'static>> {
         .as_deref()
         .unwrap_or("-")
         .to_owned();
-    let planning = status.planning_price.as_deref().unwrap_or("-").to_owned();
-    let worst_long = status.worst_long.as_deref().unwrap_or("-").to_owned();
-    let worst_short = status.worst_short.as_deref().unwrap_or("-").to_owned();
     let action = status
         .out_of_range_action
         .as_deref()
         .unwrap_or("-")
         .to_owned();
-    let max_position = status.max_position.as_deref().unwrap_or("-").to_owned();
     let available = status.available_margin.as_deref().unwrap_or("-").to_owned();
     let estimated = status.estimated_margin.as_deref().unwrap_or("-").to_owned();
     Some(Line::from(vec![
         Span::styled("Perp: ", Style::default().fg(Color::DarkGray)),
         Span::styled(
             format!(
-                "{} plan={} pos/target={}/{} Δ={} worst={}/{} max={} margin={}/{} oor={}{}{}",
+                "{} pos/target={}/{} Δ={} margin={}/{} oor={}{}{}",
                 mode.to_ascii_uppercase(),
-                planning,
                 position,
                 target,
                 delta,
-                worst_long,
-                worst_short,
-                max_position,
                 available,
                 estimated,
                 action,
@@ -829,7 +856,7 @@ fn perp_summary_line(status: &EngineStatus) -> Option<Line<'static>> {
                 status
                     .perp_blocked_reason
                     .as_deref()
-                    .map(|reason| format!(" blocked={reason}"))
+                    .map(|_| " blocked".to_owned())
                     .unwrap_or_default(),
             ),
             Style::default()
@@ -866,10 +893,6 @@ fn snapshot_plain_text(status: &EngineStatus, include_events: bool, main_width: 
 }
 
 fn copy_snapshot_to_clipboard(status: &EngineStatus, log_panel: &LogPanelState) -> Result<()> {
-    let mut child = Command::new("pbcopy")
-        .stdin(Stdio::piped())
-        .spawn()
-        .context("start macOS clipboard command (pbcopy)")?;
     let mut text = snapshot_plain_text(status, true, u16::MAX);
     let recent_logs = log_panel.recent_lines(200);
     if !recent_logs.is_empty() {
@@ -878,6 +901,26 @@ fn copy_snapshot_to_clipboard(status: &EngineStatus, log_panel: &LogPanelState) 
         text.push('\n');
         text.push_str(&recent_logs.join("\n"));
     }
+    copy_text_to_clipboard(&text)
+}
+
+fn copy_monitor_to_clipboard(status: &EngineStatus) -> Result<()> {
+    copy_text_to_clipboard(&snapshot_plain_text(status, true, u16::MAX))
+}
+
+fn copy_log_to_clipboard(log_panel: &LogPanelState) -> Result<()> {
+    let lines = log_panel.recent_lines(200);
+    if lines.is_empty() {
+        anyhow::bail!("the engine log pane has no lines to copy")
+    }
+    copy_text_to_clipboard(&lines.join("\n"))
+}
+
+fn copy_text_to_clipboard(text: &str) -> Result<()> {
+    let mut child = Command::new("pbcopy")
+        .stdin(Stdio::piped())
+        .spawn()
+        .context("start macOS clipboard command (pbcopy)")?;
     child
         .stdin
         .as_mut()
@@ -1057,7 +1100,7 @@ fn render(
         ""
     };
     let controls = format!(
-        "Lines {start}-{end} / {} ({scroll_mode})  |  Up/Down scroll  PgUp/PgDn page  Home/End bounds  c copy  s liquidate  q/Esc/Ctrl+C quit{log_controls}",
+        "Lines {start}-{end} / {} ({scroll_mode})  |  Up/Down scroll  PgUp/PgDn page  Home/End bounds  c all  m monitor  l log  s liquidate  q/Esc/Ctrl+C quit{log_controls}",
         content.len(),
     );
     let notice_style = if app.connected {
@@ -1219,6 +1262,35 @@ mod tests {
         assert!(wide.size >= 6);
         assert_eq!(wide.side, 4);
         assert_eq!(wide.status, 8);
+    }
+
+    #[test]
+    fn resting_ladder_levels_display_as_active() {
+        assert_eq!(display_state("Resting"), "Active");
+        assert_eq!(display_state("planned"), "Planned");
+    }
+
+    #[test]
+    fn long_error_is_expanded_into_scrollable_snapshot_rows() {
+        let error = "simulation failed because the market-order transaction was rejected by the gas station";
+        let status = EngineStatus {
+            last_error: Some(error.to_owned()),
+            ..EngineStatus::default()
+        };
+
+        let lines = snapshot_lines(&status, false, 72, &[]);
+        let header = lines
+            .iter()
+            .position(|line| line.to_string() == "Last engine error:")
+            .expect("error header");
+        assert!(lines.len() > header + 2);
+        assert!(lines[header + 1].to_string().starts_with("simulation failed"));
+    }
+
+    #[test]
+    fn perp_main_viewport_accounts_for_header_and_borders() {
+        assert_eq!(main_viewport_height(24, false), 14);
+        assert_eq!(main_viewport_height(24, true), 13);
     }
 
     #[test]

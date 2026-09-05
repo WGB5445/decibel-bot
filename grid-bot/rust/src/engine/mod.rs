@@ -696,7 +696,10 @@ pub async fn run_cli(
         if let Some(adjustment) = fit_spot_snapshot_to_pfs(&mut snapshot)? {
             println!("Spot funding check: {adjustment}");
         }
-        if let Some(runtime) = &engine_runtime {
+        // A live attach view must retain the last exchange-confirmed ladder until
+        // this cycle's reconciliation replaces it below. Replacing it here with
+        // the freshly generated plan would make resting orders flicker as Planned.
+        if !execute && let Some(runtime) = &engine_runtime {
             let ladder = decibel_grid_tui::control::ladder_from_plan(&snapshot.plan);
             runtime
                 .update_status(|status| {
@@ -748,11 +751,16 @@ pub async fn run_cli(
                 let matched = reconcile_result.matched.len();
                 let missing = reconcile_result.missing.len();
                 let unmanaged = reconcile_result.unmanaged.len();
+                let ladder = decibel_grid_tui::control::ladder_from_reconciliation(
+                    &desired,
+                    &reconcile_result,
+                );
                 runtime
                     .update_status(|status| {
                         status.matched = Some(matched);
                         status.missing = Some(missing);
                         status.unmanaged = Some(unmanaged);
+                        status.ladder = ladder;
                         status.events.push(decibel_grid_tui::control::EngineEvent {
                             at: Utc::now(),
                             message: format!("reconcile: {matched} matched, {missing} missing, {unmanaged} unmanaged"),
@@ -1001,6 +1009,16 @@ pub async fn run_cli(
                                         execution.ask_count,
                                         execution.transaction_hash
                                     );
+                                    if let Some(runtime) = &engine_runtime {
+                                        let ladder = decibel_grid_tui::control::ladder_from_submitted_plan(
+                                            &exec_plan,
+                                        );
+                                        runtime
+                                            .update_status(|status| {
+                                                status.ladder = ladder;
+                                            })
+                                            .await;
+                                    }
                                     if let Some(journal) = &journal {
                                         let event = journal::JournalEvent::BulkOrderSubmitted {
                                             at: Utc::now(),

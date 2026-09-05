@@ -115,6 +115,7 @@ pub(crate) fn refresh_perp_plan_metrics(
     plan.estimated_margin = Some(perp_estimated_margin(
         config,
         planning,
+        position,
         worst_long,
         worst_short,
         plan,
@@ -208,8 +209,10 @@ pub(crate) fn uniform_range_prices(
     append_uniform_prices(&mut prices, lower, upper, count, tick);
     prices.sort();
     prices.dedup();
-    if prices.is_empty() {
-        bail!("grid range is too narrow for market tick size")
+    if prices.len() != count {
+        bail!(
+            "grid range is too narrow for {count} distinct price points at market tick size {tick}"
+        )
     }
     Ok(prices)
 }
@@ -226,7 +229,9 @@ pub(crate) fn split_uniform_levels(
     let mut asks = Vec::new();
     for price in prices {
         if close_to_tick(price, planning_price, tick) {
-            continue;
+            bail!(
+                "grid point {price} coincides with planning price {planning_price}; cannot place a post-only bid or ask at the mid"
+            )
         }
         if price < planning_price {
             if !asks.contains(&price) {
@@ -253,8 +258,7 @@ fn derive_perp_grid_size(
         Allocation::FixedSize(value) => value,
         Allocation::TotalBudget(budget) => {
             let total_levels = bid_prices.len() + ask_prices.len();
-            let worst_side_count = bid_prices.len().max(ask_prices.len());
-            if worst_side_count == 0 || total_levels == 0 {
+            if total_levels == 0 {
                 bail!("cannot derive perp grid size from an empty level set")
             }
             // representative price — first ask, last bid, or tick minimum
@@ -263,10 +267,12 @@ fn derive_perp_grid_size(
                 .or_else(|| bid_prices.last())
                 .copied()
                 .unwrap_or(market.tick_size);
-            // budget = (worst_side_count × size × price / leverage)
-            //        + (total_levels × size × price × maker_fee_rate)
+            // budget covers the maximum position after ALL levels fill on both sides
+            // plus the pending notional for fees:
+            //   budget = total_levels × size × price / leverage
+            //          + total_levels × size × price × maker_fee_rate
             // Solve for size:
-            let denominator = Decimal::from(worst_side_count) * representative_price
+            let denominator = Decimal::from(total_levels) * representative_price
                 / config.preview_leverage
                 + Decimal::from(total_levels) * representative_price
                     * config.maker_fee_rate;
@@ -305,8 +311,14 @@ fn append_uniform_prices(
     tick: Decimal,
 ) {
     let span = upper - lower;
-    let denom = Decimal::from(count + 1);
-    for i in 1..=count {
+    if count == 1 {
+        prices.push(round_down(lower + span / Decimal::TWO, tick));
+        return;
+    }
+    // `count` is the requested number of price points, not the number of
+    // intervals. Include both configured bounds, so 40 levels have 39 gaps.
+    let denom = Decimal::from(count - 1);
+    for i in 0..count {
         let raw = lower + span * Decimal::from(i) / denom;
         prices.push(round_down(raw, tick));
     }
@@ -363,6 +375,29 @@ mod tests {
         assert!(!plan.bids.is_empty());
         assert!(!plan.asks.is_empty());
         assert_eq!(plan.target_position, Some(dec!(0.02)));
+    }
+
+    #[test]
+    fn fixed_count_grid_includes_both_configured_bounds() {
+        let prices = uniform_range_prices(dec!(70000), dec!(85000), 40, dec!(1)).unwrap();
+
+        assert_eq!(prices.len(), 40);
+        assert_eq!(prices.first(), Some(&dec!(70000)));
+        assert_eq!(prices.last(), Some(&dec!(85000)));
+    }
+
+    #[test]
+    fn fixed_count_split_keeps_both_bounds_as_orders() {
+        let config = config(PerpMode::Long, 40);
+        let (bids, asks) =
+            split_uniform_levels(&config, dec!(70000), dec!(85000), dec!(77500), dec!(1))
+                .unwrap();
+        let mut prices = bids.into_iter().chain(asks).collect::<Vec<_>>();
+        prices.sort();
+
+        assert_eq!(prices.len(), 40);
+        assert_eq!(prices.first(), Some(&dec!(70000)));
+        assert_eq!(prices.last(), Some(&dec!(85000)));
     }
 
     #[test]

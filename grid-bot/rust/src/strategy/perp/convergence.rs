@@ -1,11 +1,11 @@
-//! Perp position convergence via bounded IOC before bulk replacement.
+//! Perp position convergence via market orders before bulk replacement.
 
 use anyhow::{Result, anyhow, bail};
 use rust_decimal::Decimal;
 
 use crate::{
-    DecibelClient, GasStationConfig, GridPlan, Market, OrderBook, SpotExecutionConfig, round_down,
-    round_up, submit_perp_ioc_order,
+    DecibelClient, GasStationConfig, GridPlan, Market, SpotExecutionConfig, round_down,
+    submit_perp_market_order,
 };
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -51,7 +51,6 @@ pub async fn execute_perp_convergence_ioc(
         return Ok(state);
     }
 
-    let book = client.order_book(market, 50).await?;
     let mut attempts = 0usize;
     while attempts < guard.entry_exit_max_attempts {
         let position = client
@@ -67,17 +66,16 @@ pub async fn execute_perp_convergence_ioc(
         let side_buy = state.delta.is_sign_positive();
         let reduce_only =
             (position > Decimal::ZERO && !side_buy) || (position < Decimal::ZERO && side_buy);
-        let attempt = plan_perp_ioc_attempt(&book, side_buy, remaining, market, guard)?;
-        let Some(attempt) = attempt else {
-            bail!("perp convergence IOC has no executable liquidity within slippage cap")
-        };
-        submit_perp_ioc_order(
+        let size = round_down(remaining, market.lot_size);
+        if size < market.min_size {
+            bail!("perp convergence IOC has no executable size (remaining={remaining} rounds below min_size={})", market.min_size)
+        }
+        submit_perp_market_order(
             network,
             private_key,
             subaccount,
             market,
-            attempt.limit_price,
-            attempt.size,
+            size,
             side_buy,
             reduce_only,
             gas_station,
@@ -108,51 +106,6 @@ pub async fn execute_perp_convergence_ioc(
     } else {
         bail!("perp position {final_position} did not converge to target {target} within tolerance")
     }
-}
-
-#[derive(Clone, Debug)]
-struct PerpIocAttempt {
-    size: Decimal,
-    limit_price: Decimal,
-}
-
-fn plan_perp_ioc_attempt(
-    book: &OrderBook,
-    buy: bool,
-    remaining: Decimal,
-    market: &Market,
-    guard: &SpotExecutionConfig,
-) -> Result<Option<PerpIocAttempt>> {
-    let reference = if buy {
-        book.asks.first()
-    } else {
-        book.bids.first()
-    };
-    let Some(reference) = reference else {
-        return Ok(None);
-    };
-    let bps = Decimal::from(10_000);
-    let cap = if buy {
-        reference.price * (Decimal::ONE + guard.entry_max_slippage_bps / bps)
-    } else {
-        reference.price * (Decimal::ONE - guard.entry_max_slippage_bps / bps)
-    };
-    let limit_price = if buy {
-        round_up(
-            cap.min(reference.price * Decimal::new(1003, 3)),
-            market.tick_size,
-        )
-    } else {
-        round_down(
-            cap.max(reference.price * Decimal::new(997, 3)),
-            market.tick_size,
-        )
-    };
-    let size = round_down(remaining, market.lot_size);
-    if size < market.min_size {
-        return Ok(None);
-    }
-    Ok(Some(PerpIocAttempt { size, limit_price }))
 }
 
 pub fn convergence_blocked_reason(
