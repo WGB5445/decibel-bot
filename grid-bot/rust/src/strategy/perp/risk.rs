@@ -35,13 +35,16 @@ pub(crate) fn perp_theoretical_limits(
     if let Some(max) = config.max_position {
         return (max, max);
     }
+    let total = bid_levels + ask_levels;
     match config.perp_mode {
         PerpMode::Long => (Decimal::from(ask_levels) * grid_size, Decimal::ZERO),
         PerpMode::Short => (Decimal::ZERO, Decimal::from(bid_levels) * grid_size),
-        PerpMode::Neutral => (
-            Decimal::from(ask_levels) * grid_size,
-            Decimal::from(bid_levels) * grid_size,
-        ),
+        // Neutral has no directional bias: both sides can grow to whichever is larger,
+        // limited by max_position if explicitly set.
+        PerpMode::Neutral => {
+            let max_side = bid_levels.max(ask_levels);
+            (Decimal::from(max_side) * grid_size, Decimal::from(max_side) * grid_size)
+        }
     }
 }
 

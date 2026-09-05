@@ -941,6 +941,7 @@ pub async fn run_cli(
                     } else {
                         let desired_level_count = exec_plan.bids.len() + exec_plan.asks.len();
                         let structural_change = new_trade_observed
+                            || !reconcile_result.missing.is_empty()
                             || last_submitted_level_count
                                 .is_none_or(|previous| previous != desired_level_count);
                         let cooldown_active = last_bulk_replacement_at.is_some_and(|submitted| {

@@ -252,14 +252,28 @@ fn derive_perp_grid_size(
     let size = match config.allocation {
         Allocation::FixedSize(value) => value,
         Allocation::TotalBudget(budget) => {
-            let bid_notional: Decimal = bid_prices.iter().copied().sum();
-            let ask_notional: Decimal = ask_prices.iter().copied().sum();
-            let per_base = bid_notional.max(ask_notional) / config.preview_leverage
-                + (bid_notional + ask_notional) * config.maker_fee_rate;
-            if per_base <= Decimal::ZERO {
+            let total_levels = bid_prices.len() + ask_prices.len();
+            let worst_side_count = bid_prices.len().max(ask_prices.len());
+            if worst_side_count == 0 || total_levels == 0 {
                 bail!("cannot derive perp grid size from an empty level set")
             }
-            budget / per_base
+            // representative price — first ask, last bid, or tick minimum
+            let representative_price = ask_prices
+                .first()
+                .or_else(|| bid_prices.last())
+                .copied()
+                .unwrap_or(market.tick_size);
+            // budget = (worst_side_count × size × price / leverage)
+            //        + (total_levels × size × price × maker_fee_rate)
+            // Solve for size:
+            let denominator = Decimal::from(worst_side_count) * representative_price
+                / config.preview_leverage
+                + Decimal::from(total_levels) * representative_price
+                    * config.maker_fee_rate;
+            if denominator <= Decimal::ZERO {
+                bail!("cannot derive perp grid size: denominator is zero")
+            }
+            budget / denominator
         }
     };
     let rounded = round_down(size, market.lot_size);
