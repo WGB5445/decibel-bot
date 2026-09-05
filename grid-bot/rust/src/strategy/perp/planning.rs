@@ -6,7 +6,7 @@ use rust_decimal::Decimal;
 use super::risk::{compute_perp_target, perp_estimated_margin, perp_worst_case};
 use crate::{
     Allocation, GridConfig, GridLevel, GridPlan, LevelState, MAX_LEVELS_PER_SIDE, Market,
-    OutOfRangeAction, PerpMode, Product, RangeSpec, Result, Side, resolve_range, round_down,
+    OutOfRangeAction, Product, Result, Side, resolve_range, round_down,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -301,7 +301,7 @@ fn append_uniform_prices(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{GridConfig, SpotExecutionConfig};
+    use crate::{GridConfig, PerpMode, RangeSpec, SpotExecutionConfig};
     use rust_decimal_macros::dec;
     use std::time::Duration;
 

@@ -65,6 +65,8 @@ pub async fn execute_perp_convergence_ioc(
         }
         let remaining = state.delta.abs();
         let side_buy = state.delta.is_sign_positive();
+        let reduce_only =
+            (position > Decimal::ZERO && !side_buy) || (position < Decimal::ZERO && side_buy);
         let attempt = plan_perp_ioc_attempt(&book, side_buy, remaining, market, guard)?;
         let Some(attempt) = attempt else {
             bail!("perp convergence IOC has no executable liquidity within slippage cap")
@@ -77,7 +79,7 @@ pub async fn execute_perp_convergence_ioc(
             attempt.limit_price,
             attempt.size,
             side_buy,
-            false,
+            reduce_only,
             gas_station,
         )
         .await?;

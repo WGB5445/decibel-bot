@@ -5,7 +5,7 @@ use chrono::Utc;
 use rust_decimal::Decimal;
 
 use super::{
-    convergence::{convergence_blocked_reason, perp_convergence_plan},
+    convergence::convergence_blocked_reason,
     planning::refresh_perp_plan_metrics,
     risk::{apply_perp_risk_trim, perp_margin_is_safe, perp_position_is_safe},
 };
@@ -127,8 +127,13 @@ pub async fn handle_perp_out_of_range(
     client: &DecibelClient,
     execute: bool,
     gas_station: Option<&GasStationConfig>,
+    out_of_range_handled: &mut bool,
 ) -> Result<()> {
     if plan.out_of_range_action_applied.is_none() {
+        *out_of_range_handled = false;
+        return Ok(());
+    }
+    if *out_of_range_handled {
         return Ok(());
     }
     let action = config.out_of_range_action;
@@ -147,6 +152,7 @@ pub async fn handle_perp_out_of_range(
             )
             .await?;
             println!("Perp out-of-range cancelled ladder in tx {hash}");
+            *out_of_range_handled = true;
         }
         crate::OutOfRangeAction::ClosePosition => {
             let hash = spot_lifecycle::cancel_bulk_ladder(
@@ -175,6 +181,7 @@ pub async fn handle_perp_out_of_range(
                 )
                 .await?;
             }
+            *out_of_range_handled = true;
         }
         crate::OutOfRangeAction::ClampContinue => {}
     }
@@ -185,16 +192,10 @@ fn guard_from_config(config: &GridConfig) -> SpotExecutionConfig {
     config.spot.clone()
 }
 
-pub async fn record_perp_risk_rejection(
+pub fn record_perp_risk_rejection(
     reason: String,
-    network: &str,
-    aptos_private_key: &str,
-    subaccount: &str,
-    market: &Market,
     journal: Option<&journal::Journal>,
     run_state: &mut journal::RunState,
-    execute: bool,
-    gas_station: Option<&GasStationConfig>,
 ) -> Result<()> {
     eprintln!("RISK REJECTED: {reason}");
     if let Some(journal) = journal {
@@ -205,20 +206,6 @@ pub async fn record_perp_risk_rejection(
         journal.append(&event)?;
         run_state.apply(&event);
         journal.save_state(run_state)?;
-    }
-    if execute {
-        match spot_lifecycle::cancel_bulk_ladder(
-            network,
-            aptos_private_key,
-            subaccount,
-            market,
-            gas_station,
-        )
-        .await
-        {
-            Ok(hash) => println!("Perp risk gate cancelled ladder in tx {hash}"),
-            Err(error) => eprintln!("Perp risk gate ladder cancellation failed: {error:#}"),
-        }
     }
     Ok(())
 }

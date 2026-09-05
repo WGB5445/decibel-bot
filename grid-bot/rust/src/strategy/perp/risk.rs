@@ -98,6 +98,62 @@ pub(crate) fn perp_estimated_margin(
         + pending_notional * config.maker_fee_rate
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TrimSide {
+    Bid,
+    Ask,
+}
+
+fn trim_violation_side(
+    config: &GridConfig,
+    position: Decimal,
+    plan: &GridPlan,
+) -> Option<TrimSide> {
+    let grid_size = plan.per_grid_base_size.unwrap_or_else(|| {
+        plan.bids
+            .first()
+            .or_else(|| plan.asks.first())
+            .map(|level| level.size)
+            .unwrap_or(Decimal::ZERO)
+    });
+    let (max_long, max_short) = perp_theoretical_limits(
+        config,
+        plan.asks.len(),
+        plan.bids.len(),
+        grid_size,
+    );
+    let (worst_long, worst_short) = perp_worst_case(position, plan);
+    match config.perp_mode {
+        PerpMode::Long => {
+            if worst_long > max_long {
+                Some(TrimSide::Bid)
+            } else if worst_short < Decimal::ZERO {
+                Some(TrimSide::Ask)
+            } else {
+                None
+            }
+        }
+        PerpMode::Short => {
+            if worst_long > Decimal::ZERO {
+                Some(TrimSide::Bid)
+            } else if worst_short < -max_short {
+                Some(TrimSide::Ask)
+            } else {
+                None
+            }
+        }
+        PerpMode::Neutral => {
+            if worst_long > max_long {
+                Some(TrimSide::Bid)
+            } else if worst_short < -max_short {
+                Some(TrimSide::Ask)
+            } else {
+                None
+            }
+        }
+    }
+}
+
 pub(crate) fn apply_perp_risk_trim(
     config: &GridConfig,
     plan: &mut GridPlan,
@@ -110,19 +166,14 @@ pub(crate) fn apply_perp_risk_trim(
         if perp_position_is_safe(position, plan, config) {
             return Ok(());
         }
-        let removed_bid = if !plan.bids.is_empty() {
-            plan.bids.pop();
-            true
-        } else {
-            false
+        let Some(side) = trim_violation_side(config, position, plan) else {
+            break;
         };
-        let removed_ask = if !removed_bid && !plan.asks.is_empty() {
-            plan.asks.pop();
-            true
-        } else {
-            false
+        let removed = match side {
+            TrimSide::Bid => plan.bids.pop().is_some(),
+            TrimSide::Ask => plan.asks.pop().is_some(),
         };
-        if !removed_bid && !removed_ask {
+        if !removed {
             break;
         }
     }
@@ -147,4 +198,58 @@ fn side_constraint_broken(config: &GridConfig, plan: &GridPlan) -> bool {
 pub(crate) fn perp_margin_is_safe(plan: &GridPlan, available_margin: Decimal) -> bool {
     plan.estimated_margin
         .is_some_and(|required| required <= available_margin)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{Allocation, GridLevel, GridPlan, LevelState, Product, RangeSpec, Side};
+    use rust_decimal_macros::dec;
+    use std::time::Duration;
+
+    fn level(side: Side, price: Decimal, size: Decimal) -> GridLevel {
+        GridLevel {
+            side,
+            price,
+            size,
+            notional: price * size,
+            state: LevelState::Planned,
+        }
+    }
+
+    fn short_config() -> GridConfig {
+        GridConfig {
+            product: Product::Perp,
+            perp_mode: PerpMode::Short,
+            market_name: "BTC/USD".to_owned(),
+            range: RangeSpec::Bounds {
+                lower: dec!(90),
+                upper: dec!(110),
+            },
+            total_count: 4,
+            allocation: Allocation::FixedSize(dec!(0.01)),
+            maker_fee_rate: dec!(0.0001),
+            preview_leverage: dec!(1),
+            refresh: Duration::from_secs(3),
+            price_source: crate::PriceSource::Prices,
+            spot: crate::SpotExecutionConfig::default(),
+            max_position: Some(dec!(0.03)),
+            out_of_range_action: crate::OutOfRangeAction::Pause,
+        }
+    }
+
+    #[test]
+    fn short_mode_trim_prefers_bids_when_long_exposure_violates() {
+        let mut plan = GridPlan {
+            bids: vec![level(Side::Bid, dec!(99), dec!(0.01)); 4],
+            asks: vec![level(Side::Ask, dec!(101), dec!(0.01)); 2],
+            target_position: Some(dec!(-0.02)),
+            per_grid_base_size: Some(dec!(0.01)),
+            ..GridPlan::default()
+        };
+        apply_perp_risk_trim(&short_config(), &mut plan, dec!(-0.01)).unwrap();
+        assert!(!plan.bids.is_empty());
+        assert_eq!(plan.asks.len(), 2);
+        assert!(perp_position_is_safe(dec!(-0.01), &plan, &short_config()));
+    }
 }

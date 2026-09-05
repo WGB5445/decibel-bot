@@ -213,6 +213,7 @@ pub async fn run_cli(
     // changed level count means inventory/affordability moved (a fill, funding, or a PFS-driven
     // shrink), which must replace immediately regardless of the cooldown.
     let mut last_submitted_level_count: Option<usize> = None;
+    let mut out_of_range_handled = false;
     // Trade history is the reliable fill signal. Bulk synthetic order IDs change on every
     // replacement because the sequence number changes, so comparing those IDs would falsely
     // classify every replacement as a fill.
@@ -468,6 +469,7 @@ pub async fn run_cli(
                         &api,
                         execute,
                         gas_station,
+                        &mut out_of_range_handled,
                     )
                     .await?;
                 }
@@ -962,16 +964,9 @@ pub async fn run_cli(
                         {
                             decibel_grid_tui::strategy::perp::runtime::record_perp_risk_rejection(
                                 reason,
-                                &settings.network,
-                                &settings.aptos_private_key,
-                                &settings.subaccount,
-                                &snapshot.market,
                                 journal.as_ref(),
                                 &mut run_state,
-                                execute,
-                                gas_station,
-                            )
-                            .await?;
+                            )?;
                         } else {
                             match execute_bulk_grid(
                                 &settings.network,

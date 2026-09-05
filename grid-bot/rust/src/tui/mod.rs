@@ -1,12 +1,8 @@
 use std::{
     fs,
-    io::{self, Write},
+    io,
     path::PathBuf,
     str::FromStr,
-    sync::{
-        Arc,
-        atomic::{AtomicBool, Ordering},
-    },
     time::Duration,
 };
 
@@ -24,7 +20,7 @@ use decibel_grid_tui::monitor_log::{
     LogPanelState, MIN_LOG_WIDTH, MIN_MAIN_WIDTH, render_log_panel, split_layout,
 };
 use decibel_grid_tui::process_lock::SubaccountRunLock;
-use decibel_grid_tui::profile::{self, DEFAULT_PROFILE, ProfileData, ProfileStore};
+use decibel_grid_tui::profile::{self, DEFAULT_PROFILE, ProfileStore};
 use decibel_grid_tui::*;
 use ratatui::{
     Terminal,
@@ -37,7 +33,7 @@ use ratatui::{
 use rust_decimal::{Decimal, prelude::ToPrimitive};
 use tokio::sync::mpsc;
 
-use crate::cli::settings::{AllocationKind, Args, RangeKind, Settings};
+use crate::cli::settings::{AllocationKind, RangeKind, Settings};
 use crate::engine::optional_subaccount;
 
 /// Cross USDC balance below this threshold is treated as zero for UI warnings and display.
