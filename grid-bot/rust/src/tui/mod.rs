@@ -3038,9 +3038,12 @@ fn render_grid(area: Rect, frame: &mut ratatui::Frame, app: &mut App, config: Op
         } else {
             Style::default().fg(Color::Gray).bg(Color::Rgb(24, 24, 24))
         };
+        // Global 1-based index for easy counting: 1. BID, 2. ASK, etc.
+        let display_index = index + 1;
+        let side_label = format!("{:>2}. {}", display_index, level.side.as_str());
         frame.render_widget(
             Paragraph::new(vec![
-                Line::from(level.side.as_str()),
+                Line::from(side_label),
                 Line::from(format_decimal(level.price, 5)),
                 Line::from(format!(
                     "{} {} · {} {}",

@@ -808,7 +808,16 @@ pub async fn run_cli(
                     && !exec_plan.paused_by_out_of_range
                     && !reconcile_result.missing.is_empty()
                 {
-                    match decibel_grid_tui::strategy::perp::runtime::run_perp_convergence(
+                    // Skip convergence when already at target — avoids an unnecessary
+                    // order-book fetch and IOC attempt for zero-delta plans.
+                    let skip_convergence = exec_plan
+                        .target_position
+                        .zip(Some(snapshot.account.position.size))
+                        .is_some_and(|(target, current)| {
+                            (target - current).abs() < snapshot.market.lot_size
+                        });
+                    if !skip_convergence {
+                        match decibel_grid_tui::strategy::perp::runtime::run_perp_convergence(
                         &settings.network,
                         &api,
                         &settings.aptos_private_key,
@@ -854,7 +863,8 @@ pub async fn run_cli(
                             continue;
                         }
                     }
-                }
+                    } // end if !skip_convergence
+                } // end Perp convergence block
 
                 // Spot bulk orders source PFS only. On replacement, the existing bulk escrow is
                 // credited by the Move entry function, so the currently reserved side counts
