@@ -20,6 +20,10 @@ pub(crate) fn compute_perp_target(
     }
 }
 
+pub fn perp_bootstrap_target_is_safe(config: &GridConfig, target: Decimal) -> bool {
+    config.max_position.is_none_or(|max| target.abs() <= max)
+}
+
 pub(crate) fn perp_worst_case(position: Decimal, plan: &GridPlan) -> (Decimal, Decimal) {
     let bid_sum: Decimal = plan.bids.iter().map(|level| level.size).sum();
     let ask_sum: Decimal = plan.asks.iter().map(|level| level.size).sum();
@@ -127,25 +131,21 @@ fn trim_violation_side(
             .map(|level| level.size)
             .unwrap_or(Decimal::ZERO)
     });
-    let (max_long, max_short) = perp_theoretical_limits(
-        config,
-        plan.asks.len(),
-        plan.bids.len(),
-        grid_size,
-    );
+    let (max_long, max_short) =
+        perp_theoretical_limits(config, plan.asks.len(), plan.bids.len(), grid_size);
     let (worst_long, worst_short) = perp_worst_case(position, plan);
     match config.perp_mode {
         PerpMode::Long => {
             if worst_long > max_long {
                 Some(TrimSide::Bid)
-            } else if worst_short < Decimal::ZERO {
+            } else if worst_short < Decimal::ZERO && position > Decimal::ZERO {
                 Some(TrimSide::Ask)
             } else {
                 None
             }
         }
         PerpMode::Short => {
-            if worst_long > Decimal::ZERO {
+            if worst_long > Decimal::ZERO && position < Decimal::ZERO {
                 Some(TrimSide::Bid)
             } else if worst_short < -max_short {
                 Some(TrimSide::Ask)
@@ -187,6 +187,14 @@ pub(crate) fn apply_perp_risk_trim(
         if !removed {
             break;
         }
+    }
+    if position == Decimal::ZERO
+        && matches!(config.perp_mode, PerpMode::Long | PerpMode::Short)
+        && plan.target_position.is_some()
+    {
+        // Bootstrap convergence runs before bulk submission; flat directional grids are
+        // intentionally bilateral even though worst-case exposure checks fail at zero.
+        return Ok(());
     }
     if !perp_position_is_safe(position, plan, config) || side_constraint_broken(config, plan) {
         bail!("perp pending ladder cannot be trimmed to a safe bilateral shape")
@@ -250,6 +258,51 @@ mod tests {
     }
 
     #[test]
+    fn long_bootstrap_at_flat_preserves_ask_ladder() {
+        let mut plan = GridPlan {
+            bids: vec![level(Side::Bid, dec!(99), dec!(0.01)); 2],
+            asks: vec![level(Side::Ask, dec!(101), dec!(0.01)); 2],
+            target_position: Some(dec!(0.02)),
+            per_grid_base_size: Some(dec!(0.01)),
+            ..GridPlan::default()
+        };
+        let config = GridConfig {
+            perp_mode: PerpMode::Long,
+            max_position: None,
+            ..short_config()
+        };
+        apply_perp_risk_trim(&config, &mut plan, dec!(0)).unwrap();
+        assert_eq!(plan.asks.len(), 2);
+        assert_eq!(plan.bids.len(), 2);
+    }
+
+    #[test]
+    fn bootstrap_target_respects_max_position() {
+        let config = GridConfig {
+            perp_mode: PerpMode::Long,
+            max_position: Some(dec!(0.01)),
+            ..short_config()
+        };
+        assert!(perp_bootstrap_target_is_safe(&config, dec!(0.01)));
+        assert!(!perp_bootstrap_target_is_safe(&config, dec!(0.02)));
+        assert!(!perp_bootstrap_target_is_safe(&config, dec!(-0.02)));
+    }
+
+    #[test]
+    fn short_bootstrap_at_flat_preserves_bid_ladder() {
+        let mut plan = GridPlan {
+            bids: vec![level(Side::Bid, dec!(99), dec!(0.01)); 2],
+            asks: vec![level(Side::Ask, dec!(101), dec!(0.01)); 2],
+            target_position: Some(dec!(-0.02)),
+            per_grid_base_size: Some(dec!(0.01)),
+            ..GridPlan::default()
+        };
+        apply_perp_risk_trim(&short_config(), &mut plan, dec!(0)).unwrap();
+        assert_eq!(plan.bids.len(), 2);
+        assert_eq!(plan.asks.len(), 2);
+    }
+
+    #[test]
     fn short_mode_trim_prefers_bids_when_long_exposure_violates() {
         let mut plan = GridPlan {
             bids: vec![level(Side::Bid, dec!(99), dec!(0.01)); 4],
@@ -282,7 +335,7 @@ mod tests {
     }
 
     #[test]
-    fn long_target_and_bid_ladder_are_safe_together() {
+    fn long_ladder_requires_reentry_after_position_returns_to_zero() {
         let plan = GridPlan {
             bids: vec![level(Side::Bid, dec!(100), dec!(1)); 2],
             asks: vec![level(Side::Ask, dec!(100), dec!(1)); 1],
@@ -299,5 +352,6 @@ mod tests {
         // The initial one-unit long covers the ask. Both bids may subsequently
         // fill, taking the position to the three-unit grid maximum.
         assert!(perp_position_is_safe(dec!(1), &plan, &config));
+        assert!(!perp_position_is_safe(Decimal::ZERO, &plan, &config));
     }
 }

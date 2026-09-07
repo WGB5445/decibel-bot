@@ -120,6 +120,39 @@ def test_spot_budget_auto_sizes_each_side_using_half_budget() -> None:
     assert orders.ask_sizes == [Decimal("0.93"), Decimal("0.93")]
 
 
+def test_perp_budget_auto_sizes_using_total_levels_formula() -> None:
+    cfg = config(
+        product="perp",
+        perp_mode="long",
+        total_budget=Decimal("412.412"),
+        order_size=None,
+        lower_price=Decimal("90"),
+        upper_price=Decimal("110"),
+        total_grid_count=4,
+    )
+    orders = GridMath.orders(
+        cfg,
+        Decimal("100"),
+        Decimal("1"),
+        Decimal("0.01"),
+        Decimal("0.01"),
+        cfg.maker_fee_rate,
+    )
+    rep = orders.ask_prices[0]
+    total_levels = len(orders.bid_prices) + len(orders.ask_prices)
+    expected = quantize_down(
+        cfg.total_budget
+        / (
+            Decimal(total_levels) * rep / cfg.preview_leverage
+            + Decimal(total_levels) * rep * cfg.maker_fee_rate
+        ),
+        Decimal("0.01"),
+    )
+    assert orders.bid_sizes == [expected] * len(orders.bid_prices)
+    assert orders.ask_sizes == [expected] * len(orders.ask_prices)
+    assert expected == Decimal("1")
+
+
 def test_40_per_side_grid_is_supported() -> None:
     orders = GridMath.orders(
         config(levels_per_side=MAX_BULK_LEVELS_PER_SIDE),
@@ -195,6 +228,44 @@ def test_perp_position_is_safe_requires_convergence_at_zero() -> None:
     )
     assert not perp_position_is_safe(cfg, Decimal(0), orders)
     assert perp_position_is_safe(cfg, Decimal("0.02"), orders)
+
+
+def test_long_perp_at_target_is_safe_without_max_position() -> None:
+    cfg = config(
+        product="perp",
+        perp_mode="long",
+        lower_price=Decimal("90"),
+        upper_price=Decimal("110"),
+        total_grid_count=4,
+    )
+    orders = grid_orders(
+        product="perp",
+        perp_mode="long",
+        lower_price=Decimal("90"),
+        upper_price=Decimal("110"),
+        total_grid_count=4,
+    )
+    target = compute_perp_target(
+        "long", len(orders.ask_prices), len(orders.bid_prices), orders.bid_sizes[0]
+    )
+    assert perp_position_is_safe(cfg, target, orders)
+
+
+def test_uniform_range_rejects_tick_collisions() -> None:
+    with pytest.raises(ValueError, match="too narrow for 4 distinct price points"):
+        build_perp_orders(
+            config(
+                product="perp",
+                lower_price=Decimal("100"),
+                upper_price=Decimal("101"),
+                total_grid_count=4,
+            ),
+            Decimal("100.5"),
+            Decimal("1"),
+            Decimal("0.01"),
+            Decimal("0.01"),
+            Decimal(0),
+        )
 
 
 def test_out_of_range_pause_returns_empty_orders() -> None:

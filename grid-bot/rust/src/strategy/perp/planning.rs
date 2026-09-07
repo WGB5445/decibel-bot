@@ -274,8 +274,7 @@ fn derive_perp_grid_size(
             // Solve for size:
             let denominator = Decimal::from(total_levels) * representative_price
                 / config.preview_leverage
-                + Decimal::from(total_levels) * representative_price
-                    * config.maker_fee_rate;
+                + Decimal::from(total_levels) * representative_price * config.maker_fee_rate;
             if denominator <= Decimal::ZERO {
                 bail!("cannot derive perp grid size: denominator is zero")
             }
@@ -390,8 +389,7 @@ mod tests {
     fn fixed_count_split_keeps_both_bounds_as_orders() {
         let config = config(PerpMode::Long, 40);
         let (bids, asks) =
-            split_uniform_levels(&config, dec!(70000), dec!(85000), dec!(77500), dec!(1))
-                .unwrap();
+            split_uniform_levels(&config, dec!(70000), dec!(85000), dec!(77500), dec!(1)).unwrap();
         let mut prices = bids.into_iter().chain(asks).collect::<Vec<_>>();
         prices.sort();
 

@@ -1,10 +1,4 @@
-use std::{
-    fs,
-    io,
-    path::PathBuf,
-    str::FromStr,
-    time::Duration,
-};
+use std::{fs, io, path::PathBuf, str::FromStr, time::Duration};
 
 use anyhow::{Context, Result};
 use crossterm::{
@@ -449,6 +443,9 @@ pub struct App {
     /// Whether the Monitor tab currently shows the log sidebar.
     log_split_visible: bool,
     engine_log_polled_at: Option<tokio::time::Instant>,
+    /// Live engine status is authoritative for runtime Perp accounting. Preview snapshots never
+    /// fabricate realized PnL from the display-only trade history.
+    engine_status: Option<decibel_grid_tui::control::EngineStatus>,
 }
 impl App {
     /// Preserve the complete anyhow error chain separately from the compact header status.
@@ -499,6 +496,7 @@ impl App {
             log_panel: LogPanelState::default(),
             log_split_visible: false,
             engine_log_polled_at: None,
+            engine_status: None,
         }
     }
 
@@ -519,12 +517,21 @@ impl App {
             return;
         }
         let path = match decibel_grid_tui::client::EngineClient::for_subaccount(subaccount) {
-            Ok(client) => client
-                .get_status()
-                .await
-                .ok()
-                .and_then(|status| status.log_path),
-            Err(_) => None,
+            Ok(client) => match client.get_status().await {
+                Ok(status) => {
+                    let path = status.log_path.clone();
+                    self.engine_status = Some(status);
+                    path
+                }
+                Err(_) => {
+                    self.engine_status = None;
+                    None
+                }
+            },
+            Err(_) => {
+                self.engine_status = None;
+                None
+            }
         };
         self.log_panel.sync_engine_log_path(path.as_deref());
     }
@@ -1087,15 +1094,16 @@ async fn tui_loop(
                         .ok()
                         .flatten();
                         let gas_station_ref = gas_station.as_ref();
-                        let result = execute_bulk_grid(
-                            &network,
-                            &api_key,
-                            &private_key,
-                            &subaccount,
-                            &market,
-                            &plan,
-                            gas_station_ref,
-                        )
+                        let result = execute_bulk_grid(BulkGridExecutionRequest {
+                            network: &network,
+                            api_key: &api_key,
+                            private_key: &private_key,
+                            subaccount: &subaccount,
+                            market: &market,
+                            plan: &plan,
+                            expected_sequence: None,
+                            gas_station: gas_station_ref,
+                        })
                         .await;
                         let _ = tx.send(MarketFetch::Execution {
                             settings_revision: revision,
@@ -2609,7 +2617,7 @@ fn field_explanation(app: &App, field: Field) -> String {
             "Fixed upper price in quote currency. The live midpoint must stay between lower and upper."
         }
         Field::GridCount => {
-            "Total Bid + Ask orders. The bot policy caps this at 40; Decibel also caps either side at 30."
+            "Total Bid + Ask orders. The bot policy caps the total at 40; Decibel caps either side at 40."
         }
         Field::AllocationKind => {
             "Total Budget derives a uniform size from your capital. Fixed Order Size uses the exact base quantity per level."
@@ -2662,9 +2670,7 @@ fn field_explanation(app: &App, field: Field) -> String {
             RangeKind::Bounds => "这里填写固定下界报价，例如 BTC/USD 填 65000。",
         },
         Field::UpperBound => "固定上界报价。实时中间价必须位于上下界之间。",
-        Field::GridCount => {
-            "Bid + Ask 总数。机器人策略上限为 40，Decibel 对单边另有最多 30 档的限制。"
-        }
+        Field::GridCount => "Bid + Ask 总数。机器人策略总数上限为 40，Decibel 对单边最多 40 档。",
         Field::AllocationKind => {
             "总预算会根据资金自动推导每格数量；固定数量则每格使用指定 base 数量。"
         }
@@ -2900,6 +2906,29 @@ fn render_grid(area: Rect, frame: &mut ratatui::Frame, app: &mut App, config: Op
     } else {
         None
     };
+    let live_perp_pnl = if snapshot.market.product == Product::Perp {
+        app.engine_status
+            .as_ref()
+            .and_then(|status| status.perp_pnl.as_ref())
+            .map(|pnl| {
+                format!(
+                    "ENGINE PNL  net {}  realized {}  unrealized {}  fees {}  funding {}",
+                    pnl.net_pnl_quote.as_deref().unwrap_or("unavailable"),
+                    pnl.realized_gross_quote,
+                    pnl.unrealized_gross_quote
+                        .as_deref()
+                        .unwrap_or("unavailable"),
+                    pnl.trade_fees_quote.as_deref().unwrap_or("unavailable"),
+                    pnl.funding_pnl_quote.as_deref().unwrap_or("unavailable"),
+                )
+            })
+            .unwrap_or_else(|| {
+                "ENGINE PNL unavailable: start the engine and wait for an accounting snapshot"
+                    .to_owned()
+            })
+    } else {
+        String::new()
+    };
     let reconciliation_line = match snapshot.reconciliation.as_ref() {
         Some(result) if result.unmanaged.is_empty() => format!(
             "{}  {} {}  {} {}  {} {}  ·  {}",
@@ -2960,9 +2989,9 @@ fn render_grid(area: Rect, frame: &mut ratatui::Frame, app: &mut App, config: Op
         ),
         format!(
             "{} {}  {} {}",
-            ui(app.settings.language, "Net profit", "净利润"),
+            ui(app.settings.language, "Estimated maker capture", "预估做市收益"),
             format_decimal(profit.net_capture, 6),
-            ui(app.settings.language, "Avg profit/trade", "单次平均利润"),
+            ui(app.settings.language, "Avg capture/pair", "每对预估收益"),
             average_pair_profit_display,
         ),
         capital_line,
@@ -2971,7 +3000,7 @@ fn render_grid(area: Rect, frame: &mut ratatui::Frame, app: &mut App, config: Op
             if snapshot.market.product == Product::Spot {
                 "Spot funding: PFS quote is sufficient for the current grid; press U or click here to view funding instructions.".to_owned()
             } else {
-                String::new()
+                live_perp_pnl
             }
         }),
         change_notice.to_owned(),

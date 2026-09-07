@@ -42,7 +42,7 @@ pub mod strategy;
 pub use geomi::GasStationConfig;
 
 /// Decibel's per-side protocol limit. This is separate from the bot policy below.
-pub const MAX_LEVELS_PER_SIDE: usize = 30;
+pub const MAX_LEVELS_PER_SIDE: usize = 40;
 /// User policy: a Spot grid may have at most forty levels across both sides.
 pub const MAX_TOTAL_LEVELS: usize = 40;
 const EXIT_SETTLE_POLL_ATTEMPTS: usize = 6;
@@ -68,7 +68,7 @@ pub fn validate_api_key_format(api_key: &str) -> Result<()> {
     Ok(())
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum, serde::Serialize, serde::Deserialize)]
 pub enum Product {
     Spot,
     Perp,
@@ -411,8 +411,20 @@ pub struct Trade {
 pub struct ExecutionResult {
     pub transaction_hash: String,
     pub product: Product,
+    pub bulk_sequence: u64,
     pub bid_count: usize,
     pub ask_count: usize,
+}
+
+pub struct BulkGridExecutionRequest<'a> {
+    pub network: &'a str,
+    pub api_key: &'a str,
+    pub private_key: &'a str,
+    pub subaccount: &'a str,
+    pub market: &'a Market,
+    pub plan: &'a GridPlan,
+    pub expected_sequence: Option<u64>,
+    pub gas_station: Option<&'a GasStationConfig>,
 }
 
 // Result of the optional automatic Spot base-inventory funding step. The live execution path
@@ -452,6 +464,95 @@ pub struct BulkOrderParameters {
     pub ask_sizes: Vec<u64>,
 }
 
+/// A typed view of the venue's active bulk ladder. It intentionally keeps the venue sequence
+/// separate from synthetic reconciliation IDs, because a bulk level has no individually
+/// cancellable REST order ID.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ActiveBulkLadder {
+    pub product: Product,
+    pub market_address: String,
+    pub sequence: u64,
+    pub levels: Vec<journal::BulkLevelState>,
+}
+
+impl ActiveBulkLadder {
+    pub fn matches(&self, expected: &journal::BulkLadder) -> bool {
+        self.product == expected.product
+            && normalized_address(&self.market_address)
+                == normalized_address(&expected.market_address)
+            && self.sequence == expected.sequence
+            && self.levels == expected.levels
+    }
+}
+
+/// Build the durable expectation before a bulk transaction is signed. The plan has already been
+/// risk-checked by the caller; this function only captures the exact quantized venue payload.
+pub fn bulk_ladder_intent(
+    operation_id: String,
+    product: Product,
+    market_address: String,
+    sequence: u64,
+    prior_sequence: Option<u64>,
+    plan: &GridPlan,
+    market: &Market,
+) -> Result<journal::BulkLadder> {
+    let bids: Vec<&GridLevel> = plan
+        .bids
+        .iter()
+        .filter(|level| level.state != LevelState::Filled)
+        .collect();
+    let asks: Vec<&GridLevel> = plan
+        .asks
+        .iter()
+        .filter(|level| level.state != LevelState::Filled)
+        .collect();
+    if bids.is_empty() && asks.is_empty() {
+        bail!("refusing to record an empty bulk ladder intent")
+    }
+    let parameters = prepare_bulk_order_parameters(sequence, &bids, &asks, market)?;
+    let mut levels = Vec::with_capacity(bids.len() + asks.len());
+    for (index, (price, size)) in parameters
+        .bid_prices
+        .iter()
+        .zip(&parameters.bid_sizes)
+        .enumerate()
+    {
+        levels.push(journal::BulkLevelState {
+            side: Side::Bid,
+            index,
+            price: scale_raw(Decimal::from(*price), market.px_decimals),
+            original_size: scale_raw(Decimal::from(*size), market.sz_decimals),
+            filled_size: Decimal::ZERO,
+        });
+    }
+    for (index, (price, size)) in parameters
+        .ask_prices
+        .iter()
+        .zip(&parameters.ask_sizes)
+        .enumerate()
+    {
+        levels.push(journal::BulkLevelState {
+            side: Side::Ask,
+            index,
+            price: scale_raw(Decimal::from(*price), market.px_decimals),
+            original_size: scale_raw(Decimal::from(*size), market.sz_decimals),
+            filled_size: Decimal::ZERO,
+        });
+    }
+    Ok(journal::BulkLadder {
+        operation_id,
+        product,
+        market_address,
+        sequence,
+        prior_sequence,
+        levels,
+        intent_at: Utc::now(),
+        transaction_hash: None,
+        cancel_transaction_hash: None,
+        state: journal::BulkLadderState::IntentRecorded,
+    })
+}
+
 /// Decibel's testnet USDC metadata object. Mainnet assets must be supplied explicitly by the
 /// caller because metadata addresses are network-specific.
 pub const TESTNET_USDC_METADATA: &str =
@@ -476,15 +577,30 @@ pub fn perp_position_is_safe(position: Decimal, plan: &GridPlan, config: &GridCo
 /// Build, sign, submit, and wait for an official Spot or Perp bulk order transaction.
 /// Spot: reads real PFS balances and refuses to alter a pinned grid if funding is insufficient.
 /// Perp: submitted as-configured (no automatic adjustment).
-pub async fn execute_bulk_grid(
-    network: &str,
-    api_key: &str,
-    private_key: &str,
-    subaccount: &str,
-    market: &Market,
-    plan: &GridPlan,
-    gas_station: Option<&GasStationConfig>,
-) -> Result<ExecutionResult> {
+pub async fn execute_bulk_grid(request: BulkGridExecutionRequest<'_>) -> Result<ExecutionResult> {
+    execute_bulk_grid_with_broadcast(request, |_| Ok(())).await
+}
+
+/// As [`execute_bulk_grid`], but invokes `on_broadcast` immediately after the transaction hash is
+/// returned and before waiting for commitment. The live engine uses this to durably record an
+/// otherwise ambiguous broadcast.
+pub async fn execute_bulk_grid_with_broadcast<F>(
+    request: BulkGridExecutionRequest<'_>,
+    on_broadcast: F,
+) -> Result<ExecutionResult>
+where
+    F: FnOnce(&str) -> Result<()>,
+{
+    let BulkGridExecutionRequest {
+        network,
+        api_key,
+        private_key,
+        subaccount,
+        market,
+        plan,
+        expected_sequence,
+        gas_station,
+    } = request;
     let subaccount_str = subaccount.trim();
     if subaccount_str.is_empty() {
         bail!("subaccount address is required for live execution")
@@ -523,9 +639,14 @@ pub async fn execute_bulk_grid(
             )
         }
     }
-    let sequence = client
-        .next_bulk_sequence(subaccount_str, &market.address, market.product)
-        .await?;
+    let sequence = match expected_sequence {
+        Some(sequence) => sequence,
+        None => {
+            client
+                .next_bulk_sequence(subaccount_str, &market.address, market.product)
+                .await?
+        }
+    };
     let key = normalize_private_key(private_key)?;
     let signer =
         Ed25519Account::from_private_key_hex(&key).context("invalid Aptos Ed25519 private key")?;
@@ -600,12 +721,12 @@ pub async fn execute_bulk_grid(
         .sequence_number(sequence_number)
         .payload(payload)
         .max_gas_amount(max_gas_amount)
-.gas_unit_price(gas_price)
+        .gas_unit_price(gas_price)
         .chain_id(chain_id)
         .expiration_from_now(aptos_tx::expiration_seconds(gas_station))
-.build()
+        .build()
         .context("build bulk-order transaction")?;
-    let response = aptos_tx::submit_raw_and_wait(
+    let response = aptos_tx::submit_raw_and_wait_with_broadcast(
         &aptos,
         raw,
         &signer,
@@ -616,6 +737,7 @@ pub async fn execute_bulk_grid(
             subaccount_str,
             market.address
         ),
+        on_broadcast,
     )
     .await?;
     if !response
@@ -638,6 +760,7 @@ pub async fn execute_bulk_grid(
             .unwrap_or_default()
             .to_owned(),
         product: market.product,
+        bulk_sequence: sequence,
         bid_count: bids.len(),
         ask_count: asks.len(),
     })
@@ -1957,7 +2080,8 @@ pub struct GridPlan {
     /// Raw planning input before out-of-range handling.
     #[serde(default)]
     pub raw_planning_price: Option<Decimal>,
-    /// Inventory target derived from level counts and rounded grid size.
+    /// Derived initial inventory target. The Perp engine locks it only for one-time bootstrap;
+    /// passive grid fills are not subsequently converged back to this value.
     #[serde(default)]
     pub target_position: Option<Decimal>,
     #[serde(default)]
@@ -2385,7 +2509,7 @@ pub(crate) fn side_counts(
         );
     }
     let bid_ratio = (mid - lower) / range;
-    // Preserve the configured combined level count while respecting the venue's 30-level
+    // Preserve the configured combined level count while respecting the venue's 40-level
     // per-side ceiling. Near a boundary the unconstrained allocation could otherwise put
     // all forty levels on one side and either exceed the ABI limit or silently drop
     // levels.
@@ -2681,7 +2805,7 @@ impl DecibelClient {
     /// Bulk sequence is a venue-side monotonically increasing value. The API's bulk-orders reader
     /// accepts the active account and market filters; the latest row's `sequence_number` is the
     /// predecessor for the next transaction.
-    async fn next_bulk_sequence(
+    pub async fn next_bulk_sequence(
         &self,
         subaccount: &str,
         market: &str,
@@ -2718,6 +2842,51 @@ impl DecibelClient {
             .unwrap_or(0)
             .checked_add(1)
             .ok_or_else(|| anyhow!("bulk sequence number overflow"))
+    }
+
+    /// Read the newest active bulk generation exactly as the venue presents it. This is used as a
+    /// submission postcondition, not merely as a reconciliation hint.
+    pub async fn active_bulk_ladder(
+        &self,
+        subaccount: &str,
+        market: &Market,
+    ) -> Result<Option<ActiveBulkLadder>> {
+        let asset_type = match market.product {
+            Product::Perp => "perp",
+            Product::Spot => "spot",
+        };
+        let data = self
+            .get(
+                "bulk_orders",
+                &[
+                    ("account", subaccount.to_owned()),
+                    ("market", market.address.clone()),
+                    ("asset_type", asset_type.to_owned()),
+                ],
+            )
+            .await?;
+        let rows = data
+            .as_array()
+            .ok_or_else(|| anyhow!("/bulk_orders did not return an array"))?;
+        let Some(latest) = rows
+            .iter()
+            .max_by_key(|row| integer_field(row, "sequence_number").unwrap_or_default())
+        else {
+            return Ok(None);
+        };
+        let sequence = integer_field(latest, "sequence_number")
+            .ok_or_else(|| anyhow!("/bulk_orders row has no sequence_number"))?;
+        let sequence = u64::try_from(sequence)
+            .map_err(|_| anyhow!("/bulk_orders has a negative sequence_number {sequence}"))?;
+        let mut levels = Vec::new();
+        append_observed_bulk_levels(&mut levels, latest, "bid_prices", "bid_sizes", Side::Bid)?;
+        append_observed_bulk_levels(&mut levels, latest, "ask_prices", "ask_sizes", Side::Ask)?;
+        Ok(Some(ActiveBulkLadder {
+            product: market.product,
+            market_address: market.address.clone(),
+            sequence,
+            levels,
+        }))
     }
 
     /// Check that the bearer key is accepted by both documented API transports without exposing
@@ -2780,6 +2949,31 @@ impl DecibelClient {
             PriceSource::Prices => self.mid_from_prices_or_depth(market).await,
             PriceSource::Depth => self.mid_from_depth(market).await,
         }
+    }
+
+    /// Perp mark price is kept separate from the quoting mid. Risk and unrealized PnL must not
+    /// silently substitute a mid when the venue has not supplied a mark price.
+    pub async fn mark_price(&self, market: &Market) -> Result<Decimal> {
+        if market.product != Product::Perp {
+            bail!("mark price is only available for Perp markets")
+        }
+        let data = self.ws_snapshot("all_market_prices").await?;
+        let rows = data
+            .get("prices")
+            .and_then(Value::as_array)
+            .ok_or_else(|| anyhow!("all_market_prices did not return a prices array"))?;
+        let row = rows
+            .iter()
+            .find(|row| price_row_matches_market(row, market))
+            .ok_or_else(|| anyhow!("all_market_prices has no row for {}", market.name))?;
+        decimal_field(row, "mark_px")
+            .filter(|price| *price > Decimal::ZERO)
+            .ok_or_else(|| {
+                anyhow!(
+                    "all_market_prices has no positive mark_px for {}",
+                    market.name
+                )
+            })
     }
 
     async fn ws_snapshot(&self, topic: &str) -> Result<Value> {
@@ -3193,6 +3387,118 @@ impl DecibelClient {
             })
             .collect())
     }
+
+    /// Fetch fills only when the venue exposes the immutable identifiers and quote-denominated
+    /// fees required for lossless accounting. Callers must block live risk expansion when this
+    /// endpoint cannot provide those fields instead of inventing a PnL from price matches.
+    pub async fn perp_fill_history(
+        &self,
+        subaccount: &str,
+        market: &Market,
+        since: Option<DateTime<Utc>>,
+    ) -> Result<Vec<strategy::perp::accounting::PerpFill>> {
+        if market.product != Product::Perp {
+            bail!("Perp fill history requested for a Spot market")
+        }
+        let order_sides = self.perp_order_sides(subaccount, market).await?;
+        const PAGE_SIZE: usize = 200;
+        const MAX_OFFSET: usize = 10_000;
+        let mut offset = 0usize;
+        let mut fills = Vec::new();
+        let history_end = Utc::now();
+        loop {
+            let mut params = vec![
+                ("account", subaccount.to_owned()),
+                ("market", market.address.clone()),
+                ("asset_type", "perp".to_owned()),
+                ("limit", PAGE_SIZE.to_string()),
+                ("offset", offset.to_string()),
+                ("sort_key", "timestamp".to_owned()),
+                ("sort_dir", "DESC".to_owned()),
+            ];
+            append_trade_history_window(&mut params, since, history_end);
+            let data = self.get("trade_history", &params).await?;
+            let rows = data
+                .get("items")
+                .and_then(Value::as_array)
+                .or_else(|| data.as_array())
+                .ok_or_else(|| anyhow!("/trade_history returned no items array"))?;
+            fills.extend(
+                rows.iter()
+                    .filter(|row| {
+                        value_str(row, "asset_type")
+                            .is_none_or(|asset_type| asset_type.eq_ignore_ascii_case("perp"))
+                    })
+                    .map(|row| parse_perp_fill(row, &order_sides))
+                    .collect::<Result<Vec<_>>>()?,
+            );
+            // A new run only needs the latest page as a historical baseline. Resumed runs page
+            // through every fill after their durable timestamp so realized PnL cannot be dropped.
+            if since.is_none() || rows.len() < PAGE_SIZE {
+                return Ok(fills);
+            }
+            if offset >= MAX_OFFSET {
+                bail!(
+                    "/trade_history has more than {} Perp fills after the durable cursor; refusing incomplete accounting",
+                    MAX_OFFSET + PAGE_SIZE
+                )
+            }
+            offset += PAGE_SIZE;
+        }
+    }
+
+    /// `trade_history.action` is position-centric, so a `Net` fill cannot always reveal whether
+    /// it bought or sold. The documented order history supplies `is_buy` for that fallback.
+    async fn perp_order_sides(
+        &self,
+        subaccount: &str,
+        market: &Market,
+    ) -> Result<std::collections::HashMap<String, bool>> {
+        let data = self
+            .get(
+                "order_history",
+                &[
+                    ("account", subaccount.to_owned()),
+                    ("market", market.address.clone()),
+                    ("asset_type", "perp".to_owned()),
+                    ("limit", "200".to_owned()),
+                    ("sort_key", "timestamp".to_owned()),
+                    ("sort_dir", "DESC".to_owned()),
+                ],
+            )
+            .await?;
+        let rows = data
+            .get("items")
+            .and_then(Value::as_array)
+            .or_else(|| data.as_array())
+            .ok_or_else(|| anyhow!("/order_history returned no items array"))?;
+        Ok(rows
+            .iter()
+            .filter_map(|row| {
+                Some((
+                    string_or_number_field(row, "order_id")?,
+                    row.get("is_buy")?.as_bool()?,
+                ))
+            })
+            .collect())
+    }
+}
+
+fn append_trade_history_window(
+    params: &mut Vec<(&str, String)>,
+    since: Option<DateTime<Utc>>,
+    end: DateTime<Utc>,
+) {
+    let Some(start) = since else {
+        return;
+    };
+    // The one-millisecond overlap preserves fills sharing the cursor timestamp; the durable
+    // trade_id set removes the intentional duplicate on restart. Decibel requires both bounds.
+    params.push((
+        "start_timestamp",
+        start.timestamp_millis().saturating_sub(1).to_string(),
+    ));
+    params.push(("end_timestamp", end.timestamp_millis().to_string()));
 }
 
 #[derive(Clone, Debug)]
@@ -3269,6 +3575,42 @@ fn append_bulk_levels(
             remaining_size: decimal_value(size)
                 .ok_or_else(|| anyhow!("/bulk_orders {sizes_key}[{index}] has no size"))?,
             origin: reconcile::OrderOrigin::Bulk,
+        });
+    }
+    Ok(())
+}
+
+fn append_observed_bulk_levels(
+    levels: &mut Vec<journal::BulkLevelState>,
+    row: &Value,
+    prices_key: &str,
+    sizes_key: &str,
+    side: Side,
+) -> Result<()> {
+    let prices = row
+        .get(prices_key)
+        .and_then(Value::as_array)
+        .ok_or_else(|| anyhow!("/bulk_orders row has no {prices_key} array"))?;
+    let sizes = row
+        .get(sizes_key)
+        .and_then(Value::as_array)
+        .ok_or_else(|| anyhow!("/bulk_orders row has no {sizes_key} array"))?;
+    if prices.len() != sizes.len() {
+        bail!(
+            "/bulk_orders {prices_key}/{sizes_key} length mismatch: {} prices, {} sizes",
+            prices.len(),
+            sizes.len()
+        )
+    }
+    for (index, (price, size)) in prices.iter().zip(sizes).enumerate() {
+        levels.push(journal::BulkLevelState {
+            side,
+            index,
+            price: decimal_value(price)
+                .ok_or_else(|| anyhow!("/bulk_orders {prices_key}[{index}] has no price"))?,
+            original_size: decimal_value(size)
+                .ok_or_else(|| anyhow!("/bulk_orders {sizes_key}[{index}] has no size"))?,
+            filled_size: Decimal::ZERO,
         });
     }
     Ok(())
@@ -3526,6 +3868,72 @@ fn scale_raw(raw: Decimal, decimals: u32) -> Decimal {
 fn value_str<'a>(value: &'a Value, key: &str) -> Option<&'a str> {
     value.get(key)?.as_str()
 }
+fn string_or_number_field(value: &Value, key: &str) -> Option<String> {
+    value.get(key).and_then(|field| match field {
+        Value::String(value) if !value.trim().is_empty() => Some(value.to_owned()),
+        Value::Number(value) => Some(value.to_string()),
+        _ => None,
+    })
+}
+
+fn parse_perp_fill(
+    row: &Value,
+    order_sides: &std::collections::HashMap<String, bool>,
+) -> Result<strategy::perp::accounting::PerpFill> {
+    use strategy::perp::accounting::{FillSide, PerpFill};
+
+    let id = string_or_number_field(row, "trade_id")
+        .or_else(|| string_or_number_field(row, "fill_id"))
+        .or_else(|| string_or_number_field(row, "id"))
+        .ok_or_else(|| anyhow!("Perp trade history row has no stable trade_id"))?;
+    let order_id = string_or_number_field(row, "order_id");
+    let order_side = order_id
+        .as_deref()
+        .and_then(|order_id| order_sides.get(order_id))
+        .copied();
+    let normalized_action = value_str(row, "action")
+        .unwrap_or_default()
+        .chars()
+        .filter(|character| character.is_ascii_alphanumeric())
+        .collect::<String>()
+        .to_ascii_lowercase();
+    let side = match normalized_action.as_str() {
+        "openlong" | "closeshort" | "buy" => FillSide::Buy,
+        "closelong" | "openshort" | "sell" => FillSide::Sell,
+        "net" | "" => match order_side {
+            Some(true) => FillSide::Buy,
+            Some(false) => FillSide::Sell,
+            None => bail!(
+                "Perp trade {id} has action {:?} but no is_buy order-history fallback",
+                value_str(row, "action")
+            ),
+        },
+        _ => bail!("Perp trade {id} has unsupported action {normalized_action:?}"),
+    };
+    let price = decimal_field(row, "price")
+        .filter(|value| *value > Decimal::ZERO)
+        .ok_or_else(|| anyhow!("Perp trade {id} has no positive price"))?;
+    let quantity = decimal_field(row, "size")
+        .filter(|value| *value > Decimal::ZERO)
+        .ok_or_else(|| anyhow!("Perp trade {id} has no positive size"))?;
+    let timestamp_ms = integer_field(row, "transaction_unix_ms")
+        .ok_or_else(|| anyhow!("Perp trade {id} has no transaction_unix_ms"))?;
+    let timestamp = DateTime::from_timestamp_millis(timestamp_ms)
+        .ok_or_else(|| anyhow!("Perp trade {id} has invalid transaction_unix_ms"))?;
+    Ok(PerpFill {
+        id,
+        side,
+        price,
+        quantity,
+        fee_quote: decimal_field(row, "fee_amount")
+            .ok_or_else(|| anyhow!("Perp trade has no fee_amount"))?,
+        realized_pnl_quote: decimal_field(row, "realized_pnl_amount")
+            .ok_or_else(|| anyhow!("Perp trade has no realized_pnl_amount"))?,
+        realized_funding_quote: decimal_field(row, "realized_funding_amount")
+            .ok_or_else(|| anyhow!("Perp trade has no realized_funding_amount"))?,
+        timestamp,
+    })
+}
 fn decimal_field(value: &Value, key: &str) -> Option<Decimal> {
     value.get(key).and_then(decimal_value)
 }
@@ -3602,6 +4010,58 @@ mod tests {
         )
         .expect_err("mismatched bulk arrays must fail");
         assert!(error.to_string().contains("length mismatch"));
+    }
+
+    #[test]
+    fn resumed_trade_history_includes_both_timestamp_bounds() {
+        let start = DateTime::from_timestamp_millis(1_700_000_000_000).unwrap();
+        let end = DateTime::from_timestamp_millis(1_700_000_100_000).unwrap();
+        let mut params = Vec::new();
+
+        append_trade_history_window(&mut params, Some(start), end);
+
+        assert_eq!(
+            params,
+            vec![
+                ("start_timestamp", "1699999999999".to_owned()),
+                ("end_timestamp", "1700000100000".to_owned()),
+            ]
+        );
+    }
+
+    #[test]
+    fn active_bulk_ladder_requires_exact_sequence_and_levels() {
+        let expected = journal::BulkLadder {
+            operation_id: "operation-1".to_owned(),
+            product: Product::Perp,
+            market_address: "0x01".to_owned(),
+            sequence: 42,
+            prior_sequence: Some(41),
+            levels: vec![journal::BulkLevelState {
+                side: Side::Bid,
+                index: 0,
+                price: dec!(100),
+                original_size: dec!(0.01),
+                filled_size: Decimal::ZERO,
+            }],
+            intent_at: Utc::now(),
+            transaction_hash: None,
+            cancel_transaction_hash: None,
+            state: journal::BulkLadderState::IntentRecorded,
+        };
+        let mut observed = ActiveBulkLadder {
+            product: Product::Perp,
+            market_address: "0x1".to_owned(),
+            sequence: 42,
+            levels: expected.levels.clone(),
+        };
+
+        assert!(observed.matches(&expected));
+        observed.sequence = 43;
+        assert!(!observed.matches(&expected));
+        observed.sequence = 42;
+        observed.levels[0].original_size = dec!(0.02);
+        assert!(!observed.matches(&expected));
     }
 
     fn market() -> Market {
@@ -3853,6 +4313,29 @@ mod tests {
             dec!(1),
         );
         assert_eq!(plan.bids[0].state, LevelState::Filled);
+    }
+
+    #[test]
+    fn documented_perp_trade_fields_book_fee_pnl_and_funding() {
+        let row = serde_json::json!({
+            "asset_type": "perp",
+            "trade_id": "123",
+            "order_id": "456",
+            "action": "Net",
+            "price": "105.5",
+            "size": "2",
+            "fee_amount": "0.25",
+            "realized_pnl_amount": "3.5",
+            "realized_funding_amount": "-0.1",
+            "transaction_unix_ms": 1_700_000_000_000i64
+        });
+        let order_sides = std::collections::HashMap::from([("456".to_owned(), false)]);
+        let fill = parse_perp_fill(&row, &order_sides).unwrap();
+        assert_eq!(fill.id, "123");
+        assert_eq!(fill.side, strategy::perp::accounting::FillSide::Sell);
+        assert_eq!(fill.fee_quote, dec!(0.25));
+        assert_eq!(fill.realized_pnl_quote, dec!(3.5));
+        assert_eq!(fill.realized_funding_quote, dec!(-0.1));
     }
 
     /// A pinned Spot ladder: bounds [90, 110] with eight fixed levels, sized 1 each.

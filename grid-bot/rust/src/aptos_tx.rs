@@ -37,8 +37,26 @@ pub async fn submit_raw_and_wait(
     gas_station: Option<&GasStationConfig>,
     context: &str,
 ) -> Result<Value> {
+    submit_raw_and_wait_with_broadcast(aptos, raw, signer, gas_station, context, |_| Ok(())).await
+}
+
+/// Submit a transaction and invoke `on_broadcast` as soon as the venue returns its hash, before
+/// waiting for commitment. Callers that manage irreversible state must fsync the hash here so a
+/// crash during the wait can be recovered without resubmitting.
+pub async fn submit_raw_and_wait_with_broadcast<F>(
+    aptos: &Aptos,
+    raw: RawTransaction,
+    signer: &Ed25519Account,
+    gas_station: Option<&GasStationConfig>,
+    context: &str,
+    on_broadcast: F,
+) -> Result<Value>
+where
+    F: FnOnce(&str) -> Result<()>,
+{
     if let Some(config) = gas_station {
         let hash = sign_and_submit(config, &raw, signer, context).await?;
+        on_broadcast(&hash)?;
         let hash_value = HashValue::from_hex(&hash)
             .with_context(|| format!("{context}: invalid transaction hash from Geomi: {hash}"))?;
         let response = aptos
@@ -51,9 +69,18 @@ pub async fn submit_raw_and_wait(
 
     let signed = sign_transaction(&raw, signer)
         .with_context(|| format!("{context}: sign self-paid transaction"))?;
-    let response = aptos
-        .submit_and_wait(&signed, Some(WAIT_TIMEOUT))
+    let pending = aptos
+        .submit_transaction(&signed)
         .await
         .with_context(|| format!("{context}: submit self-paid transaction"))?;
+    let hash = pending.data.hash.to_string();
+    on_broadcast(&hash)?;
+    let hash_value = HashValue::from_hex(&hash)
+        .with_context(|| format!("{context}: invalid transaction hash from fullnode: {hash}"))?;
+    let response = aptos
+        .fullnode()
+        .wait_for_transaction(&hash_value, Some(WAIT_TIMEOUT))
+        .await
+        .with_context(|| format!("{context}: wait for self-paid transaction {hash}"))?;
     Ok(response.data)
 }

@@ -28,6 +28,30 @@ pub async fn cancel_bulk_ladder(
     market: &Market,
     gas_station: Option<&GasStationConfig>,
 ) -> Result<String> {
+    cancel_bulk_ladder_with_broadcast(
+        network,
+        private_key,
+        subaccount,
+        market,
+        gas_station,
+        |_| Ok(()),
+    )
+    .await
+}
+
+/// As [`cancel_bulk_ladder`], but exposes the cancellation hash immediately after broadcast so a
+/// caller can durably record an unresolved cancellation before waiting for commitment.
+pub async fn cancel_bulk_ladder_with_broadcast<F>(
+    network: &str,
+    private_key: &str,
+    subaccount: &str,
+    market: &Market,
+    gas_station: Option<&GasStationConfig>,
+    on_broadcast: F,
+) -> Result<String>
+where
+    F: FnOnce(&str) -> Result<()>,
+{
     let package = package_for_network(network)?;
     let key = normalize_private_key(private_key)?;
     let signer =
@@ -70,12 +94,13 @@ pub async fn cancel_bulk_ladder(
         .expiration_from_now(aptos_tx::expiration_seconds(gas_station))
         .build()
         .context("build bulk cancellation transaction")?;
-    let response = aptos_tx::submit_raw_and_wait(
+    let response = aptos_tx::submit_raw_and_wait_with_broadcast(
         &aptos,
         raw,
         &signer,
         gas_station,
         "submit bulk cancellation transaction",
+        on_broadcast,
     )
     .await
     .context("submit bulk cancellation transaction")?;

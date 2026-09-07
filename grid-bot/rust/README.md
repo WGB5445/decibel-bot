@@ -261,7 +261,7 @@ Spot 首次计划会计算并持久化 `per_grid_base_size`。所有 bid/ask 档
 - Neutral / Long / Short Perp 方向；
 - 总预算 + 总订单数自动推导每格统一数量；
 - 固定区间、上下百分比区间、每格百分比间距三种价格范围；
-- Etna bulk order 限制：策略总计最多 **40 档**，且单边最多 **30 档**；
+- Etna bulk order 限制：策略总计最多 **40 档**，且单边最多 **40 档**；
 - REST 拉取 market、价格、账户概览、仓位、open orders 与 trade history；
 - 将 trade history 中价格命中的网格格子标记为 `Filled`;
 - TUI 中显示完整网格、当前价格、区间、仓位、可用保证金、格子状态;
@@ -778,7 +778,7 @@ Monitor 页按刷新间隔持续更新市场、账户、仓位、订单和成交
 | `10` | 5 Bid + 5 Ask |
 | `40` | 20 Bid + 20 Ask（Perp Long/Short/Neutral 均为双边合计） |
 
-`GRID_TOTAL_COUNT` 为双边合计档位数（最多 40，每侧最多 30）。越界默认 `pause`；`clamp_continue` 须显式配置。
+`GRID_TOTAL_COUNT` 为双边合计档位数（最多 40，每侧最多 40）。越界默认 `pause`；`clamp_continue` 须显式配置。
 
 ### 总预算
 

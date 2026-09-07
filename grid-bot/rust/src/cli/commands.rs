@@ -156,10 +156,7 @@ pub async fn status_client(settings: Settings) -> Result<()> {
     }
 }
 
-pub async fn stop_client(
-    settings: Settings,
-    confirm_mainnet: Option<&str>,
-) -> Result<()> {
+pub async fn stop_client(settings: Settings, confirm_mainnet: Option<&str>) -> Result<()> {
     if settings.network.eq_ignore_ascii_case("mainnet") && confirm_mainnet != Some("MAINNET") {
         anyhow::bail!("mainnet stop requires --confirm-mainnet MAINNET")
     }
@@ -358,6 +355,23 @@ async fn stop_cli(settings: Settings, confirm_mainnet: Option<&str>) -> Result<(
             println!("Grid stopped: ladder cancelled in tx {hash}; assets retained.");
         }
         ExitAssetPolicy::Sell => {
+            if market.product == Product::Perp {
+                let result = decibel_grid_tui::strategy::perp::runtime::cancel_and_flatten_perp(
+                    &settings.network,
+                    &api,
+                    &settings.aptos_private_key,
+                    &settings.subaccount,
+                    &market,
+                    &config.spot,
+                    gas_station,
+                )
+                .await?;
+                println!(
+                    "Grid stopped: cancelled {} and Perp position {} -> {}",
+                    result.cancel_transaction_hash, result.position_before, result.position_after
+                );
+                return Ok(());
+            }
             let spot_guard = if market.product == Product::Spot {
                 let rates = api.spot_fee_rates(&settings.subaccount).await?;
                 config.maker_fee_rate = rates.maker_rate;

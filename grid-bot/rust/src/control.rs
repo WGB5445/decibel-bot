@@ -123,6 +123,24 @@ pub struct EngineEvent {
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct PerpPnlStatus {
+    pub exchange_position_base: String,
+    pub ledger_position_base: String,
+    pub reconciliation_delta_base: String,
+    pub average_entry_price: Option<String>,
+    pub mark_price: Option<String>,
+    pub unrealized_gross_quote: Option<String>,
+    pub realized_gross_quote: String,
+    pub trade_fees_quote: Option<String>,
+    pub funding_pnl_quote: Option<String>,
+    pub net_pnl_quote: Option<String>,
+    pub fees_complete: bool,
+    pub funding_complete: bool,
+    pub last_fill_at: Option<DateTime<Utc>>,
+    pub last_funding_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct EngineStatus {
     pub pid: u32,
     pub started_at: Option<DateTime<Utc>>,
@@ -142,7 +160,9 @@ pub struct EngineStatus {
     pub pfs_quote_symbol: Option<String>,
     pub pfs_quote_balance: Option<String>,
     pub realized_pnl: Option<String>,
+    pub perp_pnl: Option<PerpPnlStatus>,
     pub perp_mode: Option<String>,
+    pub perp_bootstrap_status: Option<String>,
     pub max_position: Option<String>,
     pub position: Option<String>,
     pub available_margin: Option<String>,

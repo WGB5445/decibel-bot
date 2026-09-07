@@ -15,6 +15,83 @@ use crate::cli::settings::Settings;
 use crate::cli::settings::decimal;
 use tokio::sync::mpsc;
 
+fn apply_spot_fill_to_ladder(
+    ladder: &mut journal::BulkLadder,
+    fill: &events::SpotBulkFill,
+) -> Result<()> {
+    if ladder.product != Product::Spot || ladder.state != journal::BulkLadderState::VenueObserved {
+        anyhow::bail!("fill does not belong to a venue-observed Spot ladder")
+    }
+    let sequence = fill
+        .bulk_sequence_number
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("Spot bulk fill has no bulk sequence number"))?
+        .parse::<u64>()
+        .context("Spot bulk fill has an invalid bulk sequence number")?;
+    if sequence != ladder.sequence {
+        anyhow::bail!(
+            "Spot bulk fill sequence {sequence} does not match active sequence {}",
+            ladder.sequence
+        )
+    }
+    let side = match fill.side.as_deref().map(str::to_ascii_lowercase).as_deref() {
+        Some("buy" | "bid") => Side::Bid,
+        Some("sell" | "ask") => Side::Ask,
+        _ => anyhow::bail!("Spot bulk fill has no recognized side"),
+    };
+    let matches = ladder
+        .levels
+        .iter()
+        .enumerate()
+        .filter(|(_, level)| level.side == side && level.price == fill.price)
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+    let [index] = matches.as_slice() else {
+        anyhow::bail!(
+            "Spot bulk fill cannot be uniquely mapped to sequence {sequence}: side={side:?} price={}",
+            fill.price
+        )
+    };
+    let level = &mut ladder.levels[*index];
+    let updated = level.filled_size + fill.size;
+    if updated > level.original_size {
+        anyhow::bail!(
+            "Spot bulk fill exceeds original level size: {} filled plus {} new exceeds {}",
+            level.filled_size,
+            fill.size,
+            level.original_size
+        )
+    }
+    level.filled_size = updated;
+    Ok(())
+}
+
+fn perp_pnl_status(
+    accounting: &decibel_grid_tui::strategy::perp::accounting::PerpAccounting,
+    exchange_position: Decimal,
+    mark_price: Option<Decimal>,
+) -> control::PerpPnlStatus {
+    let snapshot = accounting.pnl_snapshot(exchange_position, mark_price);
+    control::PerpPnlStatus {
+        exchange_position_base: snapshot.exchange_position_base.to_string(),
+        ledger_position_base: snapshot.ledger_position_base.to_string(),
+        reconciliation_delta_base: snapshot.reconciliation_delta_base.to_string(),
+        average_entry_price: snapshot.average_entry_price.map(|value| value.to_string()),
+        mark_price: snapshot.mark_price.map(|value| value.to_string()),
+        unrealized_gross_quote: snapshot
+            .unrealized_gross_quote
+            .map(|value| value.to_string()),
+        realized_gross_quote: snapshot.realized_gross_quote.to_string(),
+        trade_fees_quote: snapshot.trade_fees_quote.map(|value| value.to_string()),
+        funding_pnl_quote: snapshot.funding_pnl_quote.map(|value| value.to_string()),
+        net_pnl_quote: snapshot.net_pnl_quote.map(|value| value.to_string()),
+        fees_complete: accounting.fees_complete,
+        funding_complete: accounting.funding_complete,
+        last_fill_at: accounting.last_fill_at,
+        last_funding_at: accounting.last_funding_at,
+    }
+}
+
 pub(crate) fn print_snapshot(snapshot: &MonitorSnapshot, config: &GridConfig) {
     let profit = snapshot.plan.profit_preview(config.maker_fee_rate);
     println!(
@@ -91,7 +168,7 @@ pub async fn run_cli(
     } else {
         None
     };
-    let run_id = if execute && config.product == Product::Spot {
+    let run_id = if execute {
         journal::persistent_run_id(&settings.network, &settings.subaccount, &config.market_name)
     } else {
         journal::generate_run_id()
@@ -149,7 +226,7 @@ pub async fn run_cli(
     }
     if resumed {
         println!(
-            "Recovered durable Spot grid state for run {run_id}; reconciling exchange state before replacement."
+            "Recovered durable grid state for run {run_id}; reconciling exchange state before replacement."
         );
     }
     println!(
@@ -204,9 +281,8 @@ pub async fn run_cli(
         .spot_runtime
         .as_ref()
         .map(|state| state.pinned_plan.clone());
-    // A small mid-price move can change many quantized levels and otherwise cause a full bulk
-    // replacement every refresh. Keep a short cooldown for same-sized ladders; initial placement
-    // and structural changes (level count changes, fills, funding/affordability changes) bypass it.
+    // Retain a short Spot-only cooldown for transient reconciliation drift. Perp geometry is
+    // pinned below, so a mid-price refresh cannot create price-only ladder drift.
     const BULK_REPLACEMENT_COOLDOWN: Duration = Duration::from_secs(30);
     let mut last_bulk_replacement_at: Option<tokio::time::Instant> = None;
     // Total resting levels (bid_count + ask_count) from the last submitted bulk ladder. A
@@ -214,6 +290,22 @@ pub async fn run_cli(
     // shrink), which must replace immediately regardless of the cooldown.
     let mut last_submitted_level_count: Option<usize> = None;
     let mut out_of_range_handled = false;
+    let existing_perp_runtime = run_state.perp_runtime.clone();
+    let mut perp_runtime = match existing_perp_runtime {
+        Some(state) => state,
+        None if resumed && config.product == Product::Perp => {
+            journal::PerpRuntimeState::legacy_unknown()
+        }
+        None => journal::PerpRuntimeState::new(),
+    };
+    let mut legacy_perp_state = config.product == Product::Perp
+        && perp_runtime.bootstrap_status == journal::PerpBootstrapStatus::LegacyUnknown;
+    let mut perp_accounting = perp_runtime.accounting.clone();
+    // A new strategy is allowed to establish a ledger only while flat. A resumed strategy first
+    // applies unseen fills, then must agree with the exchange before it can submit more risk.
+    let mut perp_accounting_initialized =
+        resumed && config.product == Product::Perp && !legacy_perp_state;
+    let mut perp_accounting_blocked: Option<String> = None;
     // Trade history is the reliable fill signal. Bulk synthetic order IDs change on every
     // replacement because the sequence number changes, so comparing those IDs would falsely
     // classify every replacement as a fill.
@@ -397,6 +489,117 @@ pub async fn run_cli(
         // must not suppress a future desired order during reconciliation or execution.
         let mut snapshot = snapshot;
         last_market = Some(snapshot.market.clone());
+        if execute
+            && run_state.bulk_ladder.as_ref().is_some_and(|ladder| {
+                matches!(
+                    ladder.state,
+                    journal::BulkLadderState::IntentRecorded
+                        | journal::BulkLadderState::BroadcastPending
+                        | journal::BulkLadderState::BroadcastUnknown
+                        | journal::BulkLadderState::Committed
+                )
+            })
+        {
+            let expected = run_state
+                .bulk_ladder
+                .as_ref()
+                .expect("checked above")
+                .clone();
+            if api
+                .active_bulk_ladder(&settings.subaccount, &snapshot.market)
+                .await?
+                .is_some_and(|active| active.matches(&expected))
+            {
+                let event = journal::JournalEvent::BulkVenueObserved {
+                    at: Utc::now(),
+                    operation_id: expected.operation_id.clone(),
+                };
+                let journal = journal
+                    .as_ref()
+                    .expect("live execution always has a durable journal");
+                journal.append(&event)?;
+                run_state.apply(&event);
+                journal.save_state(&run_state)?;
+                println!(
+                    "Recovered bulk operation {} as venue-observed sequence {}.",
+                    expected.operation_id, expected.sequence
+                );
+            }
+        }
+        if execute && snapshot.market.product == Product::Perp && !legacy_perp_state {
+            match api
+                .perp_fill_history(
+                    &settings.subaccount,
+                    &snapshot.market,
+                    perp_accounting_initialized
+                        .then(|| perp_accounting.history_cursor())
+                        .flatten(),
+                )
+                .await
+            {
+                Ok(fills) if !perp_accounting_initialized => {
+                    if !snapshot.account.position.size.is_zero() {
+                        anyhow::bail!(
+                            "refusing Perp startup with existing position {}; no verified grid journal is available",
+                            snapshot.account.position.size
+                        )
+                    }
+                    // Existing historical trades are not strategy PnL for this new run.
+                    perp_accounting.seed_historical_fills(&fills, snapshot.observed_at);
+                    perp_accounting_initialized = true;
+                    perp_runtime.accounting = perp_accounting.clone();
+                    run_state.perp_runtime = Some(perp_runtime.clone());
+                    if let Some(journal) = &journal {
+                        journal.save_state(&run_state)?;
+                    }
+                }
+                Ok(fills) => {
+                    let mut changed = false;
+                    for fill in &fills {
+                        changed |= perp_accounting.apply_fill(fill)?;
+                    }
+                    if !perp_accounting.position_matches_exchange(
+                        snapshot.account.position.size,
+                        snapshot.market.lot_size,
+                    ) {
+                        perp_accounting_blocked = Some(format!(
+                            "Perp accounting mismatch: exchange position {} vs ledger {}",
+                            snapshot.account.position.size, perp_accounting.position_base
+                        ));
+                    } else {
+                        perp_accounting_blocked = None;
+                    }
+                    if changed {
+                        perp_runtime.accounting = perp_accounting.clone();
+                        run_state.perp_runtime = Some(perp_runtime.clone());
+                        if let Some(journal) = &journal {
+                            journal.save_state(&run_state)?;
+                        }
+                    }
+                }
+                Err(error) => {
+                    perp_accounting_blocked = Some(format!(
+                        "Perp accounting unavailable; refusing new risk: {error:#}"
+                    ));
+                }
+            }
+            let mark_price = api.mark_price(&snapshot.market).await.ok();
+            if let Some(runtime) = &engine_runtime {
+                let pnl =
+                    perp_pnl_status(&perp_accounting, snapshot.account.position.size, mark_price);
+                let accounting_blocked = perp_accounting_blocked.clone();
+                runtime
+                    .update_status(|status| {
+                        status.perp_pnl = Some(pnl);
+                        status.realized_pnl =
+                            Some(perp_accounting.realized_gross_quote.to_string());
+                        if accounting_blocked.is_some() {
+                            status.perp_blocked_reason = accounting_blocked;
+                        }
+                    })
+                    .await;
+            }
+        }
         // Trade history is returned newest-first. A newly observed trade is a strong trigger for
         // replacement; a small price-only drift is not. Seed the cursor on the first cycle so
         // historical fills from before this process started do not cause an immediate refresh.
@@ -451,13 +654,82 @@ pub async fn run_cli(
             )?;
             snapshot.plan = offline.plan;
             if snapshot.market.product == Product::Perp {
+                // The Perp grid is a ladder, not a market-making quote. Rebuilding it from every
+                // refreshed price would atomically cancel orders just before they can fill and
+                // chase the market away. Evaluate range breaks from the fresh plan, but otherwise
+                // retain the first accepted geometry and only replace it after a real fill.
+                let fresh_plan = snapshot.plan.clone();
+                if fresh_plan.out_of_range_action_applied.is_none() {
+                    if let Some(pinned) = &perp_runtime.pinned_plan {
+                        snapshot.plan = pinned.clone();
+                        snapshot.plan.raw_planning_price = fresh_plan.raw_planning_price;
+                    } else {
+                        perp_runtime.pinned_plan = Some(fresh_plan);
+                        perp_runtime.accounting = perp_accounting.clone();
+                        run_state.perp_runtime = Some(perp_runtime.clone());
+                        if let Some(journal) = &journal {
+                            journal.save_state(&run_state)?;
+                        }
+                    }
+                }
                 snapshot.plan =
-                    decibel_grid_tui::strategy::perp::runtime::prepare_perp_executable_plan(
+                    decibel_grid_tui::strategy::perp::runtime::finalize_perp_executable_plan(
                         &config,
                         snapshot.plan.clone(),
                         snapshot.account.position.size,
                         snapshot.account.available_margin,
                     )?;
+                if perp_runtime.bootstrap_status == journal::PerpBootstrapStatus::Pending
+                    && perp_runtime.bootstrap_target_position.is_none()
+                {
+                    match snapshot.plan.target_position {
+                        Some(target)
+                            if decibel_grid_tui::strategy::perp::risk::perp_bootstrap_target_is_safe(
+                                &config, target,
+                            ) =>
+                        {
+                            let locked = perp_runtime
+                                .lock_bootstrap_target(target)
+                                .expect("pending bootstrap accepts its first target");
+                            println!("Perp bootstrap target locked at {locked}.");
+                        }
+                        Some(target) => {
+                            perp_runtime.bootstrap_status = journal::PerpBootstrapStatus::Blocked;
+                            snapshot.plan.perp_blocked_reason = Some(format!(
+                                "Perp bootstrap blocked: target position {target} exceeds GRID_MAX_POSITION"
+                            ));
+                        }
+                        None => {
+                            perp_runtime.bootstrap_status = journal::PerpBootstrapStatus::Blocked;
+                            snapshot.plan.perp_blocked_reason = Some(
+                                "Perp bootstrap blocked: initial plan has no target position"
+                                    .to_owned(),
+                            );
+                        }
+                    }
+                    perp_runtime.accounting = perp_accounting.clone();
+                    run_state.perp_runtime = Some(perp_runtime.clone());
+                    if let Some(journal) = &journal {
+                        journal.save_state(&run_state)?;
+                    }
+                }
+                if let Some(reason) = perp_accounting_blocked.clone() {
+                    snapshot.plan.perp_blocked_reason = Some(reason);
+                }
+                snapshot.plan.convergence_delta =
+                    if perp_runtime.bootstrap_status == journal::PerpBootstrapStatus::Pending {
+                        perp_runtime
+                            .bootstrap_target_position
+                            .map(|target| target - snapshot.account.position.size)
+                    } else {
+                        None
+                    };
+                if perp_runtime.bootstrap_status == journal::PerpBootstrapStatus::Blocked {
+                    snapshot.plan.perp_blocked_reason = Some(
+                        "Perp bootstrap blocked; automatic market convergence and grid submission are paused"
+                            .to_owned(),
+                    );
+                }
                 if execute {
                     decibel_grid_tui::strategy::perp::runtime::handle_perp_out_of_range(
                         &config,
@@ -491,14 +763,18 @@ pub async fn run_cli(
                 snapshot.account.position.size,
                 snapshot.account.available_margin,
                 snapshot.market.lot_size,
+                perp_runtime.bootstrap_status == journal::PerpBootstrapStatus::Pending,
             );
             runtime
                 .update_status(|status| {
                     status.planning_price =
                         snapshot.plan.planning_price.map(|value| value.to_string());
                     status.position = Some(snapshot.account.position.size.to_string());
-                    status.target_position =
-                        snapshot.plan.target_position.map(|value| value.to_string());
+                    status.target_position = perp_runtime
+                        .bootstrap_target_position
+                        .map(|value| value.to_string());
+                    status.perp_bootstrap_status =
+                        Some(format!("{:?}", perp_runtime.bootstrap_status).to_lowercase());
                     status.convergence_delta = snapshot
                         .plan
                         .convergence_delta
@@ -782,6 +1058,51 @@ pub async fn run_cli(
                 journal.save_state(&run_state)?;
             }
 
+            // State files written before bootstrap tracking must never be interpreted as a new
+            // strategy that is allowed to send a market order. Only a fully matched active bulk
+            // ladder proves this process can safely regard the old run as already bootstrapped.
+            if snapshot.market.product == Product::Perp
+                && perp_runtime.bootstrap_status == journal::PerpBootstrapStatus::LegacyUnknown
+            {
+                let has_active_bulk_ladder = actual
+                    .iter()
+                    .any(|order| order.order_id.starts_with("bulk:"));
+                if has_active_bulk_ladder && reconcile_result.is_converged() {
+                    match api
+                        .perp_fill_history(&settings.subaccount, &snapshot.market, None)
+                        .await
+                    {
+                        Ok(fills) => {
+                            perp_accounting.seed_historical_fills(&fills, snapshot.observed_at);
+                            perp_accounting_initialized = true;
+                            legacy_perp_state = false;
+                            perp_runtime.accounting = perp_accounting.clone();
+                            perp_runtime.bootstrap_status = journal::PerpBootstrapStatus::Completed;
+                            println!(
+                                "Perp legacy state migrated: active bulk ladder matched; bootstrap marked completed without market convergence."
+                            );
+                        }
+                        Err(error) => {
+                            let reason = format!(
+                                "Perp bootstrap blocked: cannot establish a historical accounting baseline for legacy state: {error:#}"
+                            );
+                            eprintln!("{reason}");
+                            perp_runtime.bootstrap_status = journal::PerpBootstrapStatus::Blocked;
+                            snapshot.plan.perp_blocked_reason = Some(reason);
+                        }
+                    }
+                } else {
+                    let reason = "Perp bootstrap blocked: legacy state has no fully matched active bulk ladder; restart only after manual ownership review".to_owned();
+                    eprintln!("{reason}");
+                    perp_runtime.bootstrap_status = journal::PerpBootstrapStatus::Blocked;
+                    snapshot.plan.perp_blocked_reason = Some(reason);
+                }
+                run_state.perp_runtime = Some(perp_runtime.clone());
+                if let Some(journal) = &journal {
+                    journal.save_state(&run_state)?;
+                }
+            }
+
             // 2. Standalone orders carry no client-order ID, so ownership cannot be proven and a
             // bulk submission could silently remove a manual order — those still halt execution.
             // Levels of this (subaccount, market)'s own bulk ladder are different: only one bulk
@@ -816,62 +1137,143 @@ pub async fn run_cli(
                     && !exec_plan.paused_by_out_of_range
                     && !reconcile_result.missing.is_empty()
                 {
-                    // Skip convergence when already at target — avoids an unnecessary
-                    // order-book fetch and IOC attempt for zero-delta plans.
-                    let skip_convergence = exec_plan
-                        .target_position
-                        .zip(Some(snapshot.account.position.size))
-                        .is_some_and(|(target, current)| {
-                            (target - current).abs() < snapshot.market.lot_size
-                        });
-                    if !skip_convergence {
-                        match decibel_grid_tui::strategy::perp::runtime::run_perp_convergence(
-                        &settings.network,
-                        &api,
-                        &settings.aptos_private_key,
-                        &settings.subaccount,
-                        &snapshot.market,
-                        &exec_plan,
-                        &config.spot,
-                        gas_station,
-                    )
-                    .await
+                    if perp_runtime.bootstrap_status == journal::PerpBootstrapStatus::Completed
+                        && !decibel_grid_tui::perp_position_is_safe(
+                            snapshot.account.position.size,
+                            &exec_plan,
+                            &config,
+                        )
                     {
-                        Ok(convergence) => {
-                            println!(
-                                "  Perp convergence: position {} -> target {} (delta {})",
-                                convergence.current, convergence.target, convergence.delta
-                            );
-                            let account = api
-                                .account(Some(&settings.subaccount), &snapshot.market)
-                                .await?;
-                            exec_plan =
-                                decibel_grid_tui::strategy::perp::runtime::finalize_perp_executable_plan(
-                                    &config,
-                                    exec_plan,
-                                    account.position.size,
-                                    account.available_margin,
-                                )?;
-                            snapshot.account = account;
-                        }
-                        Err(error) => {
-                            let reason = format!("Perp convergence failed: {error:#}");
-                            eprintln!("  {reason}");
-                            if let Some(journal) = &journal {
-                                let event = journal::JournalEvent::RiskRejected {
-                                    at: Utc::now(),
-                                    reason: reason.clone(),
-                                };
-                                journal.append(&event)?;
-                                run_state.apply(&event);
-                                journal.save_state(&run_state)?;
+                        match exec_plan.target_position {
+                            Some(target)
+                                if decibel_grid_tui::strategy::perp::risk::perp_bootstrap_target_is_safe(
+                                    &config, target,
+                                ) =>
+                            {
+                                println!(
+                                    "Perp grid re-entry: position {} cannot safely support the replacement ladder; converging to target {target}.",
+                                    snapshot.account.position.size
+                                );
+                                // A replacement is about to create a new full ladder. Reuse the
+                                // guarded bootstrap path to establish the ladder's initial state.
+                                perp_runtime.bootstrap_status = journal::PerpBootstrapStatus::Pending;
+                                perp_runtime.bootstrap_target_position = Some(target);
                             }
-                            check_cancel!();
-                            tokio::time::sleep(config.refresh).await;
-                            continue;
+                            Some(target) => {
+                                exec_plan.perp_blocked_reason = Some(format!(
+                                    "Perp grid re-entry blocked: target position {target} exceeds GRID_MAX_POSITION"
+                                ));
+                            }
+                            None => {
+                                exec_plan.perp_blocked_reason = Some(
+                                    "Perp grid re-entry blocked: replacement plan has no target position"
+                                        .to_owned(),
+                                );
+                            }
                         }
                     }
-                    } // end if !skip_convergence
+                    match perp_runtime.bootstrap_status {
+                        journal::PerpBootstrapStatus::Pending => {
+                            let Some(target) = perp_runtime.bootstrap_target_position else {
+                                let reason =
+                                    "Perp bootstrap blocked: locked target is missing".to_owned();
+                                perp_runtime.block_bootstrap();
+                                exec_plan.perp_blocked_reason = Some(reason.clone());
+                                eprintln!("{reason}");
+                                perp_runtime.accounting = perp_accounting.clone();
+                                run_state.perp_runtime = Some(perp_runtime.clone());
+                                if let Some(journal) = &journal {
+                                    journal.save_state(&run_state)?;
+                                }
+                                continue;
+                            };
+                            let bootstrap_state = decibel_grid_tui::strategy::perp::convergence::perp_convergence_plan(
+                                snapshot.account.position.size,
+                                target,
+                                snapshot.market.lot_size,
+                            );
+                            if !perp_runtime.requires_bootstrap_convergence(
+                                snapshot.account.position.size,
+                                snapshot.market.lot_size,
+                            ) {
+                                println!(
+                                    "Perp bootstrap completed without market convergence: position {} already matches locked target {}.",
+                                    bootstrap_state.current, target
+                                );
+                                perp_runtime.complete_bootstrap();
+                            } else {
+                                let mut bootstrap_plan = exec_plan.clone();
+                                bootstrap_plan.target_position = Some(target);
+                                bootstrap_plan.convergence_delta = Some(bootstrap_state.delta);
+                                match decibel_grid_tui::strategy::perp::runtime::run_perp_convergence(
+                                    &settings.network,
+                                    &api,
+                                    &settings.aptos_private_key,
+                                    &settings.subaccount,
+                                    &snapshot.market,
+                                    &bootstrap_plan,
+                                    &config.spot,
+                                    gas_station,
+                                )
+                                .await
+                                {
+                                    Ok(convergence) => {
+                                        println!(
+                                            "Perp bootstrap convergence: position {} -> locked target {} (delta {})",
+                                            convergence.current, convergence.target, convergence.delta
+                                        );
+                                        perp_runtime.complete_bootstrap();
+                                        let account = api
+                                            .account(Some(&settings.subaccount), &snapshot.market)
+                                            .await?;
+                                        exec_plan =
+                                            decibel_grid_tui::strategy::perp::runtime::finalize_perp_executable_plan(
+                                                &config,
+                                                exec_plan,
+                                                account.position.size,
+                                                account.available_margin,
+                                            )?;
+                                        snapshot.account = account;
+                                    }
+                                    Err(error) => {
+                                        let reason = format!("Perp bootstrap blocked: convergence failed: {error:#}");
+                                        perp_runtime.block_bootstrap();
+                                        eprintln!("{reason}");
+                                        if let Some(journal) = &journal {
+                                            let event = journal::JournalEvent::RiskRejected {
+                                                at: Utc::now(),
+                                                reason: reason.clone(),
+                                            };
+                                            journal.append(&event)?;
+                                            run_state.apply(&event);
+                                        }
+                                        perp_runtime.accounting = perp_accounting.clone();
+                                        run_state.perp_runtime = Some(perp_runtime.clone());
+                                        if let Some(journal) = &journal {
+                                            journal.save_state(&run_state)?;
+                                        }
+                                        continue;
+                                    }
+                                }
+                            }
+                            perp_runtime.accounting = perp_accounting.clone();
+                            run_state.perp_runtime = Some(perp_runtime.clone());
+                            if let Some(journal) = &journal {
+                                journal.save_state(&run_state)?;
+                            }
+                        }
+                        journal::PerpBootstrapStatus::Completed => {
+                            println!(
+                                "Perp grid replacement: no market convergence after completed bootstrap."
+                            );
+                        }
+                        journal::PerpBootstrapStatus::Blocked
+                        | journal::PerpBootstrapStatus::LegacyUnknown => {
+                            let reason = "Perp bootstrap blocked; refusing automatic grid submission until operator restarts or explicitly retries".to_owned();
+                            exec_plan.perp_blocked_reason = Some(reason.clone());
+                            eprintln!("{reason}");
+                        }
+                    }
                 } // end Perp convergence block
 
                 // Spot bulk orders source PFS only. On replacement, the existing bulk escrow is
@@ -979,6 +1381,8 @@ pub async fn run_cli(
                                     snapshot.account.position.size,
                                     snapshot.account.available_margin,
                                     snapshot.market.lot_size,
+                                    perp_runtime.bootstrap_status
+                                        == journal::PerpBootstrapStatus::Pending,
                                 )
                         {
                             decibel_grid_tui::strategy::perp::runtime::record_perp_risk_rejection(
@@ -986,19 +1390,125 @@ pub async fn run_cli(
                                 journal.as_ref(),
                                 &mut run_state,
                             )?;
+                        } else if run_state.bulk_ladder.as_ref().is_some_and(|ladder| {
+                            matches!(
+                                ladder.state,
+                                journal::BulkLadderState::IntentRecorded
+                                    | journal::BulkLadderState::BroadcastPending
+                                    | journal::BulkLadderState::BroadcastUnknown
+                                    | journal::BulkLadderState::Committed
+                                    | journal::BulkLadderState::CancelPending
+                                    | journal::BulkLadderState::Diverged
+                            )
+                        }) {
+                            let ladder = run_state.bulk_ladder.as_ref().expect("checked above");
+                            eprintln!(
+                                "BULK LIFECYCLE BLOCKED: operation {} is {:?}; refusing another replacement until recovery resolves it",
+                                ladder.operation_id, ladder.state
+                            );
                         } else {
-                            match execute_bulk_grid(
-                                &settings.network,
-                                &settings.api_key,
-                                &settings.aptos_private_key,
-                                &settings.subaccount,
-                                &snapshot.market,
+                            let observed = api
+                                .active_bulk_ladder(&settings.subaccount, &snapshot.market)
+                                .await?;
+                            let sequence = api
+                                .next_bulk_sequence(
+                                    &settings.subaccount,
+                                    &snapshot.market.address,
+                                    snapshot.market.product,
+                                )
+                                .await?;
+                            let intent = bulk_ladder_intent(
+                                format!(
+                                    "{}:{}:{}",
+                                    snapshot.market.address,
+                                    sequence,
+                                    Utc::now().timestamp_millis()
+                                ),
+                                snapshot.market.product,
+                                snapshot.market.address.clone(),
+                                sequence,
+                                observed.as_ref().map(|ladder| ladder.sequence),
                                 &exec_plan,
-                                gas_station,
+                                &snapshot.market,
+                            )?;
+                            let operation_id = intent.operation_id.clone();
+                            let journal = journal.as_ref().ok_or_else(|| {
+                                anyhow::anyhow!(
+                                    "live bulk execution requires a durable journal before broadcast"
+                                )
+                            })?;
+                            let intent_event = journal::JournalEvent::BulkIntentRecorded {
+                                at: Utc::now(),
+                                ladder: intent.clone(),
+                            };
+                            journal.append(&intent_event)?;
+                            run_state.apply(&intent_event);
+                            journal.save_state(&run_state)?;
+
+                            match execute_bulk_grid_with_broadcast(
+                                BulkGridExecutionRequest {
+                                    network: &settings.network,
+                                    api_key: &settings.api_key,
+                                    private_key: &settings.aptos_private_key,
+                                    subaccount: &settings.subaccount,
+                                    market: &snapshot.market,
+                                    plan: &exec_plan,
+                                    expected_sequence: Some(sequence),
+                                    gas_station,
+                                },
+                                |transaction_hash| {
+                                    let broadcast = journal::JournalEvent::BulkBroadcast {
+                                        at: Utc::now(),
+                                        operation_id: operation_id.clone(),
+                                        transaction_hash: transaction_hash.to_owned(),
+                                    };
+                                    journal.append(&broadcast)?;
+                                    run_state.apply(&broadcast);
+                                    journal.save_state(&run_state)
+                                },
                             )
                             .await
                             {
                                 Ok(execution) => {
+                                    let mut venue_observed = false;
+                                    for _ in 0..6 {
+                                        if api
+                                            .active_bulk_ladder(
+                                                &settings.subaccount,
+                                                &snapshot.market,
+                                            )
+                                            .await?
+                                            .is_some_and(|active| active.matches(&intent))
+                                        {
+                                            venue_observed = true;
+                                            break;
+                                        }
+                                        tokio::time::sleep(Duration::from_secs(1)).await;
+                                    }
+                                    if !venue_observed {
+                                        let blocked = journal::JournalEvent::BulkLifecycleBlocked {
+                                            at: Utc::now(),
+                                            operation_id,
+                                            reason: format!(
+                                                "transaction {} committed but /bulk_orders did not expose expected sequence {} and levels",
+                                                execution.transaction_hash, execution.bulk_sequence
+                                            ),
+                                        };
+                                        journal.append(&blocked)?;
+                                        run_state.apply(&blocked);
+                                        journal.save_state(&run_state)?;
+                                        eprintln!(
+                                            "BULK LIFECYCLE BLOCKED: committed ladder was not observed; automatic replacement paused."
+                                        );
+                                        continue;
+                                    }
+                                    let observed_event = journal::JournalEvent::BulkVenueObserved {
+                                        at: Utc::now(),
+                                        operation_id,
+                                    };
+                                    journal.append(&observed_event)?;
+                                    run_state.apply(&observed_event);
+                                    journal.save_state(&run_state)?;
                                     consecutive_bulk_failures = 0;
                                     last_bulk_replacement_at = Some(tokio::time::Instant::now());
                                     last_submitted_level_count =
@@ -1010,28 +1520,40 @@ pub async fn run_cli(
                                         execution.transaction_hash
                                     );
                                     if let Some(runtime) = &engine_runtime {
-                                        let ladder = decibel_grid_tui::control::ladder_from_submitted_plan(
-                                            &exec_plan,
-                                        );
+                                        let ladder =
+                                            decibel_grid_tui::control::ladder_from_submitted_plan(
+                                                &exec_plan,
+                                            );
                                         runtime
                                             .update_status(|status| {
                                                 status.ladder = ladder;
                                             })
                                             .await;
                                     }
-                                    if let Some(journal) = &journal {
-                                        let event = journal::JournalEvent::BulkOrderSubmitted {
-                                            at: Utc::now(),
-                                            transaction_hash: execution.transaction_hash,
-                                            bid_count: execution.bid_count,
-                                            ask_count: execution.ask_count,
-                                        };
-                                        journal.append(&event)?;
-                                        run_state.apply(&event);
-                                        journal.save_state(&run_state)?;
-                                    }
+                                    let event = journal::JournalEvent::BulkOrderSubmitted {
+                                        at: Utc::now(),
+                                        transaction_hash: execution.transaction_hash,
+                                        bid_count: execution.bid_count,
+                                        ask_count: execution.ask_count,
+                                    };
+                                    journal.append(&event)?;
+                                    run_state.apply(&event);
+                                    journal.save_state(&run_state)?;
                                 }
                                 Err(error) => {
+                                    // `execute_bulk_grid` may fail after a broadcast timeout, so
+                                    // retrying with another sequence could create two ladders. Keep
+                                    // the intent durable and require recovery to prove the outcome.
+                                    let blocked = journal::JournalEvent::BulkLifecycleBlocked {
+                                        at: Utc::now(),
+                                        operation_id,
+                                        reason: format!(
+                                            "bulk submission outcome is unresolved after intent was recorded: {error:#}"
+                                        ),
+                                    };
+                                    journal.append(&blocked)?;
+                                    run_state.apply(&blocked);
+                                    journal.save_state(&run_state)?;
                                     consecutive_bulk_failures =
                                         consecutive_bulk_failures.saturating_add(1);
                                     eprintln!(
@@ -1039,15 +1561,13 @@ pub async fn run_cli(
                                         consecutive_bulk_failures,
                                         config.spot.max_consecutive_bulk_failures
                                     );
-                                    if let Some(journal) = &journal {
-                                        let event = journal::JournalEvent::BulkOrderFailed {
-                                            at: Utc::now(),
-                                            error: format!("{error:#}"),
-                                        };
-                                        journal.append(&event)?;
-                                        run_state.apply(&event);
-                                        journal.save_state(&run_state)?;
-                                    }
+                                    let event = journal::JournalEvent::BulkOrderFailed {
+                                        at: Utc::now(),
+                                        error: format!("{error:#}"),
+                                    };
+                                    journal.append(&event)?;
+                                    run_state.apply(&event);
+                                    journal.save_state(&run_state)?;
                                     if consecutive_bulk_failures
                                         >= config.spot.max_consecutive_bulk_failures
                                     {
@@ -1058,15 +1578,13 @@ pub async fn run_cli(
                                         eprintln!(
                                             "FAILURE CIRCUIT BREAKER: {reason}; cancelling ladder and pausing."
                                         );
-                                        if let Some(journal) = &journal {
-                                            let event = journal::JournalEvent::RiskRejected {
-                                                at: Utc::now(),
-                                                reason,
-                                            };
-                                            journal.append(&event)?;
-                                            run_state.apply(&event);
-                                            journal.save_state(&run_state)?;
-                                        }
+                                        let event = journal::JournalEvent::RiskRejected {
+                                            at: Utc::now(),
+                                            reason,
+                                        };
+                                        journal.append(&event)?;
+                                        run_state.apply(&event);
+                                        journal.save_state(&run_state)?;
                                         match spot_lifecycle::cancel_bulk_ladder(
                                             &settings.network,
                                             &settings.aptos_private_key,
@@ -1109,6 +1627,14 @@ pub async fn run_cli(
                     event = spot_event_rx.recv() => match event {
                         Some(events::SpotEvent::BulkFill(fill)) => {
                             println!("Spot bulk fill {} {} at {}; reconciling immediately.", fill.size, fill.market_addr, fill.price);
+                            if run_state
+                                .processed_spot_fill_uids
+                                .iter()
+                                .any(|uid| uid == &fill.event_uid)
+                            {
+                                println!("Ignoring duplicate Spot bulk fill event {}.", fill.event_uid);
+                                break;
+                            }
                             if let Some(runtime) = &engine_runtime {
                                 let message = format!("fill: {} {} at {}", fill.size, fill.market_addr, fill.price);
                                 runtime.update_status(|status| {
@@ -1117,16 +1643,40 @@ pub async fn run_cli(
                                 }).await;
                             }
                             if let Some(journal) = &journal {
+                                let operation_id = run_state
+                                    .bulk_ladder
+                                    .as_ref()
+                                    .map(|ladder| ladder.operation_id.clone())
+                                    .unwrap_or_else(|| "unknown".to_owned());
+                                let attribution = run_state
+                                    .bulk_ladder
+                                    .as_mut()
+                                    .ok_or_else(|| anyhow::anyhow!("Spot bulk fill arrived with no local bulk ladder"))
+                                    .and_then(|ladder| apply_spot_fill_to_ladder(ladder, &fill));
                                 let event = journal::JournalEvent::SpotFill {
                                     at: Utc::now(),
-                                    market: fill.market_addr,
+                                    market: fill.market_addr.clone(),
                                     price: fill.price.normalize().to_string(),
                                     size: fill.size.normalize().to_string(),
-                                    side: fill.side,
-                                    event_uid: fill.event_uid,
+                                    side: fill.side.clone(),
+                                    event_uid: fill.event_uid.clone(),
+                                    bulk_sequence_number: fill.bulk_sequence_number.clone(),
+                                    order_id: fill.order_id.clone(),
+                                    fee: fill.fee.map(|fee| fee.normalize().to_string()),
+                                    venue_timestamp: fill.timestamp.clone(),
                                 };
                                 journal.append(&event)?;
                                 run_state.apply(&event);
+                                if let Err(error) = attribution {
+                                    let blocked = journal::JournalEvent::BulkLifecycleBlocked {
+                                        at: Utc::now(),
+                                        operation_id,
+                                        reason: format!("Spot fill could not be attributed safely: {error:#}"),
+                                    };
+                                    journal.append(&blocked)?;
+                                    run_state.apply(&blocked);
+                                    eprintln!("BULK LIFECYCLE BLOCKED: Spot fill attribution failed: {error:#}");
+                                }
                                 journal.save_state(&run_state)?;
                             }
                             break;
@@ -1190,30 +1740,50 @@ pub async fn run_cli(
                     println!(
                         "Exit policy is SELL: cancelling the ladder and liquidating assets..."
                     );
-                    match exit_sell_assets(
-                        &settings.network,
-                        &settings.api_key,
-                        &settings.aptos_private_key,
-                        &settings.subaccount,
-                        &market,
-                        (market.product == Product::Spot).then(|| {
-                            (
+                    if market.product == Product::Perp {
+                        match decibel_grid_tui::strategy::perp::runtime::cancel_and_flatten_perp(
+                            &settings.network,
+                            &api,
+                            &settings.aptos_private_key,
+                            &settings.subaccount,
+                            &market,
+                            &config.spot,
+                            gas_station,
+                        )
+                        .await
+                        {
+                            Ok(result) => println!(
+                                "Perp exit completed: cancelled {} and position {} -> {}",
+                                result.cancel_transaction_hash,
+                                result.position_before,
+                                result.position_after
+                            ),
+                            Err(error) => eprintln!("Perp exit failed: {error:#}"),
+                        }
+                    } else {
+                        match exit_sell_assets(
+                            &settings.network,
+                            &settings.api_key,
+                            &settings.aptos_private_key,
+                            &settings.subaccount,
+                            &market,
+                            Some((
                                 &config.spot,
                                 spot_fee_rates
                                     .as_ref()
                                     .expect("live Spot execution fetched fee rates"),
-                            )
-                        }),
-                        gas_station,
-                    )
-                    .await
-                    {
-                        Ok(hashes) => println!(
-                            "Exit cleanup completed: {} transaction(s): {:?}",
-                            hashes.len(),
-                            hashes
-                        ),
-                        Err(error) => eprintln!("Exit cleanup failed: {error:#}"),
+                            )),
+                            gas_station,
+                        )
+                        .await
+                        {
+                            Ok(hashes) => println!(
+                                "Exit cleanup completed: {} transaction(s): {:?}",
+                                hashes.len(),
+                                hashes
+                            ),
+                            Err(error) => eprintln!("Exit cleanup failed: {error:#}"),
+                        }
                     }
                 }
                 ExitAssetPolicy::Retain => {

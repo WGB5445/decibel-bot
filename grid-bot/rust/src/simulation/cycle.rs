@@ -163,6 +163,7 @@ fn run_perp_offline_cycle(input: OfflineCycleInput) -> Result<OfflineCycleOutput
         position,
         input.account.available_margin,
         market.lot_size,
+        true,
     );
     let paused = plan.paused_by_out_of_range;
     Ok(OfflineCycleOutput {

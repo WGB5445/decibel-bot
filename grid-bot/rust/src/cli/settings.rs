@@ -40,7 +40,7 @@ pub enum Cmd {
     Status,
     /// Verify API access, market rules, a generated plan, balances, and order drift. Never changes orders.
     Doctor,
-    /// Monitor a grid; with -e it submits a fresh bulk ladder after every successful refresh.
+    /// Monitor a grid; with -e it submits the initial ladder and replaces only missing levels.
     Run,
     /// Stop one grid now: cancel its ladder, then retain assets or liquidate according to the
     /// runtime --exit-asset-policy argument.

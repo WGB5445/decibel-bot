@@ -6,10 +6,9 @@
 
 use crate::{
     client::{ClientCommand, EngineClient},
-    control::{EngineStatus, ExitMode, LadderLevel},
+    control::{EngineStatus, ExitMode, LadderLevel, PerpPnlStatus},
     monitor_log::{
-        LogPanelState, MIN_LOG_WIDTH, MIN_MAIN_WIDTH, fold_log_line, render_log_panel,
-        split_layout,
+        LogPanelState, MIN_LOG_WIDTH, MIN_MAIN_WIDTH, fold_log_line, render_log_panel, split_layout,
     },
 };
 use anyhow::{Context, Result};
@@ -448,9 +447,7 @@ fn page_step(term_height: u16) -> usize {
 fn main_viewport_height(term_height: u16, is_perp: bool) -> usize {
     let header_height = if is_perp { 6 } else { 5 };
     // Header + footer + main-panel borders.
-    term_height
-        .saturating_sub(header_height + 3 + 2)
-        .max(1) as usize
+    term_height.saturating_sub(header_height + 3 + 2).max(1) as usize
 }
 
 fn snapshot_lines(
@@ -473,6 +470,19 @@ fn snapshot_lines(
                     .fg(Color::Cyan)
                     .add_modifier(Modifier::BOLD),
             ));
+        }
+    }
+    if let Some(pnl) = &status.perp_pnl {
+        lines.push(Line::styled(
+            "PERP ACCOUNTING",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ));
+        for row in perp_accounting_text(pnl) {
+            for wrapped in fold_log_line(&row, main_width as usize) {
+                lines.push(Line::from(wrapped));
+            }
         }
     }
 
@@ -521,9 +531,7 @@ fn snapshot_lines(
     } else if !recent_log_errors.is_empty() {
         lines.push(Line::styled(
             "ENGINE LOG ERRORS (latest)",
-            Style::default()
-                .fg(Color::Red)
-                .add_modifier(Modifier::BOLD),
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
         ));
         for error in recent_log_errors {
             append_wrapped_error(&mut lines, error, main_width as usize);
@@ -599,7 +607,8 @@ fn snapshot_lines(
             ));
         } else {
             for event in status.events.iter().rev().take(MAX_RENDERED_EVENTS) {
-                let event_rows = fold_log_line(&event.message, (main_width as usize).saturating_sub(10));
+                let event_rows =
+                    fold_log_line(&event.message, (main_width as usize).saturating_sub(10));
                 for (index, row) in event_rows.into_iter().enumerate() {
                     let prefix = if index == 0 {
                         event.at.format("%H:%M:%S").to_string()
@@ -723,7 +732,9 @@ fn ladder_line(level: &LadderLevel, columns: LadderColumns) -> Line<'static> {
         .add_modifier(Modifier::BOLD);
     let state = display_state(&level.state);
     let state_style = if state == "Active" {
-        Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)
+        Style::default()
+            .fg(Color::Green)
+            .add_modifier(Modifier::BOLD)
     } else if state == "Planned" {
         Style::default().fg(Color::Yellow)
     } else if state == "Unmanaged" || state == "Cancelled" {
@@ -804,15 +815,17 @@ fn perp_summary_text(status: &EngineStatus) -> Option<String> {
     let mode = status.perp_mode.as_deref()?;
     let position = status.position.as_deref().unwrap_or("-");
     let target = status.target_position.as_deref().unwrap_or("-");
+    let bootstrap = status.perp_bootstrap_status.as_deref().unwrap_or("-");
     let delta = status.convergence_delta.as_deref().unwrap_or("-");
     let max_position = status.max_position.as_deref().unwrap_or("-");
     let available = status.available_margin.as_deref().unwrap_or("-");
     let estimated = status.estimated_margin.as_deref().unwrap_or("-");
     Some(format!(
-        "Perp: {}  pos={}  target={}  Δ={}  max={}  margin={}/{} USDC",
+        "Perp: {}  pos={}  bootstrap-target={}  bootstrap={}  Δ={}  max={}  margin={}/{} USDC",
         mode.to_ascii_uppercase(),
         position,
         target,
+        bootstrap,
         delta,
         max_position,
         available,
@@ -820,10 +833,60 @@ fn perp_summary_text(status: &EngineStatus) -> Option<String> {
     ))
 }
 
+fn perp_accounting_text(pnl: &PerpPnlStatus) -> [String; 3] {
+    let unavailable = "unavailable";
+    let net = pnl.net_pnl_quote.as_deref().unwrap_or(unavailable);
+    let unrealized = pnl.unrealized_gross_quote.as_deref().unwrap_or(unavailable);
+    let fees = pnl.trade_fees_quote.as_deref().unwrap_or(unavailable);
+    let funding = pnl.funding_pnl_quote.as_deref().unwrap_or(unavailable);
+    let last_fill = pnl
+        .last_fill_at
+        .map(|time| time.format("%Y-%m-%d %H:%M:%S UTC").to_string())
+        .unwrap_or_else(|| "-".to_owned());
+    let last_funding = pnl
+        .last_funding_at
+        .map(|time| time.format("%Y-%m-%d %H:%M:%S UTC").to_string())
+        .unwrap_or_else(|| "-".to_owned());
+    [
+        format!(
+            "Position exchange/ledger/delta: {}/{}/{}  avg entry: {}  mark: {}",
+            pnl.exchange_position_base,
+            pnl.ledger_position_base,
+            pnl.reconciliation_delta_base,
+            pnl.average_entry_price.as_deref().unwrap_or(unavailable),
+            pnl.mark_price.as_deref().unwrap_or(unavailable),
+        ),
+        format!(
+            "PnL gross realized/unrealized: {}/{}  trade fees: {}  funding: {}  net: {}",
+            pnl.realized_gross_quote, unrealized, fees, funding, net,
+        ),
+        format!(
+            "Accounting completeness: fees={} funding={}  last fill: {}  last funding: {}",
+            if pnl.fees_complete {
+                "complete"
+            } else {
+                "missing"
+            },
+            if pnl.funding_complete {
+                "complete"
+            } else {
+                "unavailable"
+            },
+            last_fill,
+            last_funding,
+        ),
+    ]
+}
+
 fn perp_summary_line(status: &EngineStatus) -> Option<Line<'static>> {
     let mode = status.perp_mode.as_deref()?;
     let position = status.position.as_deref().unwrap_or("-").to_owned();
     let target = status.target_position.as_deref().unwrap_or("-").to_owned();
+    let bootstrap = status
+        .perp_bootstrap_status
+        .as_deref()
+        .unwrap_or("-")
+        .to_owned();
     let delta = status
         .convergence_delta
         .as_deref()
@@ -840,10 +903,11 @@ fn perp_summary_line(status: &EngineStatus) -> Option<Line<'static>> {
         Span::styled("Perp: ", Style::default().fg(Color::DarkGray)),
         Span::styled(
             format!(
-                "{} pos/target={}/{} Δ={} margin={}/{} oor={}{}{}",
+                "{} pos/bootstrap-target={}/{} bootstrap={} Δ={} margin={}/{} oor={}{}{}",
                 mode.to_ascii_uppercase(),
                 position,
                 target,
+                bootstrap,
                 delta,
                 available,
                 estimated,
@@ -1139,7 +1203,7 @@ fn render(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::control::EngineEvent;
+    use crate::control::{EngineEvent, PerpPnlStatus};
     use chrono::Utc;
 
     fn level(side: &str, price: &str) -> LadderLevel {
@@ -1167,6 +1231,36 @@ mod tests {
         assert!(snapshot.contains("pos=0.002"));
         assert!(snapshot.contains("max=0.01"));
         assert!(snapshot.contains("margin=120/500 USDC"));
+    }
+
+    #[test]
+    fn snapshot_labels_incomplete_perp_pnl_without_fabricating_a_net_value() {
+        let status = EngineStatus {
+            perp_mode: Some("neutral".to_owned()),
+            perp_pnl: Some(PerpPnlStatus {
+                exchange_position_base: "1".to_owned(),
+                ledger_position_base: "1".to_owned(),
+                reconciliation_delta_base: "0".to_owned(),
+                average_entry_price: Some("100".to_owned()),
+                mark_price: Some("105".to_owned()),
+                unrealized_gross_quote: Some("5".to_owned()),
+                realized_gross_quote: "2".to_owned(),
+                trade_fees_quote: Some("1".to_owned()),
+                funding_pnl_quote: None,
+                net_pnl_quote: None,
+                fees_complete: true,
+                funding_complete: false,
+                last_fill_at: None,
+                last_funding_at: None,
+            }),
+            ..EngineStatus::default()
+        };
+
+        let snapshot = snapshot_plain_text(&status, true, 120);
+        assert!(snapshot.contains("PERP ACCOUNTING"));
+        assert!(snapshot.contains("gross realized/unrealized: 2/5"));
+        assert!(snapshot.contains("net: unavailable"));
+        assert!(snapshot.contains("funding=unavailable"));
     }
 
     #[test]
@@ -1284,7 +1378,11 @@ mod tests {
             .position(|line| line.to_string() == "Last engine error:")
             .expect("error header");
         assert!(lines.len() > header + 2);
-        assert!(lines[header + 1].to_string().starts_with("simulation failed"));
+        assert!(
+            lines[header + 1]
+                .to_string()
+                .starts_with("simulation failed")
+        );
     }
 
     #[test]
