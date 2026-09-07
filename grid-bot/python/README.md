@@ -700,22 +700,25 @@ python grid_bot.py perp --preview --perp-mode neutral
 
 程序会把当前仓位和当前网格所有潜在同向成交纳入检查。超过限制时会取消网格，不会自动平仓。
 
-### `long`：做多/买入累积网格
+### `long` / `short` / `neutral`：双边网格 + 推导目标仓位
+
+> **语义变更：** Long/Short 不再只挂单边。三种模式都会在区间内生成同一套双边档位，由 `planning_price` 划分 bid/ask，并按档位计数推导 `target_position`。请重新 `simulate` / `preview`，不要沿用旧单边场景结果。
+
+| 模式 | `target_position` |
+| --- | --- |
+| `long` | `ask_levels × grid_size` |
+| `short` | `-bid_levels × grid_size` |
+| `neutral` | `(ask_levels - bid_levels) × grid_size / 2` |
+
+Rust 常驻引擎会在每次提交 bulk 前尝试 IOC 收敛到 `target`，失败则 blocked。Python 版本目前共享规划、舍入、target、worst-case 风控与越界动作契约，但**尚未实现目标仓位 IOC convergence**；方向仓位不满足约束时会保守撤梯，不会提交 bulk。
+
+Python 实盘循环已支持统一越界动作：`pause` 保留现有梯子和仓位，`cancel_orders` 撤梯保仓，`close_position` 撤梯后提交 reduce-only IOC 平仓，`clamp_continue` 仅在显式配置时按边界继续。默认仍为 `pause`。
 
 ```bash
 python grid_bot.py perp --preview --perp-mode long
 ```
 
-行为：
-
-- 只挂 Bid；
-- 价格下跌时分层买入；
-- 成交后增加多仓；
-- 不自动生成上方止盈 Ask。
-
-这个模式适合你有独立止盈或回补逻辑的场景。它不是完整的自动网格闭环，不能只看当前挂单计算最终收益。
-
-必须配置仓位限制：
+建议配置仓位限制与越界动作：
 
 ```bash
 python grid_bot.py perp \
@@ -724,20 +727,7 @@ python grid_bot.py perp \
   --dry-run
 ```
 
-### `short`：做空/卖出累积网格
-
-```bash
-python grid_bot.py perp --preview --perp-mode short
-```
-
-行为：
-
-- 只挂 Ask；
-- 价格上涨时分层开空；
-- 成交后增加空仓；
-- 不自动生成下方回补 Bid。
-
-必须有独立的止损、回补和平仓方案。
+环境变量 `GRID_OUT_OF_RANGE_ACTION` 可选：`pause` | `cancel_orders` | `close_position` | `clamp_continue`。
 
 ---
 

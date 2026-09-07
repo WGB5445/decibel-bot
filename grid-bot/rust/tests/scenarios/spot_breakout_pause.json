@@ -1,0 +1,34 @@
+{
+  "name": "spot_breakout_pause",
+  "product": "spot",
+  "config": {
+    "total_count": 8,
+    "range": { "kind": "bounds", "lower": "0.45", "upper": "0.65" },
+    "allocation": { "kind": "fixed_size", "value": "0.1" },
+    "range_breakout_action": "pause_and_alert"
+  },
+  "market": {
+    "name": "TEST/USDC",
+    "tick_size": "0.01",
+    "lot_size": "0.01",
+    "min_size": "0.01"
+  },
+  "steps": [
+    {
+      "mid": "0.55",
+      "expect": {
+        "bid_count": 4,
+        "ask_count": 4,
+        "spot_breakout": false,
+        "paused": false
+      }
+    },
+    {
+      "mid": "0.40",
+      "expect": {
+        "spot_breakout": true,
+        "paused": true
+      }
+    }
+  ]
+}

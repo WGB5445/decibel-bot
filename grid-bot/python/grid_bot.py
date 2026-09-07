@@ -27,11 +27,14 @@ from dotenv import load_dotenv
 
 Product = Literal["spot", "perp"]
 PerpMode = Literal["neutral", "long", "short"]
+OutOfRangeAction = Literal["pause", "cancel_orders", "close_position", "clamp_continue"]
 PriceSource = Literal["depth", "prices"]
 RangeMode = Literal["bounds", "percent", "step"]
 MAX_BULK_LEVELS_PER_SIDE = 40
 BULK_REPLACEMENT_COOLDOWN_SECONDS = 30.0
 MAX_TAKER_FUNDING_ATTEMPTS = 6
+PERP_CANCEL_CONFIRM_ATTEMPTS = 6
+PERP_CANCEL_CONFIRM_INTERVAL_SECONDS = 1.0
 TAKER_SLIPPAGE = Decimal("0.003")
 TAKER_FEE_BUFFER = Decimal("0.001")
 LOG = logging.getLogger("decibel_grid")
@@ -60,6 +63,7 @@ class GridConfig:
     maker_fee_rate: Decimal | None
     preview_leverage: Decimal
     price_source: PriceSource
+    out_of_range_action: OutOfRangeAction
     dry_run: bool
     log_file: str | None = None
     spot_funding_amount: Decimal | None = None
@@ -156,6 +160,9 @@ class GridConfig:
                 args.preview_leverage or os.getenv("PREVIEW_LEVERAGE", "1"),
             ),
             price_source=str(first_set(args.price_source, "PRICE_SOURCE", "depth")),
+            out_of_range_action=str(
+                first_set(args.out_of_range_action, "GRID_OUT_OF_RANGE_ACTION", "pause")
+            ),
             dry_run=args.dry_run or os.getenv("DRY_RUN", "false").lower() == "true",
             log_file=(
                 str(first_set(args.log_file, "LOG_FILE"))
@@ -190,8 +197,18 @@ class GridConfig:
             )
         if config.lower_price is not None and config.lower_price >= config.upper_price:
             raise ValueError("GRID_LOWER_PRICE must be less than GRID_UPPER_PRICE")
-        if config.total_grid_count is not None and not 2 <= config.total_grid_count <= 80:
-            raise ValueError("GRID_TOTAL_COUNT must be between 2 and 80")
+        if config.total_grid_count is not None and not 2 <= config.total_grid_count <= 40:
+            raise ValueError("GRID_TOTAL_COUNT must be between 2 and 40")
+        if config.out_of_range_action not in (
+            "pause",
+            "cancel_orders",
+            "close_position",
+            "clamp_continue",
+        ):
+            raise ValueError(
+                "GRID_OUT_OF_RANGE_ACTION must be pause, cancel_orders, close_position, "
+                "or clamp_continue"
+            )
         if config.range_percent is not None and config.range_percent >= 100:
             raise ValueError("GRID_RANGE_PERCENT must be below 100")
         if config.grid_step_percent is not None and config.grid_step_percent >= 100:
@@ -217,6 +234,51 @@ class GridOrders:
     bid_sizes: list[Decimal]
     ask_prices: list[Decimal]
     ask_sizes: list[Decimal]
+
+
+@dataclass(frozen=True)
+class PerpOutOfRangeDecision:
+    raw_planning_price: Decimal
+    effective_planning_price: Decimal
+    action: OutOfRangeAction
+    direction: Literal["below", "above"] | None
+    skip_bulk: bool
+    paused: bool
+    cancel_orders: bool
+    close_position: bool
+
+
+def perp_out_of_range_decision(
+    config: GridConfig, planning_price: Decimal
+) -> PerpOutOfRangeDecision:
+    """Resolve one unified Perp out-of-range action without implicit clamping."""
+    total = config.total_grid_count or config.levels_per_side * 2
+    lower, upper = resolve_range(config, planning_price, total)
+    direction: Literal["below", "above"] | None = None
+    if planning_price < lower:
+        direction = "below"
+    elif planning_price > upper:
+        direction = "above"
+    if direction is None:
+        return PerpOutOfRangeDecision(
+            planning_price, planning_price, config.out_of_range_action,
+            None, False, False, False, False,
+        )
+    if config.out_of_range_action == "clamp_continue":
+        return PerpOutOfRangeDecision(
+            planning_price, min(max(planning_price, lower), upper),
+            config.out_of_range_action, direction, False, False, False, False,
+        )
+    return PerpOutOfRangeDecision(
+        planning_price,
+        planning_price,
+        config.out_of_range_action,
+        direction,
+        True,
+        config.out_of_range_action == "pause",
+        config.out_of_range_action in ("cancel_orders", "close_position"),
+        config.out_of_range_action == "close_position",
+    )
 
 
 @dataclass(frozen=True)
@@ -301,11 +363,11 @@ class GridMath:
         min_size: Decimal,
         maker_fee_rate: Decimal = Decimal(0),
     ) -> GridOrders:
-        """Build a centered grid, with at most 40 price levels on either side.
-
-        Bid vectors are descending and ask vectors ascending, as required by Decibel's Move
-        bulk-order validation. A narrower range than the tick size can yield fewer levels.
-        """
+        """Build a centered grid with bilateral Perp inclusion or Spot side allocation."""
+        if config.product == "perp":
+            return build_perp_orders(
+                config, mid, tick_size, lot_size, min_size, maker_fee_rate
+            )
         bid_count, ask_count = grid_side_counts(config)
         lower, upper = resolve_range(config, mid, max(bid_count, ask_count))
         if not lower < mid < upper:
@@ -356,13 +418,6 @@ class GridMath:
             raise ValueError(
                 f"a Decibel bulk order supports at most {MAX_BULK_LEVELS_PER_SIDE} levels per side"
             )
-
-        # Bulk orders do not have a reduce-only flag. Directional perp modes are deliberately
-        # single-sided: long places only bids; short places only asks. Neutral is two-sided.
-        if config.product == "perp" and config.perp_mode == "long":
-            asks = []
-        elif config.product == "perp" and config.perp_mode == "short":
-            bids = []
 
         bid_size, ask_size = order_sizes_for_budget(
             config, mid, bids, asks, lot_size, min_size, maker_fee_rate
@@ -427,20 +482,174 @@ class GridMath:
 
 
 def grid_side_counts(config: GridConfig) -> tuple[int, int]:
-    """Return requested bid/ask counts before tick rounding.
-
-    GRID_TOTAL_COUNT means the combined number of actual orders. For an odd neutral count,
-    the extra order is allocated to asks. Directional perp grids use the whole count on their
-    enabled side; a dummy opposite-side level is generated then discarded to reuse validation.
-    """
+    """Return requested bid/ask counts before tick rounding for Spot grids."""
     if config.total_grid_count is None:
         return config.levels_per_side, config.levels_per_side
-    if config.product == "perp" and config.perp_mode == "long":
-        return config.total_grid_count, 1
-    if config.product == "perp" and config.perp_mode == "short":
-        return 1, config.total_grid_count
     bid_count = config.total_grid_count // 2
     return bid_count, config.total_grid_count - bid_count
+
+
+def uniform_range_prices(
+    lower: Decimal, upper: Decimal, count: int, tick_size: Decimal
+) -> list[Decimal]:
+    if count == 0:
+        return []
+    span = upper - lower
+    if span <= 0:
+        raise ValueError("grid lower bound must be below upper bound")
+    if count == 1:
+        prices = [quantize_down(lower + span / Decimal(2), tick_size)]
+    else:
+        # `count` is the requested number of price points, not intervals.
+        denom = Decimal(count - 1)
+        prices = [
+            quantize_down(lower + span * Decimal(index) / denom, tick_size)
+            for index in range(count)
+        ]
+    prices = sorted(set(prices))
+    if len(prices) != count:
+        raise ValueError(
+            f"grid range is too narrow for {count} distinct price points at "
+            f"market tick size {tick_size}"
+        )
+    return prices
+
+
+def split_uniform_levels(
+    config: GridConfig,
+    lower: Decimal,
+    upper: Decimal,
+    planning_price: Decimal,
+    tick_size: Decimal,
+) -> tuple[list[Decimal], list[Decimal]]:
+    total = config.total_grid_count or config.levels_per_side * 2
+    prices = uniform_range_prices(lower, upper, total, tick_size)
+    bids: list[Decimal] = []
+    asks: list[Decimal] = []
+    for price in prices:
+        if abs(price - planning_price) <= tick_size / 2:
+            continue
+        if price < planning_price and price not in asks:
+            bids.append(price)
+        elif price > planning_price and price not in bids:
+            asks.append(price)
+    return sorted(bids, reverse=True), sorted(asks)
+
+
+def compute_perp_target(
+    perp_mode: PerpMode, ask_levels: int, bid_levels: int, grid_size: Decimal
+) -> Decimal:
+    if perp_mode == "long":
+        return Decimal(ask_levels) * grid_size
+    if perp_mode == "short":
+        return -Decimal(bid_levels) * grid_size
+    return Decimal(ask_levels - bid_levels) * grid_size / 2
+
+
+def perp_theoretical_limits(
+    config: GridConfig, ask_levels: int, bid_levels: int, grid_size: Decimal
+) -> tuple[Decimal, Decimal]:
+    if config.max_position is not None:
+        return config.max_position, config.max_position
+    total = ask_levels + bid_levels
+    if config.perp_mode == "long":
+        return Decimal(total) * grid_size, Decimal(0)
+    if config.perp_mode == "short":
+        return Decimal(0), Decimal(total) * grid_size
+    max_side = Decimal(total) * grid_size / 2
+    return max_side, max_side
+
+
+def perp_worst_case(position: Decimal, orders: GridOrders) -> tuple[Decimal, Decimal]:
+    bid_sum = sum(orders.bid_sizes, Decimal(0))
+    ask_sum = sum(orders.ask_sizes, Decimal(0))
+    return position + bid_sum, position - ask_sum
+
+
+def perp_position_is_safe(
+    config: GridConfig,
+    position: Decimal,
+    orders: GridOrders,
+) -> bool:
+    ask_levels = len(orders.ask_prices)
+    bid_levels = len(orders.bid_prices)
+    grid_size = orders.bid_sizes[0] if orders.bid_sizes else (
+        orders.ask_sizes[0] if orders.ask_sizes else Decimal(0)
+    )
+    max_long, max_short = perp_theoretical_limits(config, ask_levels, bid_levels, grid_size)
+    worst_long, worst_short = perp_worst_case(position, orders)
+    if config.perp_mode == "long":
+        return worst_short >= 0 and worst_long <= max_long
+    if config.perp_mode == "short":
+        return worst_long <= 0 and worst_short >= -max_short
+    return worst_long <= max_long and worst_short >= -max_short
+
+
+def build_perp_orders(
+    config: GridConfig,
+    planning_price: Decimal,
+    tick_size: Decimal,
+    lot_size: Decimal,
+    min_size: Decimal,
+    maker_fee_rate: Decimal,
+) -> GridOrders:
+    decision = perp_out_of_range_decision(config, planning_price)
+    total = config.total_grid_count or config.levels_per_side * 2
+    lower, upper = resolve_range(config, planning_price, total)
+    if decision.skip_bulk:
+        return GridOrders([], [], [], [])
+    planning_price = decision.effective_planning_price
+    bids, asks = split_uniform_levels(config, lower, upper, planning_price, tick_size)
+    if len(bids) > MAX_BULK_LEVELS_PER_SIDE or len(asks) > MAX_BULK_LEVELS_PER_SIDE:
+        raise ValueError(
+            f"a Decibel bulk order supports at most {MAX_BULK_LEVELS_PER_SIDE} levels per side"
+        )
+    bid_size, ask_size = order_sizes_for_budget(
+        config, planning_price, bids, asks, lot_size, min_size, maker_fee_rate
+    )
+    grid_size = bid_size if bids else ask_size
+    return GridOrders([*bids], [grid_size] * len(bids), [*asks], [grid_size] * len(asks))
+
+
+def trim_perp_pending_to_risk(
+    config: GridConfig, position: Decimal, orders: GridOrders
+) -> GridOrders:
+    """Trim farthest pending levels only; the caller's target remains unchanged."""
+    bids = list(zip(orders.bid_prices, orders.bid_sizes, strict=True))
+    asks = list(zip(orders.ask_prices, orders.ask_sizes, strict=True))
+    while bids or asks:
+        candidate = GridOrders(
+            [price for price, _ in bids],
+            [size for _, size in bids],
+            [price for price, _ in asks],
+            [size for _, size in asks],
+        )
+        if perp_position_is_safe(config, position, candidate):
+            return candidate
+        grid_size = (
+            candidate.bid_sizes[0]
+            if candidate.bid_sizes
+            else candidate.ask_sizes[0] if candidate.ask_sizes else Decimal(0)
+        )
+        max_long, max_short = perp_theoretical_limits(
+            config, len(candidate.ask_prices), len(candidate.bid_prices), grid_size
+        )
+        worst_long, worst_short = perp_worst_case(position, candidate)
+        long_violation = worst_long > max_long or (
+            config.perp_mode == "short" and worst_long > 0
+        )
+        short_violation = worst_short < -max_short or (
+            config.perp_mode == "long" and worst_short < 0
+        )
+        if long_violation and bids:
+            bids.pop()  # descending bids: remove farthest/lowest first
+        elif short_violation and asks:
+            asks.pop()  # ascending asks: remove farthest/highest first
+        elif bids:
+            bids.pop()
+        elif asks:
+            asks.pop()
+    return GridOrders([], [], [], [])
 
 
 def resolve_range(
@@ -472,8 +681,9 @@ def order_sizes_for_budget(
     """Derive a uniform size for each side, or validate an explicit fixed size.
 
     A spot budget is split 50/50 between quote reserved for bids (fee buffer included)
-    and quote-equivalent base inventory for asks. A perp budget is a conservative
-    total margin budget under PREVIEW_LEVERAGE, not a promise of exchange acceptance.
+    and quote-equivalent base inventory for asks. A perp budget covers the maximum position
+    after all levels fill on both sides plus pending notional for fees, using
+    total_levels × representative_price (matching Rust `derive_perp_grid_size`).
     """
     if config.order_size is not None:
         size = quantize_down(config.order_size, lot_size)
@@ -495,15 +705,17 @@ def order_sizes_for_budget(
         bid_size = half_budget / bid_denominator if bids else Decimal(0)
         ask_size = half_budget / ask_denominator if asks else Decimal(0)
     else:
-        bid_notional = sum(bids, Decimal(0))
-        ask_notional = sum(asks, Decimal(0))
-        margin_per_base = (
-            max(bid_notional, ask_notional) / config.preview_leverage
-            + (bid_notional + ask_notional) * maker_fee_rate
-        )
-        if margin_per_base <= 0:
+        total_levels = len(bids) + len(asks)
+        if total_levels == 0:
             raise ValueError("cannot derive size from an empty grid")
-        bid_size = ask_size = config.total_budget / margin_per_base
+        representative_price = asks[0] if asks else bids[-1]
+        denominator = (
+            Decimal(total_levels) * representative_price / config.preview_leverage
+            + Decimal(total_levels) * representative_price * maker_fee_rate
+        )
+        if denominator <= 0:
+            raise ValueError("cannot derive size from an empty grid")
+        bid_size = ask_size = config.total_budget / denominator
 
     bid_size = quantize_down(bid_size, lot_size) if bids else Decimal(0)
     ask_size = quantize_down(ask_size, lot_size) if asks else Decimal(0)
@@ -760,7 +972,27 @@ class GridBot:
                             await self._fund_spot_base_if_needed()
                         except Exception:
                             LOG.exception("Spot base funding failed; ask side will be shrunk")
-                    orders = await self._build_orders()
+                    planning_price = await self._mid_price()
+                    if self.config.product == "perp":
+                        decision = perp_out_of_range_decision(self.config, planning_price)
+                        if decision.direction is not None:
+                            LOG.warning(
+                                "Perp planning price %s is %s the configured range; "
+                                "GRID_OUT_OF_RANGE_ACTION=%s",
+                                decision.raw_planning_price,
+                                decision.direction,
+                                decision.action,
+                            )
+                        if decision.skip_bulk:
+                            if decision.cancel_orders:
+                                await executor.cancel()
+                            if decision.close_position:
+                                if decision.cancel_orders:
+                                    await self._wait_for_bulk_orders_cleared()
+                                await self._close_perp_position_ioc()
+                            await asyncio.sleep(self.config.refresh_seconds)
+                            continue
+                    orders = await self._build_orders(planning_price=planning_price)
                     if self.config.product == "spot":
                         funds = await self._spot_funds()
                         fee = await self._maker_fee_rate()
@@ -943,9 +1175,13 @@ class GridBot:
             MAX_TAKER_FUNDING_ATTEMPTS,
         )
 
-    async def _build_orders(self, maker_fee_rate: Decimal | None = None) -> GridOrders:
+    async def _build_orders(
+        self,
+        maker_fee_rate: Decimal | None = None,
+        planning_price: Decimal | None = None,
+    ) -> GridOrders:
         assert self.market is not None
-        mid = await self._mid_price()
+        mid = planning_price if planning_price is not None else await self._mid_price()
         fee = maker_fee_rate if maker_fee_rate is not None else await self._maker_fee_rate()
         return GridMath.orders(
             self.config,
@@ -954,6 +1190,73 @@ class GridBot:
             chain_units_to_decimal(self.market.lot_size, self.market.sz_decimals),
             chain_units_to_decimal(self.market.min_size, self.market.sz_decimals),
             fee,
+        )
+
+    async def _wait_for_bulk_orders_cleared(self) -> None:
+        """Poll until no active bulk ladder remains before reduce-only closes."""
+        assert self.read is not None and self.market is not None and self.subaccount
+        if self.config.dry_run:
+            return
+        for attempt in range(1, PERP_CANCEL_CONFIRM_ATTEMPTS + 1):
+            rows = await self.read.user_bulk_orders.get_by_addr(
+                sub_addr=self.subaccount,
+                market=self.market.market_addr,
+                asset_type=self.config.product,
+            )
+            active = [row for row in rows if row.cancellation_reason is None]
+            if not active:
+                return
+            if attempt == PERP_CANCEL_CONFIRM_ATTEMPTS:
+                raise ValueError(
+                    f"Perp bulk cancellation was committed but {len(active)} order(s) "
+                    f"remain active after {PERP_CANCEL_CONFIRM_ATTEMPTS} confirmation "
+                    "attempts; refusing market close"
+                )
+            await asyncio.sleep(PERP_CANCEL_CONFIRM_INTERVAL_SECONDS)
+
+    async def _close_perp_position_ioc(self) -> None:
+        """Cancel-first, reduce-only IOC flatten for close_position OOR action."""
+        assert self.read is not None and self.write is not None
+        assert self.market is not None and self.subaccount
+        positions = await self.read.user_positions.get_by_addr(
+            sub_addr=self.subaccount, market_addr=self.market.market_addr
+        )
+        position = next(
+            (item for item in positions if item.market == self.market.market_addr), None
+        )
+        current = Decimal(str(position.size)) if position else Decimal(0)
+        if current == 0:
+            return
+        if self.config.dry_run:
+            LOG.info("[dry-run] would IOC-flatten Perp position %s", current)
+            return
+        depth = await self.read.market_depth.get_by_addr(self.market.market_addr, limit=1)
+        is_buy = current < 0
+        levels = depth.asks if is_buy else depth.bids
+        if not levels:
+            raise ValueError("cannot close Perp position: executable book side is empty")
+        reference = Decimal(str(levels[0].price))
+        raw_price = reference * (Decimal("1.003") if is_buy else Decimal("0.997"))
+        tick = chain_units_to_decimal(self.market.tick_size, self.market.px_decimals)
+        lot = chain_units_to_decimal(self.market.lot_size, self.market.sz_decimals)
+        price = quantize_down(raw_price, tick)
+        size = quantize_down(abs(current), lot)
+        if size <= 0:
+            return
+        result = await self.write.place_order(
+            market_name=self.market.market_name,
+            price=scale_to_chain_units(price, self.market.px_decimals),
+            size=scale_to_chain_units(size, self.market.sz_decimals),
+            is_buy=is_buy,
+            time_in_force=TimeInForce.ImmediateOrCancel,
+            is_reduce_only=True,
+            subaccount_addr=self.subaccount,
+            tick_size=self.market.tick_size,
+        )
+        LOG.info(
+            "Perp out-of-range close IOC submitted: position=%s tx=%s",
+            current,
+            getattr(result, "transaction_hash", ""),
         )
 
     async def _mid_price(self) -> Decimal:
@@ -1128,8 +1431,6 @@ class GridBot:
 
     async def _position_is_safe(self, orders: GridOrders) -> bool:
         assert self.read is not None and self.market is not None and self.subaccount
-        if self.config.max_position is None:
-            return True
         positions = await self.read.user_positions.get_by_addr(
             sub_addr=self.subaccount, market_addr=self.market.market_addr
         )
@@ -1137,13 +1438,7 @@ class GridBot:
             (item for item in positions if item.market == self.market.market_addr), None
         )
         current = Decimal(str(position.size)) if position else Decimal(0)
-        worst_long = current + sum(orders.bid_sizes, Decimal(0))
-        worst_short = current - sum(orders.ask_sizes, Decimal(0))
-        return (
-            abs(current) < self.config.max_position
-            and abs(worst_long) <= self.config.max_position
-            and abs(worst_short) <= self.config.max_position
-        )
+        return perp_position_is_safe(self.config, current, orders)
 
     async def _bulk_matches(self, orders: GridOrders) -> bool:
         """Reconcile the desired ladder against the latest active bulk row."""
@@ -1284,7 +1579,7 @@ def parse_args() -> tuple[Product, argparse.Namespace]:
     parser.add_argument(
         "--grid-count",
         type=int,
-        help="total combined Bid+Ask order count (2-80); overrides --levels-per-side",
+        help="total combined Bid+Ask order count (2-40); overrides --levels-per-side",
     )
     parser.add_argument("--order-size", help="fixed size per order in base units")
     parser.add_argument(
@@ -1302,6 +1597,11 @@ def parse_args() -> tuple[Product, argparse.Namespace]:
     )
     parser.add_argument(
         "--perp-mode", choices=("neutral", "long", "short"), help="perp grid direction"
+    )
+    parser.add_argument(
+        "--out-of-range-action",
+        choices=("pause", "cancel_orders", "close_position", "clamp_continue"),
+        help="Perp range action; default GRID_OUT_OF_RANGE_ACTION or pause",
     )
     parser.add_argument("--maker-fee-rate", help="decimal maker fee override, e.g. 0.0001")
     parser.add_argument(

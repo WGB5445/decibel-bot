@@ -6,7 +6,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use aptos_sdk::{
     Aptos, AptosConfig,
     account::Ed25519Account,
-    transaction::{InputEntryFunctionData, TransactionBuilder, move_none, sign_transaction},
+    transaction::{InputEntryFunctionData, TransactionBuilder, move_none},
     types::AccountAddress,
 };
 use chrono::{DateTime, Utc};
@@ -21,16 +21,28 @@ use tokio_tungstenite::{
     tungstenite::{Message, client::IntoClientRequest, http::HeaderValue},
 };
 
+pub mod aptos_tx;
+pub mod attach_tui;
+pub mod client;
+pub mod control;
 pub mod events;
+pub mod geomi;
 pub mod i18n;
 pub mod journal;
+pub mod monitor_log;
+pub mod network;
+pub mod process_lock;
 pub mod profile;
 pub mod reconcile;
+pub mod simulation;
 pub mod spot_lifecycle;
 pub mod spot_taker;
+pub mod strategy;
+
+pub use geomi::GasStationConfig;
 
 /// Decibel's per-side protocol limit. This is separate from the bot policy below.
-pub const MAX_LEVELS_PER_SIDE: usize = 30;
+pub const MAX_LEVELS_PER_SIDE: usize = 40;
 /// User policy: a Spot grid may have at most forty levels across both sides.
 pub const MAX_TOTAL_LEVELS: usize = 40;
 const EXIT_SETTLE_POLL_ATTEMPTS: usize = 6;
@@ -56,7 +68,7 @@ pub fn validate_api_key_format(api_key: &str) -> Result<()> {
     Ok(())
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum, serde::Serialize, serde::Deserialize)]
 pub enum Product {
     Spot,
     Perp,
@@ -87,10 +99,26 @@ pub enum RangeBreakoutAction {
     ExtendGrid,
 }
 
+/// Perp-only action when [`planning_price`](GridPlan::planning_price) leaves the configured grid
+/// range. Default is [`Pause`](Self::Pause); [`ClampContinue`](Self::ClampContinue) must be set
+/// explicitly — the bot never clamps silently.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum, Default)]
+pub enum OutOfRangeAction {
+    #[default]
+    #[value(name = "pause")]
+    Pause,
+    #[value(name = "cancel_orders")]
+    CancelOrders,
+    #[value(name = "close_position")]
+    ClosePosition,
+    #[value(name = "clamp_continue")]
+    ClampContinue,
+}
+
 #[derive(Clone, Debug)]
 pub struct SpotExecutionConfig {
-    /// Explicit per-side inventory budgets. When omitted, the legacy total-budget allocation is
-    /// used; when supplied, each side is independently sized from its real Spot asset budget.
+    /// Spot inventory caps used once to derive a single fixed per-grid base size. Re-centering
+    /// and ladder replacement only validate against these caps; they never re-size a level.
     pub total_quote_budget: Option<Decimal>,
     pub total_base_budget: Option<Decimal>,
     pub min_net_margin_bps: Decimal,
@@ -170,6 +198,11 @@ pub struct GridConfig {
     pub refresh: Duration,
     pub price_source: PriceSource,
     pub spot: SpotExecutionConfig,
+    /// Perp-only absolute position cap. When set, live execution refuses plans that would breach
+    /// current or worst-case exposure after resting bids/asks fill.
+    pub max_position: Option<Decimal>,
+    /// Perp-only behaviour when planning price is outside the resolved grid range.
+    pub out_of_range_action: OutOfRangeAction,
 }
 
 impl GridConfig {
@@ -184,14 +217,6 @@ impl GridConfig {
     pub fn validate(&self) -> Result<()> {
         if !(2..=MAX_TOTAL_LEVELS).contains(&self.total_count) {
             bail!("grid count must be between 2 and {MAX_TOTAL_LEVELS}")
-        }
-        if self.product == Product::Perp
-            && self.perp_mode != PerpMode::Neutral
-            && self.total_count > MAX_LEVELS_PER_SIDE
-        {
-            bail!(
-                "directional Perp grids use one side and therefore allow at most {MAX_LEVELS_PER_SIDE} levels"
-            )
         }
         if self.maker_fee_rate.is_sign_negative() || self.maker_fee_rate >= Decimal::ONE {
             bail!("maker fee rate must be >= 0 and < 1")
@@ -386,8 +411,20 @@ pub struct Trade {
 pub struct ExecutionResult {
     pub transaction_hash: String,
     pub product: Product,
+    pub bulk_sequence: u64,
     pub bid_count: usize,
     pub ask_count: usize,
+}
+
+pub struct BulkGridExecutionRequest<'a> {
+    pub network: &'a str,
+    pub api_key: &'a str,
+    pub private_key: &'a str,
+    pub subaccount: &'a str,
+    pub market: &'a Market,
+    pub plan: &'a GridPlan,
+    pub expected_sequence: Option<u64>,
+    pub gas_station: Option<&'a GasStationConfig>,
 }
 
 // Result of the optional automatic Spot base-inventory funding step. The live execution path
@@ -418,7 +455,7 @@ pub struct SpotFundingPlan {
     pub borrowed_from_grid_quote: Decimal,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize)]
 pub struct BulkOrderParameters {
     pub sequence_number: u64,
     pub bid_prices: Vec<u64>,
@@ -427,42 +464,143 @@ pub struct BulkOrderParameters {
     pub ask_sizes: Vec<u64>,
 }
 
-const MAINNET_PACKAGE: &str = "0x50ead22afd6ffd9769e3b3d6e0e64a2a350d68e8b102c4e72e33d0b8cfdfdb06";
-const TESTNET_PACKAGE: &str = "0xe7da2794b1d8af76532ed95f38bfdf1136abfd8ea3a240189971988a83101b7f";
+/// A typed view of the venue's active bulk ladder. It intentionally keeps the venue sequence
+/// separate from synthetic reconciliation IDs, because a bulk level has no individually
+/// cancellable REST order ID.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ActiveBulkLadder {
+    pub product: Product,
+    pub market_address: String,
+    pub sequence: u64,
+    pub levels: Vec<journal::BulkLevelState>,
+}
+
+impl ActiveBulkLadder {
+    pub fn matches(&self, expected: &journal::BulkLadder) -> bool {
+        self.product == expected.product
+            && normalized_address(&self.market_address)
+                == normalized_address(&expected.market_address)
+            && self.sequence == expected.sequence
+            && self.levels == expected.levels
+    }
+}
+
+/// Build the durable expectation before a bulk transaction is signed. The plan has already been
+/// risk-checked by the caller; this function only captures the exact quantized venue payload.
+pub fn bulk_ladder_intent(
+    operation_id: String,
+    product: Product,
+    market_address: String,
+    sequence: u64,
+    prior_sequence: Option<u64>,
+    plan: &GridPlan,
+    market: &Market,
+) -> Result<journal::BulkLadder> {
+    let bids: Vec<&GridLevel> = plan
+        .bids
+        .iter()
+        .filter(|level| level.state != LevelState::Filled)
+        .collect();
+    let asks: Vec<&GridLevel> = plan
+        .asks
+        .iter()
+        .filter(|level| level.state != LevelState::Filled)
+        .collect();
+    if bids.is_empty() && asks.is_empty() {
+        bail!("refusing to record an empty bulk ladder intent")
+    }
+    let parameters = prepare_bulk_order_parameters(sequence, &bids, &asks, market)?;
+    let mut levels = Vec::with_capacity(bids.len() + asks.len());
+    for (index, (price, size)) in parameters
+        .bid_prices
+        .iter()
+        .zip(&parameters.bid_sizes)
+        .enumerate()
+    {
+        levels.push(journal::BulkLevelState {
+            side: Side::Bid,
+            index,
+            price: scale_raw(Decimal::from(*price), market.px_decimals),
+            original_size: scale_raw(Decimal::from(*size), market.sz_decimals),
+            filled_size: Decimal::ZERO,
+        });
+    }
+    for (index, (price, size)) in parameters
+        .ask_prices
+        .iter()
+        .zip(&parameters.ask_sizes)
+        .enumerate()
+    {
+        levels.push(journal::BulkLevelState {
+            side: Side::Ask,
+            index,
+            price: scale_raw(Decimal::from(*price), market.px_decimals),
+            original_size: scale_raw(Decimal::from(*size), market.sz_decimals),
+            filled_size: Decimal::ZERO,
+        });
+    }
+    Ok(journal::BulkLadder {
+        operation_id,
+        product,
+        market_address,
+        sequence,
+        prior_sequence,
+        levels,
+        intent_at: Utc::now(),
+        transaction_hash: None,
+        cancel_transaction_hash: None,
+        state: journal::BulkLadderState::IntentRecorded,
+    })
+}
+
 /// Decibel's testnet USDC metadata object. Mainnet assets must be supplied explicitly by the
 /// caller because metadata addresses are network-specific.
 pub const TESTNET_USDC_METADATA: &str =
     "0x5428acf5c112826d0c74ae1cd2de9030f53d1d01235e6c2621d967bf914ee1c8";
 
 pub fn package_for_network(network: &str) -> Result<&'static str> {
-    match network.trim().to_ascii_lowercase().as_str() {
-        "mainnet" => Ok(MAINNET_PACKAGE),
-        "testnet" => Ok(TESTNET_PACKAGE),
-        other => bail!("unsupported execution network {other}; expected mainnet or testnet"),
-    }
+    Ok(network::default_registry()
+        .resolve(network)?
+        .package_address)
 }
 
-fn aptos_for_network(network: &str) -> Result<Aptos> {
-    Ok(Aptos::new(
-        match network.trim().to_ascii_lowercase().as_str() {
-            "mainnet" => AptosConfig::mainnet(),
-            "testnet" => AptosConfig::testnet(),
-            other => bail!("unsupported execution network {other}; expected mainnet or testnet"),
-        },
-    )?)
+pub fn aptos_for_network(network: &str) -> Result<Aptos> {
+    let profile = network::default_registry().resolve(network)?;
+    network::default_registry().aptos(profile)
+}
+
+/// Returns false when worst-case exposure or mode direction constraints would be breached.
+pub fn perp_position_is_safe(position: Decimal, plan: &GridPlan, config: &GridConfig) -> bool {
+    strategy::perp::risk::perp_position_is_safe(position, plan, config)
 }
 
 /// Build, sign, submit, and wait for an official Spot or Perp bulk order transaction.
 /// Spot: reads real PFS balances and refuses to alter a pinned grid if funding is insufficient.
 /// Perp: submitted as-configured (no automatic adjustment).
-pub async fn execute_bulk_grid(
-    network: &str,
-    api_key: &str,
-    private_key: &str,
-    subaccount: &str,
-    market: &Market,
-    plan: &GridPlan,
-) -> Result<ExecutionResult> {
+pub async fn execute_bulk_grid(request: BulkGridExecutionRequest<'_>) -> Result<ExecutionResult> {
+    execute_bulk_grid_with_broadcast(request, |_| Ok(())).await
+}
+
+/// As [`execute_bulk_grid`], but invokes `on_broadcast` immediately after the transaction hash is
+/// returned and before waiting for commitment. The live engine uses this to durably record an
+/// otherwise ambiguous broadcast.
+pub async fn execute_bulk_grid_with_broadcast<F>(
+    request: BulkGridExecutionRequest<'_>,
+    on_broadcast: F,
+) -> Result<ExecutionResult>
+where
+    F: FnOnce(&str) -> Result<()>,
+{
+    let BulkGridExecutionRequest {
+        network,
+        api_key,
+        private_key,
+        subaccount,
+        market,
+        plan,
+        expected_sequence,
+        gas_station,
+    } = request;
     let subaccount_str = subaccount.trim();
     if subaccount_str.is_empty() {
         bail!("subaccount address is required for live execution")
@@ -501,9 +639,14 @@ pub async fn execute_bulk_grid(
             )
         }
     }
-    let sequence = client
-        .next_bulk_sequence(subaccount_str, &market.address, market.product)
-        .await?;
+    let sequence = match expected_sequence {
+        Some(sequence) => sequence,
+        None => {
+            client
+                .next_bulk_sequence(subaccount_str, &market.address, market.product)
+                .await?
+        }
+    };
     let key = normalize_private_key(private_key)?;
     let signer =
         Ed25519Account::from_private_key_hex(&key).context("invalid Aptos Ed25519 private key")?;
@@ -511,16 +654,8 @@ pub async fn execute_bulk_grid(
         .parse()
         .context("invalid subaccount address")?;
     let market_addr: AccountAddress = market.address.parse().context("invalid market address")?;
-    let network_name = network.trim().to_ascii_lowercase();
-    let package = match network_name.as_str() {
-        "mainnet" => MAINNET_PACKAGE,
-        "testnet" => TESTNET_PACKAGE,
-        other => bail!("unsupported execution network {other}; expected mainnet or testnet"),
-    };
-    let aptos = Aptos::new(match network_name.as_str() {
-        "mainnet" => AptosConfig::mainnet(),
-        _ => AptosConfig::testnet(),
-    })?;
+    let package = package_for_network(network)?;
+    let aptos = aptos_for_network(network)?;
     let bids: Vec<&GridLevel> = execution_plan
         .bids
         .iter()
@@ -588,23 +723,24 @@ pub async fn execute_bulk_grid(
         .max_gas_amount(max_gas_amount)
         .gas_unit_price(gas_price)
         .chain_id(chain_id)
-        .expiration_from_now(600)
+        .expiration_from_now(aptos_tx::expiration_seconds(gas_station))
         .build()
-        .context("build Perp bulk-order transaction with 0.5 APT gas cap")?;
-    let signed = sign_transaction(&raw, &signer).with_context(|| {
-        format!("sign {product_label} bulk-order transaction ({entry_function})")
-    })?;
-    let response = aptos
-        .submit_and_wait(&signed, Some(Duration::from_secs(60)))
-        .await
-        .with_context(|| {
-            format!(
-                "submit {product_label} bulk-order transaction ({entry_function}); signer={} subaccount={} market={} required_permission={required_permission}",
-                signer.address(), subaccount_str, market.address
-            )
-        })?;
+        .context("build bulk-order transaction")?;
+    let response = aptos_tx::submit_raw_and_wait_with_broadcast(
+        &aptos,
+        raw,
+        &signer,
+        gas_station,
+        &format!(
+            "submit {product_label} bulk-order transaction ({entry_function}); signer={} subaccount={} market={} required_permission={required_permission}",
+            signer.address(),
+            subaccount_str,
+            market.address
+        ),
+        on_broadcast,
+    )
+    .await?;
     if !response
-        .data
         .get("success")
         .and_then(Value::as_bool)
         .unwrap_or(false)
@@ -612,7 +748,6 @@ pub async fn execute_bulk_grid(
         bail!(
             "Perp bulk-order transaction failed: {}",
             response
-                .data
                 .get("vm_status")
                 .and_then(Value::as_str)
                 .unwrap_or("unknown VM status")
@@ -620,12 +755,12 @@ pub async fn execute_bulk_grid(
     }
     Ok(ExecutionResult {
         transaction_hash: response
-            .data
             .get("hash")
             .and_then(Value::as_str)
             .unwrap_or_default()
             .to_owned(),
         product: market.product,
+        bulk_sequence: sequence,
         bid_count: bids.len(),
         ask_count: asks.len(),
     })
@@ -653,6 +788,7 @@ pub async fn exit_sell_assets(
     subaccount: &str,
     market: &Market,
     spot_guard: Option<(&SpotExecutionConfig, &SpotFeeRates)>,
+    gas_station: Option<&GasStationConfig>,
 ) -> Result<Vec<String>> {
     let client = DecibelClient::new(network, api_key)?;
     let package = package_for_network(network)?;
@@ -678,7 +814,7 @@ pub async fn exit_sell_assets(
     }
     let max_gas_amount = 50_000_000u64 / gas_price;
     let chain_id = aptos.ensure_chain_id().await?;
-    let mut sequence = aptos.get_sequence_number(signer.address()).await?;
+    let sequence = aptos.get_sequence_number(signer.address()).await?;
     let mut hashes = Vec::new();
 
     println!(
@@ -702,25 +838,23 @@ pub async fn exit_sell_assets(
         .max_gas_amount(max_gas_amount)
         .gas_unit_price(gas_price)
         .chain_id(chain_id)
-        .expiration_from_now(600)
+        .expiration_from_now(aptos_tx::expiration_seconds(gas_station))
         .build()?;
-    let response = aptos
-        .submit_and_wait(
-            &sign_transaction(&raw, &signer)?,
-            Some(Duration::from_secs(60)),
-        )
-        .await
-        .context("submit exit bulk cancellation transaction")?;
-    sequence = sequence.saturating_add(1);
+    let response = aptos_tx::submit_raw_and_wait(
+        &aptos,
+        raw,
+        &signer,
+        gas_station,
+        "submit exit bulk cancellation transaction",
+    )
+    .await?;
     if response
-        .data
         .get("success")
         .and_then(Value::as_bool)
         .unwrap_or(false)
     {
         hashes.push(
             response
-                .data
                 .get("hash")
                 .and_then(Value::as_str)
                 .unwrap_or_default()
@@ -730,7 +864,6 @@ pub async fn exit_sell_assets(
         bail!(
             "exit bulk cancellation failed; refusing liquidation while the ladder may remain live: {}",
             response
-                .data
                 .get("vm_status")
                 .and_then(Value::as_str)
                 .unwrap_or("unknown status")
@@ -762,10 +895,6 @@ pub async fn exit_sell_assets(
             "  settle poll {attempt}/{EXIT_SETTLE_POLL_ATTEMPTS}: {observed} -> {settled} released"
         );
     }
-    let book = client
-        .order_book(market, 1)
-        .await
-        .context("refresh order book for exit cleanup")?;
     match market.product {
         Product::Spot => {
             let Some(funds) = account.spot_funds else {
@@ -794,6 +923,7 @@ pub async fn exit_sell_assets(
                     None,
                     fees,
                     guard_config,
+                    gas_station,
                 )
                 .await
                 .context("execute guarded Spot liquidation")?;
@@ -805,6 +935,10 @@ pub async fn exit_sell_assets(
             } else {
                 // Compatibility path for the interactive TUI, which does not yet have a live
                 // fee-rate fetch. CLI execution always supplies the guarded policy above.
+                let book = client
+                    .order_book(market, 1)
+                    .await
+                    .context("refresh order book for Spot exit cleanup")?;
                 let reference = book
                     .bids
                     .first()
@@ -819,6 +953,7 @@ pub async fn exit_sell_assets(
                     price,
                     quantity,
                     false,
+                    gas_station,
                 )
                 .await
                 .context("submit Spot IOC liquidation order")?;
@@ -831,75 +966,19 @@ pub async fn exit_sell_assets(
             if position == Decimal::ZERO {
                 println!("Exit cleanup: Perp position is already flat; nothing to close.");
             } else {
-                let reference = if position.is_sign_negative() {
-                    book.asks.first()
-                } else {
-                    book.bids.first()
-                }
-                .ok_or_else(|| anyhow!("cannot close Perp: executable book side is empty"))?;
-                let price = if position.is_sign_negative() {
-                    round_up(reference.price * Decimal::new(1003, 3), market.tick_size)
-                } else {
-                    round_down(reference.price * Decimal::new(997, 3), market.tick_size)
-                };
-                let entry = format!("{package}::dex_accounts_entry::place_order_to_subaccount");
-                let payload = InputEntryFunctionData::new(&entry)
-                    .arg(subaccount_addr)
-                    .arg(market_addr)
-                    .arg(scale_chain_amount(price, market.px_decimals)?)
-                    .arg(scale_chain_amount(position.abs(), market.sz_decimals)?)
-                    .arg(position.is_sign_negative())
-                    .arg(2u8)
-                    .arg(true)
-                    .arg_raw(move_none())
-                    .arg_raw(move_none())
-                    .arg_raw(move_none())
-                    .arg_raw(move_none())
-                    .arg_raw(move_none())
-                    .arg_raw(move_none())
-                    .arg_raw(move_none())
-                    .arg_raw(move_none())
-                    .build()
-                    .context("build reduce-only Perp exit transaction")?;
-                let raw = TransactionBuilder::new()
-                    .sender(signer.address())
-                    .sequence_number(sequence)
-                    .payload(payload)
-                    .max_gas_amount(max_gas_amount)
-                    .gas_unit_price(gas_price)
-                    .chain_id(chain_id)
-                    .expiration_from_now(600)
-                    .build()?;
-                let response = aptos
-                    .submit_and_wait(
-                        &sign_transaction(&raw, &signer)?,
-                        Some(Duration::from_secs(60)),
-                    )
-                    .await?;
-                if response
-                    .data
-                    .get("success")
-                    .and_then(Value::as_bool)
-                    .unwrap_or(false)
-                {
-                    hashes.push(
-                        response
-                            .data
-                            .get("hash")
-                            .and_then(Value::as_str)
-                            .unwrap_or_default()
-                            .to_owned(),
-                    );
-                } else {
-                    bail!(
-                        "Perp exit transaction failed: {}",
-                        response
-                            .data
-                            .get("vm_status")
-                            .and_then(Value::as_str)
-                            .unwrap_or("unknown status")
-                    );
-                }
+                let hash = submit_perp_market_order(
+                    network,
+                    private_key,
+                    subaccount,
+                    market,
+                    position.abs(),
+                    position.is_sign_negative(),
+                    true,
+                    gas_station,
+                )
+                .await?;
+                println!("Exit cleanup: Perp market close submitted in tx {hash}");
+                hashes.push(hash);
             }
         }
     }
@@ -1054,6 +1133,7 @@ pub async fn fund_spot_base_for_grid(
     subaccount: &str,
     market: &Market,
     plan: &GridPlan,
+    gas_station: Option<&GasStationConfig>,
 ) -> Result<SpotFundingResult> {
     if market.product != Product::Spot {
         bail!("automatic base funding is only available for Spot markets")
@@ -1065,7 +1145,15 @@ pub async fn fund_spot_base_for_grid(
     let client = DecibelClient::new(network, api_key)?;
     // An older build could have left a resting POST_ONLY funding bid. That order is standalone,
     // so it would block bulk replacement; clear any locally recorded one before funding.
-    cancel_recorded_spot_funding_order(network, private_key, subaccount, market, &client).await?;
+    cancel_recorded_spot_funding_order(
+        network,
+        private_key,
+        subaccount,
+        market,
+        &client,
+        gas_station,
+    )
+    .await?;
     let initial = client.account(Some(subaccount), market).await?;
     let mut funds = initial.spot_funds.ok_or_else(|| {
         anyhow!(
@@ -1128,6 +1216,7 @@ pub async fn fund_spot_base_for_grid(
             funding.limit_price,
             slice,
             true,
+            gas_station,
         )
         .await
         {
@@ -1225,6 +1314,7 @@ pub async fn fund_spot_quote_for_grid(
     subaccount: &str,
     market: &Market,
     plan: &GridPlan,
+    gas_station: Option<&GasStationConfig>,
 ) -> Result<SpotQuoteFundingResult> {
     if market.product != Product::Spot {
         bail!("automatic quote funding is only available for Spot markets")
@@ -1279,6 +1369,7 @@ pub async fn fund_spot_quote_for_grid(
             funding.limit_price,
             funding.quantity,
             false,
+            gas_station,
         )
         .await?;
         println!(
@@ -1398,6 +1489,7 @@ async fn submit_spot_ioc_order(
     price: Decimal,
     quantity: Decimal,
     is_buy: bool,
+    gas_station: Option<&GasStationConfig>,
 ) -> Result<String> {
     const IOC: u8 = 2;
     const MAX_GAS_OCTAS: u64 = 50_000_000;
@@ -1407,16 +1499,8 @@ async fn submit_spot_ioc_order(
     let subaccount_addr: AccountAddress =
         subaccount.parse().context("invalid subaccount address")?;
     let market_addr: AccountAddress = market.address.parse().context("invalid market address")?;
-    let network = network.trim().to_ascii_lowercase();
-    let package = match network.as_str() {
-        "mainnet" => MAINNET_PACKAGE,
-        "testnet" => TESTNET_PACKAGE,
-        other => bail!("unsupported execution network {other}; expected mainnet or testnet"),
-    };
-    let aptos = Aptos::new(match network.as_str() {
-        "mainnet" => AptosConfig::mainnet(),
-        _ => AptosConfig::testnet(),
-    })?;
+    let package = package_for_network(&network)?;
+    let aptos = aptos_for_network(&network)?;
     let entry_function =
         format!("{package}::dex_accounts_spot_entry::place_spot_order_to_subaccount");
     let payload = InputEntryFunctionData::new(&entry_function)
@@ -1451,17 +1535,18 @@ async fn submit_spot_ioc_order(
         .max_gas_amount(max_gas_amount)
         .gas_unit_price(gas_price)
         .chain_id(aptos.ensure_chain_id().await?)
-        .expiration_from_now(600)
+        .expiration_from_now(aptos_tx::expiration_seconds(gas_station))
         .build()
         .context("build Spot IOC funding transaction with 0.5 APT gas cap")?;
-    let signed = sign_transaction(&raw, &signer)
-        .with_context(|| format!("sign Spot funding transaction ({entry_function})"))?;
-    let response = aptos
-        .submit_and_wait(&signed, Some(Duration::from_secs(60)))
-        .await
-        .with_context(|| format!("submit Spot funding transaction ({entry_function})"))?;
+    let response = aptos_tx::submit_raw_and_wait(
+        &aptos,
+        raw,
+        &signer,
+        gas_station,
+        &format!("submit Spot IOC transaction ({entry_function})"),
+    )
+    .await?;
     if !response
-        .data
         .get("success")
         .and_then(Value::as_bool)
         .unwrap_or(false)
@@ -1469,14 +1554,107 @@ async fn submit_spot_ioc_order(
         bail!(
             "Spot funding transaction failed: {}",
             response
-                .data
                 .get("vm_status")
                 .and_then(Value::as_str)
                 .unwrap_or("unknown VM status")
         )
     }
     Ok(response
+        .get("hash")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_owned())
+}
+
+/// Submit a reduce-only or opening Perp market order via the official dex entry function.
+///
+/// The market-order entry has no price or time-in-force argument. Those belong
+/// to `place_order_to_subaccount`, which is the limit-order ABI and rejects a
+/// zero price. The following eight `Option` arguments are all `none`, so this
+/// is neither a stop order nor a TP/SL order.
+pub(crate) async fn submit_perp_market_order(
+    network: &str,
+    private_key: &str,
+    subaccount: &str,
+    market: &Market,
+    quantity: Decimal,
+    is_buy: bool,
+    reduce_only: bool,
+    gas_station: Option<&GasStationConfig>,
+) -> Result<String> {
+    const MAX_GAS_OCTAS: u64 = 50_000_000;
+    let key = normalize_private_key(private_key)?;
+    let signer =
+        Ed25519Account::from_private_key_hex(&key).context("invalid Aptos Ed25519 private key")?;
+    let subaccount_addr: AccountAddress =
+        subaccount.parse().context("invalid subaccount address")?;
+    let market_addr: AccountAddress = market.address.parse().context("invalid market address")?;
+    let package = package_for_network(network)?;
+    let aptos = aptos_for_network(network)?;
+    let entry_function = format!("{package}::dex_accounts_entry::place_market_order_to_subaccount");
+    let payload = InputEntryFunctionData::new(&entry_function)
+        .arg(subaccount_addr)
+        .arg(market_addr)
+        .arg(scale_chain_amount(quantity, market.sz_decimals)?)
+        .arg(is_buy)
+        .arg(reduce_only)
+        // All optional trigger fields (stop, TP, SL, and remaining ABI slots) are None.
+        .arg_raw(move_none())
+        .arg_raw(move_none())
+        .arg_raw(move_none())
+        .arg_raw(move_none())
+        .arg_raw(move_none())
+        .arg_raw(move_none())
+        .arg_raw(move_none())
+        .arg_raw(move_none())
+        .build()
+        .context("build Perp market-order transaction")?;
+    let sequence_number = aptos.get_sequence_number(signer.address()).await?;
+    let gas_price = aptos
+        .fullnode()
+        .estimate_gas_price()
+        .await?
         .data
+        .recommended();
+    if gas_price == 0 {
+        bail!("Aptos returned a zero gas unit price")
+    }
+    let max_gas_amount = MAX_GAS_OCTAS / gas_price;
+    if max_gas_amount == 0 {
+        bail!("gas price {gas_price} octas exceeds the 0.5 APT transaction cap")
+    }
+    let raw = TransactionBuilder::new()
+        .sender(signer.address())
+        .sequence_number(sequence_number)
+        .payload(payload)
+        .max_gas_amount(max_gas_amount)
+        .gas_unit_price(gas_price)
+        .chain_id(aptos.ensure_chain_id().await?)
+        .expiration_from_now(aptos_tx::expiration_seconds(gas_station))
+        .build()
+        .context("build Perp market-order transaction with 0.5 APT gas cap")?;
+    let response = aptos_tx::submit_raw_and_wait(
+        &aptos,
+        raw,
+        &signer,
+        gas_station,
+        &format!("submit Perp market-order transaction ({entry_function})"),
+    )
+    .await?;
+    if !response
+        .get("success")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        bail!(
+            "Perp market-order transaction failed: {}",
+            response
+                .get("vm_status")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown VM status")
+        )
+    }
+    Ok(response
         .get("hash")
         .and_then(Value::as_str)
         .unwrap_or_default()
@@ -1492,6 +1670,7 @@ async fn cancel_recorded_spot_funding_order(
     subaccount: &str,
     market: &Market,
     client: &DecibelClient,
+    gas_station: Option<&GasStationConfig>,
 ) -> Result<()> {
     let mut store = FundingOrderStore::load()?;
     let Some(record) = store
@@ -1519,7 +1698,15 @@ async fn cancel_recorded_spot_funding_order(
             "Cancelling prior automatic Spot funding order {} for {} before recalculating the grid.",
             order_id, market.name
         );
-        cancel_spot_order(network, private_key, subaccount, market, &order_id).await?;
+        cancel_spot_order(
+            network,
+            private_key,
+            subaccount,
+            market,
+            &order_id,
+            gas_station,
+        )
+        .await?;
     }
     store.remove(network, subaccount, &market.address);
     store.save()?;
@@ -1553,6 +1740,7 @@ async fn cancel_spot_order(
     subaccount: &str,
     market: &Market,
     order_id: &str,
+    gas_station: Option<&GasStationConfig>,
 ) -> Result<()> {
     const MAX_GAS_OCTAS: u64 = 50_000_000;
     let order_id: u128 = order_id.parse().context("Spot order_id is not a u128")?;
@@ -1562,16 +1750,8 @@ async fn cancel_spot_order(
     let subaccount_addr: AccountAddress =
         subaccount.parse().context("invalid subaccount address")?;
     let market_addr: AccountAddress = market.address.parse().context("invalid market address")?;
-    let network = network.trim().to_ascii_lowercase();
-    let package = match network.as_str() {
-        "mainnet" => MAINNET_PACKAGE,
-        "testnet" => TESTNET_PACKAGE,
-        other => bail!("unsupported execution network {other}; expected mainnet or testnet"),
-    };
-    let aptos = Aptos::new(match network.as_str() {
-        "mainnet" => AptosConfig::mainnet(),
-        _ => AptosConfig::testnet(),
-    })?;
+    let package = package_for_network(&network)?;
+    let aptos = aptos_for_network(&network)?;
     let entry_function =
         format!("{package}::dex_accounts_spot_entry::cancel_spot_order_to_subaccount");
     let payload = InputEntryFunctionData::new(&entry_function)
@@ -1600,23 +1780,23 @@ async fn cancel_spot_order(
         .max_gas_amount(max_gas_amount)
         .gas_unit_price(gas_price)
         .chain_id(aptos.ensure_chain_id().await?)
-        .expiration_from_now(600)
+        .expiration_from_now(aptos_tx::expiration_seconds(gas_station))
         .build()
         .context("build Spot funding-order cancellation transaction with 0.5 APT gas cap")?;
-    let signed = sign_transaction(&raw, &signer)
-        .with_context(|| format!("sign Spot funding cancellation ({entry_function})"))?;
-    let response = aptos
-        .submit_and_wait(&signed, Some(Duration::from_secs(60)))
-        .await
-        .with_context(|| format!("submit Spot funding cancellation ({entry_function})"))?;
+    let response = aptos_tx::submit_raw_and_wait(
+        &aptos,
+        raw,
+        &signer,
+        gas_station,
+        &format!("submit Spot funding cancellation ({entry_function})"),
+    )
+    .await?;
     if !response
-        .data
         .get("success")
         .and_then(Value::as_bool)
         .unwrap_or(false)
     {
         let status = response
-            .data
             .get("vm_status")
             .and_then(Value::as_str)
             .unwrap_or("unknown VM status");
@@ -1635,6 +1815,7 @@ pub async fn transfer_spot_cross_pfs(
     subaccount: &str,
     metadata: &str,
     amount: i64,
+    gas_station: Option<&GasStationConfig>,
 ) -> Result<String> {
     submit_spot_account_management_entry(
         network,
@@ -1643,6 +1824,7 @@ pub async fn transfer_spot_cross_pfs(
         subaccount,
         metadata,
         Some(amount),
+        gas_station,
     )
     .await
 }
@@ -1654,6 +1836,7 @@ async fn submit_spot_account_management_entry(
     subaccount: &str,
     metadata: &str,
     amount: Option<i64>,
+    gas_station: Option<&GasStationConfig>,
 ) -> Result<String> {
     let key = normalize_private_key(private_key)?;
     let signer =
@@ -1694,19 +1877,18 @@ async fn submit_spot_account_management_entry(
         .max_gas_amount(max_gas_amount)
         .gas_unit_price(gas_price)
         .chain_id(aptos.ensure_chain_id().await?)
-        .expiration_from_now(600)
+        .expiration_from_now(aptos_tx::expiration_seconds(gas_station))
         .build()
         .context("build Spot account-management transaction with 0.5 APT gas cap")?;
-    let signed = sign_transaction(&raw, &signer)
-        .with_context(|| format!("sign Spot account-management transaction ({entry_function})"))?;
-    let response = aptos
-        .submit_and_wait(&signed, Some(Duration::from_secs(60)))
-        .await
-        .with_context(|| {
-            format!("submit Spot account-management transaction ({entry_function})")
-        })?;
+    let response = aptos_tx::submit_raw_and_wait(
+        &aptos,
+        raw,
+        &signer,
+        gas_station,
+        &format!("submit Spot account-management transaction ({entry_function})"),
+    )
+    .await?;
     if !response
-        .data
         .get("success")
         .and_then(Value::as_bool)
         .unwrap_or(false)
@@ -1714,14 +1896,12 @@ async fn submit_spot_account_management_entry(
         bail!(
             "Spot account-management transaction failed: {}",
             response
-                .data
                 .get("vm_status")
                 .and_then(Value::as_str)
                 .unwrap_or("unknown VM status")
         )
     }
     Ok(response
-        .data
         .get("hash")
         .and_then(Value::as_str)
         .unwrap_or_default()
@@ -1804,7 +1984,7 @@ fn validate_bulk_side(levels: &[&GridLevel], side: Side, market: &Market) -> Res
     Ok(())
 }
 
-fn normalize_private_key(private_key: &str) -> Result<String> {
+pub(crate) fn normalize_private_key(private_key: &str) -> Result<String> {
     let key = private_key.trim();
     if key.is_empty() {
         bail!("Aptos private key is required")
@@ -1831,7 +2011,7 @@ where
         .collect()
 }
 
-fn scale_chain_amount(value: Decimal, decimals: u32) -> Result<u64> {
+pub(crate) fn scale_chain_amount(value: Decimal, decimals: u32) -> Result<u64> {
     if value <= Decimal::ZERO {
         bail!("chain amount must be positive, got {value}")
     }
@@ -1885,11 +2065,63 @@ pub struct GridPlan {
     pub mid: Decimal,
     pub lower: Decimal,
     pub upper: Decimal,
+    /// Spot-only base quantity fixed when a ladder is first created. Re-projections may change
+    /// which side owns a level, but never the quantity assigned to that level.
+    #[serde(default)]
+    pub per_grid_base_size: Option<Decimal>,
     pub bids: Vec<GridLevel>,
     pub asks: Vec<GridLevel>,
     pub quote_required: Decimal,
     pub base_required: Decimal,
     pub estimated_margin: Option<Decimal>,
+    /// Perp planning reference for this cycle (after any explicit clamp).
+    #[serde(default)]
+    pub planning_price: Option<Decimal>,
+    /// Raw planning input before out-of-range handling.
+    #[serde(default)]
+    pub raw_planning_price: Option<Decimal>,
+    /// Derived initial inventory target. The Perp engine locks it only for one-time bootstrap;
+    /// passive grid fills are not subsequently converged back to this value.
+    #[serde(default)]
+    pub target_position: Option<Decimal>,
+    #[serde(default)]
+    pub worst_long: Option<Decimal>,
+    #[serde(default)]
+    pub worst_short: Option<Decimal>,
+    #[serde(default)]
+    pub paused_by_out_of_range: bool,
+    #[serde(default)]
+    pub out_of_range_action_applied: Option<String>,
+    /// `target - current` when convergence is pending.
+    #[serde(default)]
+    pub convergence_delta: Option<Decimal>,
+    #[serde(default)]
+    pub perp_blocked_reason: Option<String>,
+}
+
+impl Default for GridPlan {
+    fn default() -> Self {
+        Self {
+            mid: Decimal::ZERO,
+            lower: Decimal::ZERO,
+            upper: Decimal::ZERO,
+            per_grid_base_size: None,
+            bids: Vec::new(),
+            asks: Vec::new(),
+            quote_required: Decimal::ZERO,
+            base_required: Decimal::ZERO,
+            estimated_margin: None,
+            planning_price: None,
+            raw_planning_price: None,
+            target_position: None,
+            worst_long: None,
+            worst_short: None,
+            paused_by_out_of_range: false,
+            out_of_range_action_applied: None,
+            convergence_delta: None,
+            perp_blocked_reason: None,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -1907,6 +2139,98 @@ impl GridPlan {
         self.bids.iter().chain(self.asks.iter())
     }
 
+    /// Check the operator's Spot budgets against the already-fixed per-grid quantity. Budgets
+    /// never re-size a running ladder; they only reject a geometry that no longer fits.
+    pub fn enforce_spot_budget(&self, config: &GridConfig) -> Result<()> {
+        if config.product != Product::Spot {
+            return Ok(());
+        }
+        let Some(size) = self.per_grid_base_size else {
+            return Ok(());
+        };
+        if size <= Decimal::ZERO {
+            bail!("per_grid_base_size must be positive for a Spot ladder")
+        }
+        if self.all_levels().any(|level| level.size != size) {
+            bail!(
+                "Spot ladder contains a level whose size differs from fixed per_grid_base_size {size}"
+            )
+        }
+        let bid_notional: Decimal = self.bids.iter().map(|level| level.price * size).sum();
+        if let Some(quote_budget) = config.spot.total_quote_budget {
+            if bid_notional > quote_budget {
+                bail!(
+                    "fixed per_grid_base_size {size} needs {bid_notional} quote across {} bid level(s), above TOTAL_QUOTE_BUDGET {quote_budget}; reduce grid levels or increase the quote budget",
+                    self.bids.len()
+                )
+            }
+            let fee_inclusive = bid_notional * (Decimal::ONE + config.maker_fee_rate);
+            if fee_inclusive > quote_budget {
+                bail!(
+                    "fixed per_grid_base_size {size} needs {fee_inclusive} quote including maker fees, above TOTAL_QUOTE_BUDGET {quote_budget}; reduce grid levels or increase the quote budget"
+                )
+            }
+        }
+        if let Some(base_budget) = config.spot.total_base_budget {
+            let base_required = size * Decimal::from(self.asks.len());
+            if base_required > base_budget {
+                bail!(
+                    "fixed per_grid_base_size {size} needs {base_required} base across {} ask level(s), above TOTAL_BASE_BUDGET {base_budget}; reduce grid levels or increase the base budget",
+                    self.asks.len()
+                )
+            }
+        }
+        Ok(())
+    }
+
+    /// Upgrade a pre-uniform Spot ladder exactly once, retaining its price geometry while fixing
+    /// every level to one lot-aligned base quantity.
+    pub fn pin_spot_per_grid_base_size(
+        &self,
+        config: &GridConfig,
+        market: &Market,
+    ) -> Result<GridPlan> {
+        if config.product != Product::Spot {
+            return Ok(self.clone());
+        }
+        if self.per_grid_base_size.is_some() {
+            self.enforce_spot_budget(config)?;
+            return Ok(self.clone());
+        }
+        let bid_prices = self
+            .bids
+            .iter()
+            .map(|level| level.price)
+            .collect::<Vec<_>>();
+        let ask_prices = self
+            .asks
+            .iter()
+            .map(|level| level.price)
+            .collect::<Vec<_>>();
+        let size = derive_spot_uniform_size(config, &bid_prices, &ask_prices, market)?;
+        let resize = |level: &GridLevel| GridLevel {
+            size,
+            notional: level.price * size,
+            ..level.clone()
+        };
+        let bids = self.bids.iter().map(resize).collect::<Vec<_>>();
+        let asks = self.asks.iter().map(resize).collect::<Vec<_>>();
+        let plan = GridPlan {
+            bids,
+            asks,
+            quote_required: self
+                .bids
+                .iter()
+                .map(|level| level.price * size * (Decimal::ONE + config.maker_fee_rate))
+                .sum(),
+            base_required: size * Decimal::from(self.asks.len()),
+            per_grid_base_size: Some(size),
+            ..self.clone()
+        };
+        plan.enforce_spot_budget(config)?;
+        Ok(plan)
+    }
+
     /// Re-project a pinned Spot ladder around the latest price without changing its bounds,
     /// prices, or per-level quantities. Levels below the current price are bids and levels above
     /// it are asks; levels exactly at the current tick remain unquoted to avoid self-crossing.
@@ -1918,6 +2242,7 @@ impl GridPlan {
         if !(self.lower < self.upper) {
             bail!("pinned Spot bounds must be ordered")
         }
+        let fixed_size = self.per_grid_base_size;
         let mut levels: Vec<GridLevel> = self
             .all_levels()
             .map(|level| GridLevel {
@@ -1930,8 +2255,8 @@ impl GridPlan {
                     Side::Bid
                 },
                 price: level.price,
-                size: level.size,
-                notional: level.notional,
+                size: fixed_size.unwrap_or(level.size),
+                notional: level.price * fixed_size.unwrap_or(level.size),
                 // Trade history is only a display hint. A projected executable ladder must
                 // always be eligible to re-place a level after it has filled.
                 state: LevelState::Planned,
@@ -1959,11 +2284,13 @@ impl GridPlan {
             mid: current_mid,
             lower: self.lower,
             upper: self.upper,
+            per_grid_base_size: self.per_grid_base_size,
             bids,
             asks,
             quote_required,
             base_required,
             estimated_margin: self.estimated_margin,
+            ..self.clone()
         })
     }
 
@@ -1991,6 +2318,28 @@ impl GridPlan {
     }
 
     /// Explicitly resize only the ask inventory after an accepted partial initial base fill.
+    /// Keep the closest ask levels that current PFS base can fully fund. Retained levels preserve
+    /// the fixed per-grid base size; only the number of asks changes.
+    pub fn reduce_asks_to_available_base(&self, available_base: Decimal) -> Result<GridPlan> {
+        let size = self
+            .per_grid_base_size
+            .ok_or_else(|| anyhow!("Spot ask reduction requires fixed per_grid_base_size"))?;
+        if size <= Decimal::ZERO {
+            bail!("per_grid_base_size must be positive")
+        }
+        let affordable = (available_base.max(Decimal::ZERO) / size)
+            .floor()
+            .to_string()
+            .parse::<usize>()
+            .context("convert affordable Spot ask count")?
+            .min(self.asks.len());
+        Ok(GridPlan {
+            asks: self.asks.iter().take(affordable).cloned().collect(),
+            base_required: size * Decimal::from(affordable),
+            ..self.clone()
+        })
+    }
+
     /// This is never used as a silent response to an ordinary PFS shortfall: the caller must first
     /// satisfy the configured entry minimum-fill policy and record the resulting actual balance.
     pub fn resize_asks_to_available_base(
@@ -1998,6 +2347,11 @@ impl GridPlan {
         available_base: Decimal,
         market: &Market,
     ) -> Result<GridPlan> {
+        if self.per_grid_base_size.is_some() {
+            bail!(
+                "partial Spot entry cannot resize a ladder with a fixed per_grid_base_size; fund the configured base budget before submitting"
+            )
+        }
         if available_base.is_sign_negative() {
             bail!("available Spot base must not be negative")
         }
@@ -2112,155 +2466,75 @@ impl GridPlan {
 }
 
 pub fn build_plan(config: &GridConfig, market: &Market, mid: Decimal) -> Result<GridPlan> {
-    config.validate()?;
-    if mid <= Decimal::ZERO {
-        bail!("market mid price must be positive")
-    }
-    // Resolve the configured range first. For Spot, an already-pinned market may later trade
-    // outside its bounds; clamp only the side-allocation reference used to build a snapshot.
-    // The bounds and generated prices remain those of the configured range, while the live
-    // execution loop projects the pinned plan against the out-of-range price.
-    let (lower, upper) = resolve_range(config, mid, config.total_count)?;
-    let allocation_mid = if config.product == Product::Spot {
-        mid.clamp(lower, upper)
-    } else {
-        if !(lower < mid && mid < upper) {
-            bail!("mid price {mid} is outside grid range [{lower}, {upper}]")
-        }
-        mid
-    };
-    let (bid_count, ask_count, bid_budget, ask_budget) =
-        side_counts(config, lower, upper, allocation_mid);
-
-    let bids = prices(
-        config,
-        Side::Bid,
-        allocation_mid,
-        lower,
-        upper,
-        bid_count,
-        market.tick_size,
-    )?;
-    let asks = prices(
-        config,
-        Side::Ask,
-        allocation_mid,
-        lower,
-        upper,
-        ask_count,
-        market.tick_size,
-    )?;
-    let (bid_size, ask_size) = derive_sizes(config, &bids, &asks, market, bid_budget, ask_budget)?;
-
-    let bid_levels = bids
-        .into_iter()
-        .map(|price| GridLevel {
-            side: Side::Bid,
-            price,
-            size: bid_size,
-            notional: price * bid_size,
-            state: LevelState::Planned,
-        })
-        .collect::<Vec<_>>();
-    let ask_levels = asks
-        .into_iter()
-        .map(|price| GridLevel {
-            side: Side::Ask,
-            price,
-            size: ask_size,
-            notional: price * ask_size,
-            state: LevelState::Planned,
-        })
-        .collect::<Vec<_>>();
-
-    let quote_required = bid_levels
-        .iter()
-        .map(|l| l.notional * (Decimal::ONE + config.maker_fee_rate))
-        .sum();
-    let base_required = ask_levels.iter().map(|l| l.size).sum();
-    let long_notional: Decimal = bid_levels.iter().map(|l| l.notional).sum();
-    let short_notional: Decimal = ask_levels.iter().map(|l| l.notional).sum();
-    let estimated_margin = match config.product {
-        Product::Spot => None,
-        Product::Perp => Some(
-            long_notional.max(short_notional) / config.preview_leverage
-                + (long_notional + short_notional) * config.maker_fee_rate,
-        ),
-    };
-    let plan = GridPlan {
-        mid,
-        lower,
-        upper,
-        bids: bid_levels,
-        asks: ask_levels,
-        quote_required,
-        base_required,
-        estimated_margin,
-    };
-    if config.product == Product::Spot {
-        plan.enforce_min_net_margin(config.maker_fee_rate, config.spot.min_net_margin_bps)?;
-    }
-    Ok(plan)
+    build_plan_with_per_grid_base_size(config, market, mid, None)
 }
 
-fn side_counts(
+/// Build a Spot plan while retaining an already-pinned per-level base quantity. This is used when
+/// an existing grid is re-centered or its range is extended; changing geometry must never derive a
+/// new size from the budgets.
+pub fn build_plan_with_per_grid_base_size(
+    config: &GridConfig,
+    market: &Market,
+    mid: Decimal,
+    pinned_per_grid_base_size: Option<Decimal>,
+) -> Result<GridPlan> {
+    let ctx = strategy::StrategyContext {
+        mid,
+        position: None,
+        pinned_per_grid_base_size,
+    };
+    match config.product {
+        Product::Spot => strategy::spot::planning::build(config, market, &ctx),
+        Product::Perp => strategy::resolve(config).build_plan(config, market, &ctx),
+    }
+}
+
+pub(crate) fn side_counts(
     config: &GridConfig,
     lower: Decimal,
     upper: Decimal,
     mid: Decimal,
 ) -> (usize, usize, Decimal, Decimal) {
     let total = Decimal::from(config.total_count);
-    match (config.product, config.perp_mode) {
-        (Product::Perp, PerpMode::Long) => (
-            config.total_count,
-            1,
-            config.budget_or_zero(),
-            Decimal::ZERO,
-        ),
-        (Product::Perp, PerpMode::Short) => (
-            1,
-            config.total_count,
-            Decimal::ZERO,
-            config.budget_or_zero(),
-        ),
-        _ => {
-            let mid = mid.clamp(lower, upper);
-            let range = upper - lower;
-            if range <= Decimal::ZERO {
-                let half = config.total_count / 2;
-                let budget = config.budget_or_zero();
-                return (
-                    half,
-                    config.total_count - half,
-                    budget / Decimal::TWO,
-                    budget / Decimal::TWO,
-                );
-            }
-            let bid_ratio = (mid - lower) / range;
-            // Preserve the configured combined level count while respecting the venue's 30-level
-            // per-side ceiling. Near a boundary the unconstrained allocation could otherwise put
-            // all forty levels on one side and either exceed the ABI limit or silently drop
-            // levels.
-            let min_bid = config
-                .total_count
-                .saturating_sub(MAX_LEVELS_PER_SIDE)
-                .max(1);
-            let max_bid = MAX_LEVELS_PER_SIDE.min(config.total_count.saturating_sub(1));
-            let bid = (total * bid_ratio)
-                .round_dp(0)
-                .to_u64()
-                .unwrap_or(1)
-                .clamp(min_bid as u64, max_bid as u64) as usize;
-            let ask = config.total_count - bid;
-            let budget = config.budget_or_zero();
-            let bid_budget = budget * bid_ratio;
-            let ask_budget = budget - bid_budget;
-            (bid, ask, bid_budget, ask_budget)
-        }
+    let mid = mid.clamp(lower, upper);
+    let range = upper - lower;
+    if range <= Decimal::ZERO {
+        let half = config.total_count / 2;
+        let budget = config.budget_or_zero();
+        return (
+            half,
+            config.total_count - half,
+            budget / Decimal::TWO,
+            budget / Decimal::TWO,
+        );
     }
+    let bid_ratio = (mid - lower) / range;
+    // Preserve the configured combined level count while respecting the venue's 40-level
+    // per-side ceiling. Near a boundary the unconstrained allocation could otherwise put
+    // all forty levels on one side and either exceed the ABI limit or silently drop
+    // levels.
+    let min_bid = config
+        .total_count
+        .saturating_sub(MAX_LEVELS_PER_SIDE)
+        .max(1);
+    let max_bid = MAX_LEVELS_PER_SIDE.min(config.total_count.saturating_sub(1));
+    let bid = (total * bid_ratio)
+        .round_dp(0)
+        .to_u64()
+        .unwrap_or(1)
+        .clamp(min_bid as u64, max_bid as u64) as usize;
+    let ask = config.total_count - bid;
+    let budget = config.budget_or_zero();
+    let bid_budget = budget * bid_ratio;
+    let ask_budget = budget - bid_budget;
+    (bid, ask, bid_budget, ask_budget)
 }
 
-fn resolve_range(config: &GridConfig, mid: Decimal, levels: usize) -> Result<(Decimal, Decimal)> {
+pub(crate) fn resolve_range(
+    config: &GridConfig,
+    mid: Decimal,
+    levels: usize,
+) -> Result<(Decimal, Decimal)> {
     let hundred = Decimal::from(100);
     match config.range {
         RangeSpec::Bounds { lower, upper } => Ok((lower, upper)),
@@ -2281,7 +2555,7 @@ fn resolve_range(config: &GridConfig, mid: Decimal, levels: usize) -> Result<(De
     }
 }
 
-fn prices(
+pub(crate) fn prices(
     config: &GridConfig,
     side: Side,
     mid: Decimal,
@@ -2290,6 +2564,9 @@ fn prices(
     count: usize,
     tick: Decimal,
 ) -> Result<Vec<Decimal>> {
+    if count == 0 {
+        return Ok(Vec::new());
+    }
     let mut values = Vec::with_capacity(count);
     for i in 1..=count {
         let raw = match (&config.range, side) {
@@ -2315,7 +2592,63 @@ fn prices(
     Ok(values)
 }
 
-fn derive_sizes(
+fn derive_spot_uniform_size(
+    config: &GridConfig,
+    bids: &[Decimal],
+    asks: &[Decimal],
+    market: &Market,
+) -> Result<Decimal> {
+    let bid_price_sum: Decimal = bids.iter().sum();
+    let quote_cap = match config.spot.total_quote_budget {
+        Some(quote_budget) => {
+            if bid_price_sum <= Decimal::ZERO {
+                bail!("cannot size a Spot grid without theoretical bid prices")
+            }
+            // Reserve maker fees inside the quote cap. The public budget check below still
+            // reports the raw notional requested by the operator, while this denominator keeps
+            // the submitted transaction fundable.
+            Some(quote_budget / (bid_price_sum * (Decimal::ONE + config.maker_fee_rate)))
+        }
+        None => None,
+    };
+    let base_cap = match config.spot.total_base_budget {
+        Some(base_budget) => {
+            if asks.is_empty() {
+                bail!("cannot size a Spot grid without theoretical ask prices")
+            }
+            Some(base_budget / Decimal::from(asks.len()))
+        }
+        None => None,
+    };
+    let raw_size = match (quote_cap, base_cap) {
+        (Some(quote), Some(base)) => quote.min(base),
+        (Some(quote), None) => quote,
+        (None, Some(base)) => base,
+        (None, None) => match config.allocation {
+            Allocation::FixedSize(size) => size,
+            // Legacy GRID_TOTAL_BUDGET remains supported as a single, symmetric preview cap.
+            // It is intentionally not re-used by a pinned live ladder after the first build.
+            Allocation::TotalBudget(total_budget) => {
+                let denominator = bid_price_sum * (Decimal::ONE + config.maker_fee_rate)
+                    + asks.iter().sum::<Decimal>();
+                if denominator <= Decimal::ZERO {
+                    bail!("cannot size a Spot grid without theoretical prices")
+                }
+                total_budget / denominator
+            }
+        },
+    };
+    let size = round_down(raw_size, market.lot_size);
+    if size < market.min_size {
+        bail!(
+            "derived per_grid_base_size {size} is below min size {}; increase budgets or reduce grid levels",
+            market.min_size
+        )
+    }
+    Ok(size)
+}
+
+pub(crate) fn derive_sizes(
     config: &GridConfig,
     bids: &[Decimal],
     asks: &[Decimal],
@@ -2323,6 +2656,11 @@ fn derive_sizes(
     bid_budget: Decimal,
     ask_budget: Decimal,
 ) -> Result<(Decimal, Decimal)> {
+    if config.product == Product::Spot {
+        let size = derive_spot_uniform_size(config, bids, asks, market)?;
+        return Ok((size, size));
+    }
+
     let explicit_spot_budgets = config.product == Product::Spot
         && (config.spot.total_quote_budget.is_some() || config.spot.total_base_budget.is_some());
     let (mut bid, mut ask) = if explicit_spot_budgets {
@@ -2383,12 +2721,6 @@ fn derive_sizes(
             },
         }
     };
-    if config.product == Product::Perp && config.perp_mode == PerpMode::Long {
-        ask = Decimal::ZERO;
-    }
-    if config.product == Product::Perp && config.perp_mode == PerpMode::Short {
-        bid = Decimal::ZERO;
-    }
     bid = if bid > Decimal::ZERO {
         round_down(bid, market.lot_size)
     } else {
@@ -2441,17 +2773,7 @@ pub struct DecibelClient {
 impl DecibelClient {
     pub fn new(network: &str, api_key: &str) -> Result<Self> {
         validate_api_key_format(api_key)?;
-        let (api_root, ws_url) = match network {
-            "mainnet" => (
-                "https://api.mainnet.aptoslabs.com/decibel/api/v1",
-                "wss://api.mainnet.aptoslabs.com/decibel/ws",
-            ),
-            "testnet" => (
-                "https://api.testnet.aptoslabs.com/decibel/api/v1",
-                "wss://api.testnet.aptoslabs.com/decibel/ws",
-            ),
-            other => bail!("unsupported network {other}; expected mainnet or testnet"),
-        };
+        let profile = network::default_registry().resolve(network)?;
         let mut headers = header::HeaderMap::new();
         let bearer = format!("Bearer {api_key}")
             .parse()
@@ -2463,8 +2785,8 @@ impl DecibelClient {
             .build()?;
         Ok(Self {
             http,
-            base_url: api_root.to_owned(),
-            ws_url: ws_url.to_owned(),
+            base_url: profile.decibel_api_base.to_owned(),
+            ws_url: profile.decibel_ws_url.to_owned(),
             api_key: api_key.to_owned(),
         })
     }
@@ -2483,7 +2805,7 @@ impl DecibelClient {
     /// Bulk sequence is a venue-side monotonically increasing value. The API's bulk-orders reader
     /// accepts the active account and market filters; the latest row's `sequence_number` is the
     /// predecessor for the next transaction.
-    async fn next_bulk_sequence(
+    pub async fn next_bulk_sequence(
         &self,
         subaccount: &str,
         market: &str,
@@ -2520,6 +2842,51 @@ impl DecibelClient {
             .unwrap_or(0)
             .checked_add(1)
             .ok_or_else(|| anyhow!("bulk sequence number overflow"))
+    }
+
+    /// Read the newest active bulk generation exactly as the venue presents it. This is used as a
+    /// submission postcondition, not merely as a reconciliation hint.
+    pub async fn active_bulk_ladder(
+        &self,
+        subaccount: &str,
+        market: &Market,
+    ) -> Result<Option<ActiveBulkLadder>> {
+        let asset_type = match market.product {
+            Product::Perp => "perp",
+            Product::Spot => "spot",
+        };
+        let data = self
+            .get(
+                "bulk_orders",
+                &[
+                    ("account", subaccount.to_owned()),
+                    ("market", market.address.clone()),
+                    ("asset_type", asset_type.to_owned()),
+                ],
+            )
+            .await?;
+        let rows = data
+            .as_array()
+            .ok_or_else(|| anyhow!("/bulk_orders did not return an array"))?;
+        let Some(latest) = rows
+            .iter()
+            .max_by_key(|row| integer_field(row, "sequence_number").unwrap_or_default())
+        else {
+            return Ok(None);
+        };
+        let sequence = integer_field(latest, "sequence_number")
+            .ok_or_else(|| anyhow!("/bulk_orders row has no sequence_number"))?;
+        let sequence = u64::try_from(sequence)
+            .map_err(|_| anyhow!("/bulk_orders has a negative sequence_number {sequence}"))?;
+        let mut levels = Vec::new();
+        append_observed_bulk_levels(&mut levels, latest, "bid_prices", "bid_sizes", Side::Bid)?;
+        append_observed_bulk_levels(&mut levels, latest, "ask_prices", "ask_sizes", Side::Ask)?;
+        Ok(Some(ActiveBulkLadder {
+            product: market.product,
+            market_address: market.address.clone(),
+            sequence,
+            levels,
+        }))
     }
 
     /// Check that the bearer key is accepted by both documented API transports without exposing
@@ -2582,6 +2949,31 @@ impl DecibelClient {
             PriceSource::Prices => self.mid_from_prices_or_depth(market).await,
             PriceSource::Depth => self.mid_from_depth(market).await,
         }
+    }
+
+    /// Perp mark price is kept separate from the quoting mid. Risk and unrealized PnL must not
+    /// silently substitute a mid when the venue has not supplied a mark price.
+    pub async fn mark_price(&self, market: &Market) -> Result<Decimal> {
+        if market.product != Product::Perp {
+            bail!("mark price is only available for Perp markets")
+        }
+        let data = self.ws_snapshot("all_market_prices").await?;
+        let rows = data
+            .get("prices")
+            .and_then(Value::as_array)
+            .ok_or_else(|| anyhow!("all_market_prices did not return a prices array"))?;
+        let row = rows
+            .iter()
+            .find(|row| price_row_matches_market(row, market))
+            .ok_or_else(|| anyhow!("all_market_prices has no row for {}", market.name))?;
+        decimal_field(row, "mark_px")
+            .filter(|price| *price > Decimal::ZERO)
+            .ok_or_else(|| {
+                anyhow!(
+                    "all_market_prices has no positive mark_px for {}",
+                    market.name
+                )
+            })
     }
 
     async fn ws_snapshot(&self, topic: &str) -> Result<Value> {
@@ -2995,6 +3387,118 @@ impl DecibelClient {
             })
             .collect())
     }
+
+    /// Fetch fills only when the venue exposes the immutable identifiers and quote-denominated
+    /// fees required for lossless accounting. Callers must block live risk expansion when this
+    /// endpoint cannot provide those fields instead of inventing a PnL from price matches.
+    pub async fn perp_fill_history(
+        &self,
+        subaccount: &str,
+        market: &Market,
+        since: Option<DateTime<Utc>>,
+    ) -> Result<Vec<strategy::perp::accounting::PerpFill>> {
+        if market.product != Product::Perp {
+            bail!("Perp fill history requested for a Spot market")
+        }
+        let order_sides = self.perp_order_sides(subaccount, market).await?;
+        const PAGE_SIZE: usize = 200;
+        const MAX_OFFSET: usize = 10_000;
+        let mut offset = 0usize;
+        let mut fills = Vec::new();
+        let history_end = Utc::now();
+        loop {
+            let mut params = vec![
+                ("account", subaccount.to_owned()),
+                ("market", market.address.clone()),
+                ("asset_type", "perp".to_owned()),
+                ("limit", PAGE_SIZE.to_string()),
+                ("offset", offset.to_string()),
+                ("sort_key", "timestamp".to_owned()),
+                ("sort_dir", "DESC".to_owned()),
+            ];
+            append_trade_history_window(&mut params, since, history_end);
+            let data = self.get("trade_history", &params).await?;
+            let rows = data
+                .get("items")
+                .and_then(Value::as_array)
+                .or_else(|| data.as_array())
+                .ok_or_else(|| anyhow!("/trade_history returned no items array"))?;
+            fills.extend(
+                rows.iter()
+                    .filter(|row| {
+                        value_str(row, "asset_type")
+                            .is_none_or(|asset_type| asset_type.eq_ignore_ascii_case("perp"))
+                    })
+                    .map(|row| parse_perp_fill(row, &order_sides))
+                    .collect::<Result<Vec<_>>>()?,
+            );
+            // A new run only needs the latest page as a historical baseline. Resumed runs page
+            // through every fill after their durable timestamp so realized PnL cannot be dropped.
+            if since.is_none() || rows.len() < PAGE_SIZE {
+                return Ok(fills);
+            }
+            if offset >= MAX_OFFSET {
+                bail!(
+                    "/trade_history has more than {} Perp fills after the durable cursor; refusing incomplete accounting",
+                    MAX_OFFSET + PAGE_SIZE
+                )
+            }
+            offset += PAGE_SIZE;
+        }
+    }
+
+    /// `trade_history.action` is position-centric, so a `Net` fill cannot always reveal whether
+    /// it bought or sold. The documented order history supplies `is_buy` for that fallback.
+    async fn perp_order_sides(
+        &self,
+        subaccount: &str,
+        market: &Market,
+    ) -> Result<std::collections::HashMap<String, bool>> {
+        let data = self
+            .get(
+                "order_history",
+                &[
+                    ("account", subaccount.to_owned()),
+                    ("market", market.address.clone()),
+                    ("asset_type", "perp".to_owned()),
+                    ("limit", "200".to_owned()),
+                    ("sort_key", "timestamp".to_owned()),
+                    ("sort_dir", "DESC".to_owned()),
+                ],
+            )
+            .await?;
+        let rows = data
+            .get("items")
+            .and_then(Value::as_array)
+            .or_else(|| data.as_array())
+            .ok_or_else(|| anyhow!("/order_history returned no items array"))?;
+        Ok(rows
+            .iter()
+            .filter_map(|row| {
+                Some((
+                    string_or_number_field(row, "order_id")?,
+                    row.get("is_buy")?.as_bool()?,
+                ))
+            })
+            .collect())
+    }
+}
+
+fn append_trade_history_window(
+    params: &mut Vec<(&str, String)>,
+    since: Option<DateTime<Utc>>,
+    end: DateTime<Utc>,
+) {
+    let Some(start) = since else {
+        return;
+    };
+    // The one-millisecond overlap preserves fills sharing the cursor timestamp; the durable
+    // trade_id set removes the intentional duplicate on restart. Decibel requires both bounds.
+    params.push((
+        "start_timestamp",
+        start.timestamp_millis().saturating_sub(1).to_string(),
+    ));
+    params.push(("end_timestamp", end.timestamp_millis().to_string()));
 }
 
 #[derive(Clone, Debug)]
@@ -3076,6 +3580,42 @@ fn append_bulk_levels(
     Ok(())
 }
 
+fn append_observed_bulk_levels(
+    levels: &mut Vec<journal::BulkLevelState>,
+    row: &Value,
+    prices_key: &str,
+    sizes_key: &str,
+    side: Side,
+) -> Result<()> {
+    let prices = row
+        .get(prices_key)
+        .and_then(Value::as_array)
+        .ok_or_else(|| anyhow!("/bulk_orders row has no {prices_key} array"))?;
+    let sizes = row
+        .get(sizes_key)
+        .and_then(Value::as_array)
+        .ok_or_else(|| anyhow!("/bulk_orders row has no {sizes_key} array"))?;
+    if prices.len() != sizes.len() {
+        bail!(
+            "/bulk_orders {prices_key}/{sizes_key} length mismatch: {} prices, {} sizes",
+            prices.len(),
+            sizes.len()
+        )
+    }
+    for (index, (price, size)) in prices.iter().zip(sizes).enumerate() {
+        levels.push(journal::BulkLevelState {
+            side,
+            index,
+            price: decimal_value(price)
+                .ok_or_else(|| anyhow!("/bulk_orders {prices_key}[{index}] has no price"))?,
+            original_size: decimal_value(size)
+                .ok_or_else(|| anyhow!("/bulk_orders {sizes_key}[{index}] has no size"))?,
+            filled_size: Decimal::ZERO,
+        });
+    }
+    Ok(())
+}
+
 /// Convert the documented open-order shape into the venue-neutral reconciliation shape.
 fn parse_open_order(value: &Value) -> Result<reconcile::ActualOrder> {
     let side = match value.get("is_buy").and_then(Value::as_bool) {
@@ -3100,6 +3640,20 @@ fn parse_open_order(value: &Value) -> Result<reconcile::ActualOrder> {
         // Individually placed orders carry no client-order ID, so ownership cannot be proven.
         origin: reconcile::OrderOrigin::Standalone,
     })
+}
+
+/// Return the executable base shortfall for a pinned Spot ladder using only the current PFS
+/// balance. A shortfall smaller than one minimum order is ignored after lot rounding.
+///
+/// This is the single bootstrap decision used by startup, reconciliation-triggered replacement,
+/// and pre-submission funding checks. It contains no persistent success flag.
+pub fn spot_base_shortfall(plan: &GridPlan, funds: &SpotFunds, market: &Market) -> Option<Decimal> {
+    if market.product != Product::Spot {
+        return None;
+    }
+    let shortfall = (plan.base_required - funds.available_base_for_bulk()).max(Decimal::ZERO);
+    let executable = round_down(shortfall, market.lot_size);
+    (executable >= market.min_size).then_some(executable)
 }
 
 /// Read the current plan and current orders, then compare them without submitting, replacing, or
@@ -3314,6 +3868,72 @@ fn scale_raw(raw: Decimal, decimals: u32) -> Decimal {
 fn value_str<'a>(value: &'a Value, key: &str) -> Option<&'a str> {
     value.get(key)?.as_str()
 }
+fn string_or_number_field(value: &Value, key: &str) -> Option<String> {
+    value.get(key).and_then(|field| match field {
+        Value::String(value) if !value.trim().is_empty() => Some(value.to_owned()),
+        Value::Number(value) => Some(value.to_string()),
+        _ => None,
+    })
+}
+
+fn parse_perp_fill(
+    row: &Value,
+    order_sides: &std::collections::HashMap<String, bool>,
+) -> Result<strategy::perp::accounting::PerpFill> {
+    use strategy::perp::accounting::{FillSide, PerpFill};
+
+    let id = string_or_number_field(row, "trade_id")
+        .or_else(|| string_or_number_field(row, "fill_id"))
+        .or_else(|| string_or_number_field(row, "id"))
+        .ok_or_else(|| anyhow!("Perp trade history row has no stable trade_id"))?;
+    let order_id = string_or_number_field(row, "order_id");
+    let order_side = order_id
+        .as_deref()
+        .and_then(|order_id| order_sides.get(order_id))
+        .copied();
+    let normalized_action = value_str(row, "action")
+        .unwrap_or_default()
+        .chars()
+        .filter(|character| character.is_ascii_alphanumeric())
+        .collect::<String>()
+        .to_ascii_lowercase();
+    let side = match normalized_action.as_str() {
+        "openlong" | "closeshort" | "buy" => FillSide::Buy,
+        "closelong" | "openshort" | "sell" => FillSide::Sell,
+        "net" | "" => match order_side {
+            Some(true) => FillSide::Buy,
+            Some(false) => FillSide::Sell,
+            None => bail!(
+                "Perp trade {id} has action {:?} but no is_buy order-history fallback",
+                value_str(row, "action")
+            ),
+        },
+        _ => bail!("Perp trade {id} has unsupported action {normalized_action:?}"),
+    };
+    let price = decimal_field(row, "price")
+        .filter(|value| *value > Decimal::ZERO)
+        .ok_or_else(|| anyhow!("Perp trade {id} has no positive price"))?;
+    let quantity = decimal_field(row, "size")
+        .filter(|value| *value > Decimal::ZERO)
+        .ok_or_else(|| anyhow!("Perp trade {id} has no positive size"))?;
+    let timestamp_ms = integer_field(row, "transaction_unix_ms")
+        .ok_or_else(|| anyhow!("Perp trade {id} has no transaction_unix_ms"))?;
+    let timestamp = DateTime::from_timestamp_millis(timestamp_ms)
+        .ok_or_else(|| anyhow!("Perp trade {id} has invalid transaction_unix_ms"))?;
+    Ok(PerpFill {
+        id,
+        side,
+        price,
+        quantity,
+        fee_quote: decimal_field(row, "fee_amount")
+            .ok_or_else(|| anyhow!("Perp trade has no fee_amount"))?,
+        realized_pnl_quote: decimal_field(row, "realized_pnl_amount")
+            .ok_or_else(|| anyhow!("Perp trade has no realized_pnl_amount"))?,
+        realized_funding_quote: decimal_field(row, "realized_funding_amount")
+            .ok_or_else(|| anyhow!("Perp trade has no realized_funding_amount"))?,
+        timestamp,
+    })
+}
 fn decimal_field(value: &Value, key: &str) -> Option<Decimal> {
     value.get(key).and_then(decimal_value)
 }
@@ -3392,6 +4012,58 @@ mod tests {
         assert!(error.to_string().contains("length mismatch"));
     }
 
+    #[test]
+    fn resumed_trade_history_includes_both_timestamp_bounds() {
+        let start = DateTime::from_timestamp_millis(1_700_000_000_000).unwrap();
+        let end = DateTime::from_timestamp_millis(1_700_000_100_000).unwrap();
+        let mut params = Vec::new();
+
+        append_trade_history_window(&mut params, Some(start), end);
+
+        assert_eq!(
+            params,
+            vec![
+                ("start_timestamp", "1699999999999".to_owned()),
+                ("end_timestamp", "1700000100000".to_owned()),
+            ]
+        );
+    }
+
+    #[test]
+    fn active_bulk_ladder_requires_exact_sequence_and_levels() {
+        let expected = journal::BulkLadder {
+            operation_id: "operation-1".to_owned(),
+            product: Product::Perp,
+            market_address: "0x01".to_owned(),
+            sequence: 42,
+            prior_sequence: Some(41),
+            levels: vec![journal::BulkLevelState {
+                side: Side::Bid,
+                index: 0,
+                price: dec!(100),
+                original_size: dec!(0.01),
+                filled_size: Decimal::ZERO,
+            }],
+            intent_at: Utc::now(),
+            transaction_hash: None,
+            cancel_transaction_hash: None,
+            state: journal::BulkLadderState::IntentRecorded,
+        };
+        let mut observed = ActiveBulkLadder {
+            product: Product::Perp,
+            market_address: "0x1".to_owned(),
+            sequence: 42,
+            levels: expected.levels.clone(),
+        };
+
+        assert!(observed.matches(&expected));
+        observed.sequence = 43;
+        assert!(!observed.matches(&expected));
+        observed.sequence = 42;
+        observed.levels[0].original_size = dec!(0.02);
+        assert!(!observed.matches(&expected));
+    }
+
     fn market() -> Market {
         Market {
             address: "0x1".to_owned(),
@@ -3421,6 +4093,8 @@ mod tests {
             refresh: Duration::from_secs(3),
             price_source: PriceSource::Prices,
             spot: SpotExecutionConfig::default(),
+            max_position: None,
+            out_of_range_action: OutOfRangeAction::default(),
         }
     }
 
@@ -3604,6 +4278,7 @@ mod tests {
     fn step_grid_is_compounded() {
         let plan = build_plan(
             &GridConfig {
+                product: Product::Spot,
                 range: RangeSpec::StepPercent { percent: dec!(1) },
                 total_count: 4,
                 allocation: Allocation::FixedSize(dec!(1)),
@@ -3640,6 +4315,29 @@ mod tests {
         assert_eq!(plan.bids[0].state, LevelState::Filled);
     }
 
+    #[test]
+    fn documented_perp_trade_fields_book_fee_pnl_and_funding() {
+        let row = serde_json::json!({
+            "asset_type": "perp",
+            "trade_id": "123",
+            "order_id": "456",
+            "action": "Net",
+            "price": "105.5",
+            "size": "2",
+            "fee_amount": "0.25",
+            "realized_pnl_amount": "3.5",
+            "realized_funding_amount": "-0.1",
+            "transaction_unix_ms": 1_700_000_000_000i64
+        });
+        let order_sides = std::collections::HashMap::from([("456".to_owned(), false)]);
+        let fill = parse_perp_fill(&row, &order_sides).unwrap();
+        assert_eq!(fill.id, "123");
+        assert_eq!(fill.side, strategy::perp::accounting::FillSide::Sell);
+        assert_eq!(fill.fee_quote, dec!(0.25));
+        assert_eq!(fill.realized_pnl_quote, dec!(3.5));
+        assert_eq!(fill.realized_funding_quote, dec!(-0.1));
+    }
+
     /// A pinned Spot ladder: bounds [90, 110] with eight fixed levels, sized 1 each.
     fn pinned_spot_plan() -> GridPlan {
         let level = |price: Decimal, side: Side| GridLevel {
@@ -3668,11 +4366,13 @@ mod tests {
             mid: dec!(100),
             lower: dec!(90),
             upper: dec!(110),
+            per_grid_base_size: Some(Decimal::ONE),
             bids,
             asks,
             quote_required,
             base_required,
             estimated_margin: None,
+            ..Default::default()
         }
     }
 
@@ -3971,11 +4671,13 @@ mod tests {
             mid: dec!(0.5372),
             lower: dec!(0.4834),
             upper: dec!(0.591),
+            per_grid_base_size: None,
             bids: vec![],
             asks: vec![],
             quote_required,
             base_required,
             estimated_margin: None,
+            ..Default::default()
         }
     }
 
@@ -4240,11 +4942,13 @@ mod tests {
             mid: dec!(60000),
             lower: dec!(57000),
             upper: dec!(63000),
+            per_grid_base_size: None,
             bids: vec![],
             asks: vec![],
             quote_required: dec!(1000),
             base_required: dec!(1),
             estimated_margin: None,
+            ..Default::default()
         };
         let market = Market {
             address: "0x1".to_owned(),
@@ -4282,11 +4986,13 @@ mod tests {
             mid: dec!(0.5782),
             lower: dec!(0.55),
             upper: dec!(0.61),
+            per_grid_base_size: None,
             bids: vec![],
             asks: vec![],
             quote_required: dec!(400),
             base_required: dec!(100),
             estimated_margin: None,
+            ..Default::default()
         };
         let market = Market {
             address: "0x1".to_owned(),
@@ -4323,11 +5029,13 @@ mod tests {
             mid: dec!(60000),
             lower: dec!(57000),
             upper: dec!(63000),
+            per_grid_base_size: None,
             bids: vec![],
             asks: vec![],
             quote_required: dec!(500),
             base_required: dec!(1),
             estimated_margin: None,
+            ..Default::default()
         };
         let market = Market {
             address: "0x1".to_owned(),
@@ -4365,11 +5073,13 @@ mod tests {
             mid: dec!(1),
             lower: dec!(0.9),
             upper: dec!(1.1),
+            per_grid_base_size: None,
             bids: vec![],
             asks: vec![],
             quote_required: dec!(99.995),
             base_required: dec!(0.011),
             estimated_margin: None,
+            ..Default::default()
         };
         let market = Market {
             address: "0x1".to_owned(),
@@ -4407,11 +5117,13 @@ mod tests {
             mid: dec!(1),
             lower: dec!(0.9),
             upper: dec!(1.1),
+            per_grid_base_size: None,
             bids: vec![],
             asks: vec![],
             quote_required: dec!(99.995),
             base_required: dec!(2),
             estimated_margin: None,
+            ..Default::default()
         };
         let market = Market {
             address: "0x1".to_owned(),
@@ -4447,11 +5159,13 @@ mod tests {
             mid: dec!(60000),
             lower: dec!(57000),
             upper: dec!(63000),
+            per_grid_base_size: None,
             bids: vec![],
             asks: vec![],
             quote_required: dec!(500),
             base_required: dec!(1),
             estimated_margin: None,
+            ..Default::default()
         };
         let market = Market {
             address: "0x1".to_owned(),
@@ -4513,12 +5227,76 @@ mod tests {
     }
 
     #[test]
+    fn bulk_json_keeps_one_fixed_spot_size_after_recenter() {
+        let mut market = market();
+        market.product = Product::Spot;
+        market.name = "APT/USDC".to_owned();
+        let config = GridConfig {
+            product: Product::Spot,
+            range: RangeSpec::Bounds {
+                lower: dec!(90),
+                upper: dec!(110),
+            },
+            total_count: 4,
+            allocation: Allocation::TotalBudget(dec!(1)),
+            maker_fee_rate: dec!(0.001),
+            spot: SpotExecutionConfig {
+                total_quote_budget: Some(dec!(4000)),
+                total_base_budget: Some(dec!(20)),
+                ..SpotExecutionConfig::default()
+            },
+            ..config()
+        };
+        let initial = build_plan(&config, &market, dec!(100)).unwrap();
+        assert_eq!(initial.per_grid_base_size, Some(dec!(10)));
+        let initial_bids = initial.bids.iter().collect::<Vec<_>>();
+        let initial_asks = initial.asks.iter().collect::<Vec<_>>();
+        let initial_bulk = prepare_bulk_order_parameters(1, &initial_bids, &initial_asks, &market)
+            .expect("initial Spot bulk parameters");
+        println!(
+            "initial bulk order JSON: {}",
+            serde_json::to_string(&initial_bulk).expect("serialize initial bulk parameters")
+        );
+        assert!(
+            initial_bulk
+                .bid_sizes
+                .iter()
+                .chain(&initial_bulk.ask_sizes)
+                .all(|size| *size == 1000)
+        );
+
+        // A fill prompts the live loop to re-project around the newest mid before submitting its
+        // replacement. The side counts change from 2/2 to 3/1, but every raw Move size remains
+        // the same persisted 10.00 APT value.
+        let recentered = initial.project_spot(dec!(106), market.tick_size).unwrap();
+        recentered.enforce_spot_budget(&config).unwrap();
+        assert_eq!(recentered.per_grid_base_size, initial.per_grid_base_size);
+        let recentered_bids = recentered.bids.iter().collect::<Vec<_>>();
+        let recentered_asks = recentered.asks.iter().collect::<Vec<_>>();
+        let recentered_bulk =
+            prepare_bulk_order_parameters(2, &recentered_bids, &recentered_asks, &market)
+                .expect("recentered Spot bulk parameters");
+        println!(
+            "recentered bulk order JSON: {}",
+            serde_json::to_string(&recentered_bulk).expect("serialize recentered bulk parameters")
+        );
+        assert!(
+            recentered_bulk
+                .bid_sizes
+                .iter()
+                .chain(&recentered_bulk.ask_sizes)
+                .all(|size| *size == 1000)
+        );
+    }
+
+    #[test]
     fn accepted_partial_entry_resizes_only_ask_inventory() {
         let market = spot_funding_market();
         let plan = GridPlan {
             mid: dec!(100),
             lower: dec!(90),
             upper: dec!(110),
+            per_grid_base_size: None,
             bids: vec![GridLevel {
                 side: Side::Bid,
                 price: dec!(99),
@@ -4545,6 +5323,7 @@ mod tests {
             quote_required: dec!(99),
             base_required: dec!(2),
             estimated_margin: None,
+            ..Default::default()
         };
         let resized = plan
             .resize_asks_to_available_base(dec!(1), &market)
@@ -4552,5 +5331,161 @@ mod tests {
         assert_eq!(resized.quote_required, plan.quote_required);
         assert!(resized.base_required <= dec!(1));
         assert_eq!(resized.bids[0].size, dec!(1));
+    }
+
+    #[test]
+    fn perp_long_places_bilateral_grid_with_target() {
+        let cfg = GridConfig {
+            perp_mode: PerpMode::Long,
+            total_count: 4,
+            allocation: Allocation::FixedSize(dec!(0.01)),
+            range: RangeSpec::Bounds {
+                lower: dec!(90),
+                upper: dec!(110),
+            },
+            ..config()
+        };
+        let plan = build_plan(&cfg, &market(), dec!(100)).unwrap();
+        assert!(!plan.bids.is_empty());
+        assert!(!plan.asks.is_empty());
+        assert_eq!(plan.bids.len() + plan.asks.len(), 4);
+        assert_eq!(plan.target_position, Some(dec!(0.02)));
+    }
+
+    #[test]
+    fn perp_short_target_is_negative_bid_inventory() {
+        let cfg = GridConfig {
+            perp_mode: PerpMode::Short,
+            total_count: 4,
+            allocation: Allocation::FixedSize(dec!(0.01)),
+            range: RangeSpec::Bounds {
+                lower: dec!(90),
+                upper: dec!(110),
+            },
+            ..config()
+        };
+        let plan = build_plan(&cfg, &market(), dec!(100)).unwrap();
+        assert_eq!(plan.target_position, Some(dec!(-0.02)));
+    }
+
+    #[test]
+    fn perp_neutral_uniform_split_at_midpoint() {
+        let lower = dec!(1);
+        let upper = dec!(100);
+        let mid = dec!(50);
+        let plan = build_plan(
+            &GridConfig {
+                perp_mode: PerpMode::Neutral,
+                total_count: 40,
+                range: RangeSpec::Bounds { lower, upper },
+                ..config()
+            },
+            &market(),
+            mid,
+        )
+        .unwrap();
+        assert_eq!(plan.bids.len(), 20);
+        assert_eq!(plan.asks.len(), 20);
+        assert_eq!(plan.target_position, Some(Decimal::ZERO));
+    }
+
+    #[test]
+    fn perp_rejects_more_than_forty_total_levels() {
+        let err = GridConfig {
+            total_count: 41,
+            ..config()
+        }
+        .validate()
+        .unwrap_err();
+        assert!(err.to_string().contains("40"));
+    }
+
+    #[test]
+    fn perp_position_is_safe_respects_mode_constraints_at_target() {
+        let cfg = GridConfig {
+            perp_mode: PerpMode::Long,
+            total_count: 4,
+            allocation: Allocation::FixedSize(dec!(1)),
+            max_position: Some(dec!(4)),
+            range: RangeSpec::Bounds {
+                lower: dec!(90),
+                upper: dec!(110),
+            },
+            ..config()
+        };
+        let plan = build_plan(&cfg, &market(), dec!(100)).unwrap();
+        let target = plan.target_position.unwrap();
+        assert!(perp_position_is_safe(target, &plan, &cfg));
+        assert!(!perp_position_is_safe(Decimal::ZERO, &plan, &cfg));
+    }
+
+    #[test]
+    fn shared_perp_contract_table() {
+        let cases = [
+            (PerpMode::Long, dec!(100), dec!(0.02)),
+            (PerpMode::Short, dec!(100), dec!(-0.02)),
+            (PerpMode::Neutral, dec!(100), Decimal::ZERO),
+        ];
+        for (mode, mid, expected_target) in cases {
+            let plan = build_plan(
+                &GridConfig {
+                    perp_mode: mode,
+                    total_count: 4,
+                    allocation: Allocation::FixedSize(dec!(0.01)),
+                    range: RangeSpec::Bounds {
+                        lower: dec!(90),
+                        upper: dec!(110),
+                    },
+                    ..config()
+                },
+                &market(),
+                mid,
+            )
+            .unwrap();
+            assert_eq!(plan.bids.len(), 2);
+            assert_eq!(plan.asks.len(), 2);
+            assert_eq!(plan.target_position, Some(expected_target));
+        }
+    }
+
+    #[test]
+    fn spot_plan_regression_golden() {
+        let config = GridConfig {
+            product: Product::Spot,
+            perp_mode: PerpMode::Neutral,
+            market_name: "APT/USDC".to_owned(),
+            range: RangeSpec::Percent { percent: dec!(10) },
+            total_count: 8,
+            allocation: Allocation::FixedSize(dec!(1)),
+            maker_fee_rate: dec!(0.001),
+            preview_leverage: dec!(1),
+            refresh: Duration::from_secs(3),
+            price_source: PriceSource::Prices,
+            spot: SpotExecutionConfig::default(),
+            max_position: None,
+            out_of_range_action: OutOfRangeAction::default(),
+        };
+        let market = Market {
+            address: "0xspot".to_owned(),
+            name: "APT/USDC".to_owned(),
+            tick_size: dec!(0.01),
+            lot_size: dec!(0.01),
+            min_size: dec!(0.01),
+            px_decimals: 2,
+            sz_decimals: 2,
+            product: Product::Spot,
+            base_asset_addr: None,
+            quote_asset_addr: None,
+            base_symbol: Some("APT".to_owned()),
+            quote_symbol: Some("USDC".to_owned()),
+        };
+        let plan = build_plan(&config, &market, dec!(10)).unwrap();
+        assert_eq!(plan.bids.len(), 4);
+        assert_eq!(plan.asks.len(), 4);
+        assert_eq!(plan.bids[0].price, dec!(9.75));
+        assert_eq!(plan.asks[0].price, dec!(10.25));
+        assert!(plan.bids.iter().all(|level| level.size == dec!(1)));
+        assert!(plan.asks.iter().all(|level| level.size == dec!(1)));
+        assert_eq!(plan.per_grid_base_size, Some(dec!(1)));
     }
 }
