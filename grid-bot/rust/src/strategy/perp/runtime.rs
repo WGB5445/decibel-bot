@@ -118,6 +118,7 @@ pub async fn run_perp_convergence(
     plan: &GridPlan,
     guard: &SpotExecutionConfig,
     gas_station: Option<&GasStationConfig>,
+    ws_state: Option<&crate::ws_state::WsStateHandle>,
 ) -> Result<super::convergence::ConvergencePlan> {
     super::convergence::execute_perp_convergence_market(
         network,
@@ -128,6 +129,7 @@ pub async fn run_perp_convergence(
         plan,
         guard,
         gas_station,
+        ws_state,
     )
     .await
 }
@@ -191,6 +193,7 @@ pub async fn cancel_and_flatten_perp(
         },
         guard,
         gas_station,
+        None,
     )
     .await?;
     let after = client

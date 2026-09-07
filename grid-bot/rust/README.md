@@ -328,6 +328,29 @@ PRICE_SOURCE=prices
 
 `DECIBEL_API_KEY` 必需;`SUBACCOUNT_ADDRESS` 可选,但如果设置,程序才能读取该账户的仓位、可用保证金、挂单和成交记录。
 
+### 可选：Discord 与 Telegram 运行告警
+
+后台 engine 在运行时错误、自动恢复和 Perp 风险暂停时可同时发送 Discord 与 Telegram 告警。通知失败只会写本地日志，绝不会阻塞交易或风控路径。
+
+```dotenv
+# Discord Incoming Webhook
+DISCORD_WEBHOOK_URL=https://discord.com/api/webhooks/...
+
+# Telegram Bot API；这两个变量必须成对设置
+TELEGRAM_BOT_TOKEN=123456:token
+TELEGRAM_CHAT_ID=123456789
+
+# 允许通过 Telegram 查看或控制 engine 的用户 ID，逗号分隔
+TELEGRAM_ALLOWED_USER_IDS=123456789
+
+# 可选：附在 Discord webhook 告警末尾的只读 dashboard 地址
+DISCORD_STATUS_URL=https://ops.example.com/decibel-grid
+```
+
+凭据仅从环境变量读取，不保存到 profile、journal 或 engine status。相同运行时错误会在首次出现以及失败次数为 2 的幂时通知，避免循环重试刷屏。
+
+Telegram 只接受 `TELEGRAM_ALLOWED_USER_IDS` 中用户发来的命令：`/status`、`/stop CONFIRM`（撤单并保留仓位）与 `/flatten CONFIRM`（撤单后通过既有滑点保护的平仓路径）。未配置允许名单时，Telegram 仅发送告警，不接受远程命令。
+
 ### 可选：Geomi Gas Station 代付 gas
 
 `GEOMI_GAS_STATION_API_KEY` **可省略**。未设置时与历史行为完全一致：签名账户自付 APT gas。设置非空 key 后，所有链上提交走 Aptos `/gs/v1` fee-payer 路径，由 Gas Station 代付 gas（签名账户仍消耗 sequence number）。

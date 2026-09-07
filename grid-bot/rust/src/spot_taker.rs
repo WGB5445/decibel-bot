@@ -3,6 +3,7 @@
 
 use anyhow::{Result, anyhow, bail};
 use rust_decimal::Decimal;
+use std::time::Duration;
 use tokio::time::Instant;
 
 use crate::{
@@ -142,6 +143,7 @@ pub async fn execute_guarded_spot_ioc(
     fees: &SpotFeeRates,
     config: &SpotExecutionConfig,
     gas_station: Option<&GasStationConfig>,
+    ws_state: Option<&crate::ws_state::WsStateHandle>,
 ) -> Result<GuardedTakerOutcome> {
     if target_size < market.min_size {
         return Ok(GuardedTakerOutcome {
@@ -149,7 +151,10 @@ pub async fn execute_guarded_spot_ioc(
             ..GuardedTakerOutcome::default()
         });
     }
-    let initial_book = api.order_book(market, 50).await?;
+    let initial_book = match ws_state {
+        Some(state) => crate::ws_state::fresh_depth(state, Duration::from_secs(2))?,
+        None => api.order_book(market, 50).await?,
+    };
     let reference = match side {
         TakerSide::Buy => initial_book.asks.first(),
         TakerSide::Sell => initial_book.bids.first(),
@@ -174,7 +179,10 @@ pub async fn execute_guarded_spot_ioc(
         && outcome.attempts < config.entry_exit_max_attempts
         && started.elapsed() < config.entry_exit_timeout
     {
-        let book = api.order_book(market, 50).await?;
+        let book = match ws_state {
+            Some(state) => crate::ws_state::fresh_depth(state, Duration::from_secs(2))?,
+            None => api.order_book(market, 50).await?,
+        };
         let Some(attempt) = plan_ioc_attempt(
             &book,
             side,

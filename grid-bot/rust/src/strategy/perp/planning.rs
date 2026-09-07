@@ -3,7 +3,9 @@
 use anyhow::bail;
 use rust_decimal::Decimal;
 
-use super::risk::{compute_perp_target, perp_estimated_margin, perp_worst_case};
+use super::risk::{
+    compute_perp_target, perp_estimated_margin, perp_theoretical_limits, perp_worst_case,
+};
 use crate::{
     Allocation, GridConfig, GridLevel, GridPlan, LevelState, MAX_LEVELS_PER_SIDE, Market,
     OutOfRangeAction, Product, Result, Side, resolve_range, round_down,
@@ -66,6 +68,8 @@ pub(crate) fn build_perp_plan(
     let ask_count = ask_prices.len();
     let bid_count = bid_prices.len();
     let target_position = compute_perp_target(config.perp_mode, ask_count, bid_count, grid_size);
+    let (perp_max_long, perp_max_short) =
+        perp_theoretical_limits(config, ask_count, bid_count, grid_size);
 
     let bid_levels = bid_prices
         .into_iter()
@@ -91,6 +95,8 @@ pub(crate) fn build_perp_plan(
         target_position: Some(target_position),
         worst_long: None,
         worst_short: None,
+        perp_max_long: Some(perp_max_long),
+        perp_max_short: Some(perp_max_short),
         paused_by_out_of_range: range_state.paused_by_out_of_range,
         out_of_range_action_applied: range_state
             .out_of_range
@@ -149,6 +155,8 @@ fn empty_perp_plan(
         target_position: None,
         worst_long: Some(Decimal::ZERO),
         worst_short: Some(Decimal::ZERO),
+        perp_max_long: None,
+        perp_max_short: None,
         paused_by_out_of_range: range_state.paused_by_out_of_range,
         out_of_range_action_applied: range_state
             .out_of_range

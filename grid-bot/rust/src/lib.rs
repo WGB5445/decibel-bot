@@ -31,6 +31,7 @@ pub mod i18n;
 pub mod journal;
 pub mod monitor_log;
 pub mod network;
+pub mod notify;
 pub mod process_lock;
 pub mod profile;
 pub mod reconcile;
@@ -38,6 +39,7 @@ pub mod simulation;
 pub mod spot_lifecycle;
 pub mod spot_taker;
 pub mod strategy;
+pub mod ws_state;
 
 pub use geomi::GasStationConfig;
 
@@ -924,6 +926,7 @@ pub async fn exit_sell_assets(
                     fees,
                     guard_config,
                     gas_station,
+                    None,
                 )
                 .await
                 .context("execute guarded Spot liquidation")?;
@@ -2088,6 +2091,13 @@ pub struct GridPlan {
     pub worst_long: Option<Decimal>,
     #[serde(default)]
     pub worst_short: Option<Decimal>,
+    /// Fixed exposure endpoints for the complete Perp ladder. These must survive temporary
+    /// inventory-aware trimming after passive fills; deriving them from the remaining levels
+    /// would double-count a consumed order as both position and future exposure.
+    #[serde(default)]
+    pub perp_max_long: Option<Decimal>,
+    #[serde(default)]
+    pub perp_max_short: Option<Decimal>,
     #[serde(default)]
     pub paused_by_out_of_range: bool,
     #[serde(default)]
@@ -2116,6 +2126,8 @@ impl Default for GridPlan {
             target_position: None,
             worst_long: None,
             worst_short: None,
+            perp_max_long: None,
+            perp_max_short: None,
             paused_by_out_of_range: false,
             out_of_range_action_applied: None,
             convergence_delta: None,
@@ -3353,6 +3365,60 @@ impl DecibelClient {
         })
     }
 
+    /// Convert the documented account WebSocket snapshots into the same risk-facing shape used by
+    /// the engine. This avoids polling account/position/order REST endpoints during a healthy WS
+    /// session; REST remains the recovery path after a disconnect or version anomaly.
+    pub fn account_from_ws(
+        &self,
+        overview_message: &Value,
+        positions_message: Option<&Value>,
+        orders_message: &Value,
+        market: &Market,
+    ) -> Result<AccountOverview> {
+        let overview = overview_message
+            .get("account_overview")
+            .ok_or_else(|| anyhow!("account_overview WS message has no account_overview"))?;
+        let position = positions_message
+            .and_then(|message| message.get("positions"))
+            .and_then(Value::as_array)
+            .and_then(|rows| {
+                rows.iter().find(|row| {
+                    normalized_address(value_str(row, "market").unwrap_or_default())
+                        == normalized_address(&market.address)
+                })
+            })
+            .map(|row| Position {
+                size: decimal_field(row, "size").unwrap_or(Decimal::ZERO),
+                entry_price: decimal_field(row, "entry_price").unwrap_or(Decimal::ZERO),
+            })
+            .unwrap_or(Position {
+                size: Decimal::ZERO,
+                entry_price: Decimal::ZERO,
+            });
+        let open_order_count = orders_message
+            .get("orders")
+            .and_then(Value::as_array)
+            .map(|rows| {
+                rows.iter()
+                    .filter(|row| {
+                        normalized_address(value_str(row, "market").unwrap_or_default())
+                            == normalized_address(&market.address)
+                    })
+                    .count()
+            })
+            .unwrap_or(0);
+        Ok(AccountOverview {
+            available_margin: decimal_field(overview, "cross_available_to_trade")
+                .or_else(|| decimal_field(overview, "perp_equity_balance")),
+            equity: decimal_field(overview, "perp_equity_balance"),
+            position,
+            open_order_count,
+            spot_funds: (market.product == Product::Spot)
+                .then(|| parse_spot_funds(overview, market))
+                .flatten(),
+        })
+    }
+
     pub async fn trade_history(
         &self,
         subaccount: Option<&str>,
@@ -3537,6 +3603,93 @@ pub async fn fetch_snapshot(
         reconciliation: None,
         trades,
         status: "LIVE DATA — EXECUTION PLAN MONITOR".to_owned(),
+    })
+}
+
+/// Build a normal snapshot but source the planning price from the persistent WS cache when one is
+/// available. A stale WS feed is deliberately an error: callers must wait for a fresh book/price
+/// rather than silently returning to the known-inaccurate REST order book.
+pub async fn fetch_snapshot_ws_first(
+    client: &DecibelClient,
+    config: &GridConfig,
+    _subaccount: Option<&str>,
+    ws_state: &ws_state::WsStateHandle,
+    max_market_data_age: Duration,
+) -> Result<MonitorSnapshot> {
+    let market = client.market(&config.market_name, config.product).await?;
+    let mid = {
+        let state = ws_state.read().expect("WS state lock poisoned");
+        if !state.subscriptions_ready {
+            bail!("WebSocket subscriptions are not ready")
+        }
+        match market.product {
+            Product::Perp => state
+                .price
+                .as_ref()
+                .filter(|price| price.fresh(max_market_data_age))
+                .map(|price| price.value.mid)
+                .filter(|price| *price > Decimal::ZERO)
+                .ok_or_else(|| anyhow!("WebSocket Perp market price is stale or unavailable"))?,
+            Product::Spot => {
+                let book = state
+                    .depth
+                    .as_ref()
+                    .filter(|book| book.fresh(max_market_data_age))
+                    .ok_or_else(|| anyhow!("WebSocket Spot depth is stale or unavailable"))?;
+                let bid = book
+                    .value
+                    .bids
+                    .first()
+                    .ok_or_else(|| anyhow!("WebSocket Spot depth has no bid"))?;
+                let ask = book
+                    .value
+                    .asks
+                    .first()
+                    .ok_or_else(|| anyhow!("WebSocket Spot depth has no ask"))?;
+                (bid.price + ask.price) / Decimal::TWO
+            }
+        }
+    };
+    let mut plan = build_plan(config, &market, mid)?;
+    let (overview, positions, orders) = {
+        let state = ws_state.read().expect("WS state lock poisoned");
+        let overview = state
+            .account_overview
+            .as_ref()
+            .ok_or_else(|| anyhow!("WebSocket account overview is stale or unavailable"))?
+            .value
+            .clone();
+        let orders = state
+            .open_orders
+            .as_ref()
+            .ok_or_else(|| anyhow!("WebSocket account open orders are stale or unavailable"))?
+            .value
+            .clone();
+        let positions = if market.product == Product::Perp {
+            Some(
+                state
+                    .positions
+                    .as_ref()
+                    .ok_or_else(|| anyhow!("WebSocket account positions are stale or unavailable"))?
+                    .value
+                    .clone(),
+            )
+        } else {
+            None
+        };
+        (overview, positions, orders)
+    };
+    let account = client.account_from_ws(&overview, positions.as_ref(), &orders, &market)?;
+    let trades = ws_state::trades(ws_state);
+    plan.apply_trade_history(&trades, market.tick_size);
+    Ok(MonitorSnapshot {
+        observed_at: Utc::now(),
+        market,
+        plan,
+        account,
+        reconciliation: None,
+        trades,
+        status: "LIVE DATA — WS-FIRST EXECUTION PLAN MONITOR".to_owned(),
     })
 }
 

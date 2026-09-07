@@ -106,6 +106,36 @@ pub struct Args {
     /// Write stdout and stderr to this file, replacing it at startup.
     #[arg(long, global = true, env = "LOG_FILE")]
     pub(crate) log_file: Option<PathBuf>,
+    /// Discord webhook for operational alerts. The URL is never persisted or displayed.
+    #[arg(
+        long,
+        global = true,
+        env = "DISCORD_WEBHOOK_URL",
+        hide_env_values = true
+    )]
+    pub(crate) discord_webhook_url: Option<String>,
+    /// Telegram bot token for operational alerts. Requires TELEGRAM_CHAT_ID as well.
+    #[arg(
+        long,
+        global = true,
+        env = "TELEGRAM_BOT_TOKEN",
+        hide_env_values = true
+    )]
+    pub(crate) telegram_bot_token: Option<String>,
+    /// Telegram chat ID for operational alerts. Requires TELEGRAM_BOT_TOKEN as well.
+    #[arg(long, global = true, env = "TELEGRAM_CHAT_ID", hide_env_values = true)]
+    pub(crate) telegram_chat_id: Option<String>,
+    /// Comma-separated Telegram user IDs permitted to query or control this engine.
+    #[arg(
+        long,
+        global = true,
+        env = "TELEGRAM_ALLOWED_USER_IDS",
+        hide_env_values = true
+    )]
+    pub(crate) telegram_allowed_user_ids: Option<String>,
+    /// Optional operator-hosted read-only dashboard URL included in Discord alerts.
+    #[arg(long, global = true, env = "DISCORD_STATUS_URL")]
+    pub(crate) discord_status_url: Option<String>,
     /// Continue streaming new lines for the `logs` client.
     #[arg(short = 'f', long, global = true, default_value_t = false)]
     pub(crate) follow: bool,
@@ -328,6 +358,11 @@ pub struct Settings {
     pub(crate) out_of_range_action: OutOfRangeAction,
     pub(crate) geomi_gas_station_api_key: Option<String>,
     pub(crate) geomi_gas_station_url: Option<String>,
+    pub(crate) discord_webhook_url: Option<String>,
+    pub(crate) telegram_bot_token: Option<String>,
+    pub(crate) telegram_chat_id: Option<String>,
+    pub(crate) telegram_allowed_user_ids: Option<String>,
+    pub(crate) discord_status_url: Option<String>,
 }
 
 impl From<&Args> for Settings {
@@ -391,6 +426,11 @@ impl From<&Args> for Settings {
             out_of_range_action: args.out_of_range_action,
             geomi_gas_station_api_key: args.geomi_gas_station_api_key.clone(),
             geomi_gas_station_url: args.geomi_gas_station_url.clone(),
+            discord_webhook_url: args.discord_webhook_url.clone(),
+            telegram_bot_token: args.telegram_bot_token.clone(),
+            telegram_chat_id: args.telegram_chat_id.clone(),
+            telegram_allowed_user_ids: args.telegram_allowed_user_ids.clone(),
+            discord_status_url: args.discord_status_url.clone(),
         }
     }
 }
@@ -452,6 +492,11 @@ impl Settings {
             out_of_range_action: OutOfRangeAction::default(),
             geomi_gas_station_api_key: None,
             geomi_gas_station_url: None,
+            discord_webhook_url: None,
+            telegram_bot_token: None,
+            telegram_chat_id: None,
+            telegram_allowed_user_ids: None,
+            discord_status_url: None,
         }
     }
 

@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeSet,
     fs,
     io::{self, Write},
     path::{Path, PathBuf},
@@ -9,6 +10,7 @@ use std::{
 
 use anyhow::{Context, Result};
 use chrono::Utc;
+use decibel_grid_tui::notify::{NotificationConfig, Notifier};
 use decibel_grid_tui::process_lock::{SubaccountRunLock, SubaccountStartupLock};
 use decibel_grid_tui::*;
 use rust_decimal::{Decimal, prelude::ToPrimitive};
@@ -302,13 +304,106 @@ pub async fn engine_cli(
     let _guard = EngineRuntimeGuard {
         paths: paths.clone(),
     };
+    if settings.telegram_bot_token.is_some() != settings.telegram_chat_id.is_some() {
+        anyhow::bail!(
+            "TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID must be configured together for alerts"
+        )
+    }
+    let notifier = Notifier::new(NotificationConfig {
+        discord_webhook_url: settings.discord_webhook_url.clone(),
+        telegram_bot_token: settings.telegram_bot_token.clone(),
+        telegram_chat_id: settings.telegram_chat_id.clone(),
+        telegram_allowed_user_ids: parse_telegram_user_ids(
+            settings.telegram_allowed_user_ids.as_deref(),
+        )?,
+        discord_status_url: settings.discord_status_url.clone(),
+    });
     let server = control::start_server(&paths, runtime.clone()).await?;
-    let result = run_cli(settings, true, confirm_mainnet, Some(runtime.clone())).await;
+    if let Some(notifier) = &notifier {
+        notifier.spawn_telegram_controller(runtime.clone());
+    }
+    let mut consecutive_failures = 0u32;
+    let result = loop {
+        if runtime.is_cancelled() {
+            break Ok(());
+        }
+        if consecutive_failures > 0 {
+            runtime
+                .update_status(|status| {
+                    status.phase = "recovering".to_owned();
+                    status.last_error = None;
+                })
+                .await;
+            if let Some(notifier) = &notifier {
+                notifier
+                    .send(
+                        "Decibel grid engine recovering",
+                        "Restarting the strategy loop from its durable journal after a runtime error.",
+                    )
+                    .await;
+            }
+        }
+        match run_cli(
+            settings.clone(),
+            true,
+            confirm_mainnet,
+            Some(runtime.clone()),
+            notifier.clone(),
+        )
+        .await
+        {
+            Ok(()) => break Ok(()),
+            Err(error) => {
+                consecutive_failures += 1;
+                let message = format!("{error:#}");
+                let backoff = Duration::from_secs(
+                    (3u64.saturating_mul(2u64.pow(consecutive_failures.saturating_sub(1).min(4))))
+                        .min(60),
+                );
+                eprintln!(
+                    "grid runtime error (attempt {consecutive_failures}); retrying in {}s: {message}",
+                    backoff.as_secs()
+                );
+                runtime
+                    .update_status(|status| {
+                        status.phase = "degraded".to_owned();
+                        status.last_error = Some(message.clone());
+                    })
+                    .await;
+                if let Some(notifier) = &notifier
+                    && (consecutive_failures == 1 || consecutive_failures.is_power_of_two())
+                {
+                    notifier
+                        .send(
+                            "Decibel grid engine degraded",
+                            &format!(
+                                "Runtime cycle failed {consecutive_failures} time(s); retrying in {}s.\n{message}",
+                                backoff.as_secs()
+                            ),
+                        )
+                        .await;
+                }
+                tokio::time::sleep(backoff).await;
+            }
+        }
+    };
     runtime
         .update_status(|status| status.phase = "stopped".to_owned())
         .await;
     server.abort();
     result
+}
+
+fn parse_telegram_user_ids(raw: Option<&str>) -> Result<BTreeSet<i64>> {
+    raw.unwrap_or_default()
+        .split(',')
+        .filter(|value| !value.trim().is_empty())
+        .map(|value| {
+            value.trim().parse::<i64>().with_context(|| {
+                format!("invalid Telegram user ID {value:?} in TELEGRAM_ALLOWED_USER_IDS")
+            })
+        })
+        .collect()
 }
 
 /// Legacy direct status implementation retained for compatibility tests; the public `status`

@@ -11,7 +11,9 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    GridPlan, Product, Side, reconcile::ActualOrder, strategy::perp::accounting::PerpAccounting,
+    GridPlan, Product, Side,
+    reconcile::ActualOrder,
+    strategy::perp::accounting::{PerpAccounting, PerpFill},
 };
 use rust_decimal::Decimal;
 
@@ -122,6 +124,21 @@ pub enum JournalEvent {
         fee: Option<String>,
         #[serde(default)]
         venue_timestamp: Option<String>,
+    },
+    /// A level-attributed fill from the unified authenticated WebSocket session. The immutable
+    /// attribution is journaled so a replay rebuilds `filled_size` without relying on a live feed.
+    BulkLevelFilled {
+        at: DateTime<Utc>,
+        event_uid: String,
+        trade_id: String,
+        sequence: u64,
+        side: Side,
+        price: Decimal,
+        size: Decimal,
+    },
+    PerpFillApplied {
+        at: DateTime<Utc>,
+        fill: PerpFill,
     },
     RiskRejected {
         at: DateTime<Utc>,
@@ -389,6 +406,62 @@ impl RunState {
                         let excess = self.processed_spot_fill_uids.len() - MAX_PROCESSED_SPOT_FILLS;
                         self.processed_spot_fill_uids.drain(..excess);
                     }
+                }
+            }
+            JournalEvent::BulkLevelFilled {
+                event_uid,
+                sequence,
+                side,
+                price,
+                size,
+                ..
+            } => {
+                if self
+                    .processed_spot_fill_uids
+                    .iter()
+                    .any(|uid| uid == event_uid)
+                {
+                    return;
+                }
+                let mut attributed = false;
+                if let Some(ladder) = self.bulk_ladder.as_mut()
+                    && ladder.sequence == *sequence
+                    && ladder.state == BulkLadderState::VenueObserved
+                {
+                    let matches = ladder
+                        .levels
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, level)| level.side == *side && level.price == *price)
+                        .map(|(index, _)| index)
+                        .collect::<Vec<_>>();
+                    if let [index] = matches.as_slice() {
+                        let level = &mut ladder.levels[*index];
+                        if level.filled_size + *size <= level.original_size {
+                            level.filled_size += *size;
+                            attributed = true;
+                        } else {
+                            ladder.state = BulkLadderState::Diverged;
+                        }
+                    } else {
+                        ladder.state = BulkLadderState::Diverged;
+                    }
+                }
+                if !attributed {
+                    if let Some(ladder) = self.bulk_ladder.as_mut() {
+                        ladder.state = BulkLadderState::Diverged;
+                    }
+                }
+                self.processed_spot_fill_uids.push(event_uid.clone());
+                const MAX_PROCESSED_SPOT_FILLS: usize = 1_000;
+                if self.processed_spot_fill_uids.len() > MAX_PROCESSED_SPOT_FILLS {
+                    let excess = self.processed_spot_fill_uids.len() - MAX_PROCESSED_SPOT_FILLS;
+                    self.processed_spot_fill_uids.drain(..excess);
+                }
+            }
+            JournalEvent::PerpFillApplied { fill, .. } => {
+                if let Some(runtime) = self.perp_runtime.as_mut() {
+                    let _ = runtime.accounting.apply_fill(fill);
                 }
             }
             JournalEvent::BulkOrderFailed { .. } => self.failed_orders += 1,

@@ -123,6 +123,10 @@ pub struct PerpPnlSnapshot {
 }
 
 impl PerpAccounting {
+    pub fn has_processed_fill(&self, id: &str) -> bool {
+        self.processed_fill_ids.contains(id)
+    }
+
     /// Mark fills visible before a brand-new strategy starts as historical baseline data. They do
     /// not belong to this run and must never be replayed into its realized PnL.
     pub fn seed_historical_fills<'a>(

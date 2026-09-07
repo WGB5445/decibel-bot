@@ -541,7 +541,9 @@ mod unix {
                         let client_handle = handle.clone();
                         tokio::spawn(async move {
                             let (reader, writer) = stream.into_split();
-                            let _ = protocol::handle_client(reader, writer, client_handle).await;
+                            if let Err(error) = protocol::handle_client(reader, writer, client_handle).await {
+                                eprintln!("control socket client failed: {error:#}");
+                            }
                         });
                     }
                     _ = tokio::time::sleep(Duration::from_millis(200)) => {
@@ -608,7 +610,9 @@ mod windows {
                         let client_handle = handle.clone();
                         tokio::spawn(async move {
                             let (reader, writer) = split(client);
-                            let _ = protocol::handle_client(reader, writer, client_handle).await;
+                            if let Err(error) = protocol::handle_client(reader, writer, client_handle).await {
+                                eprintln!("control pipe client failed: {error:#}");
+                            }
                         });
                     }
                     _ = tokio::time::sleep(Duration::from_millis(200)) => {

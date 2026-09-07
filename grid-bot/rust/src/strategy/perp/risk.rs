@@ -65,7 +65,19 @@ pub fn perp_position_is_safe(position: Decimal, plan: &GridPlan, config: &GridCo
     });
     let ask_levels = plan.asks.len();
     let bid_levels = plan.bids.len();
-    let (max_long, max_short) = perp_theoretical_limits(config, ask_levels, bid_levels, grid_size);
+    let limits = plan
+        .perp_max_long
+        .zip(plan.perp_max_short)
+        .unwrap_or_else(|| perp_theoretical_limits(config, ask_levels, bid_levels, grid_size));
+    perp_position_is_safe_with_limits(position, plan, config, limits)
+}
+
+fn perp_position_is_safe_with_limits(
+    position: Decimal,
+    plan: &GridPlan,
+    config: &GridConfig,
+    (max_long, max_short): (Decimal, Decimal),
+) -> bool {
     let (worst_long, worst_short) = perp_worst_case(position, plan);
     mode_constraints_hold(
         config.perp_mode,
@@ -123,16 +135,9 @@ fn trim_violation_side(
     config: &GridConfig,
     position: Decimal,
     plan: &GridPlan,
+    limits: (Decimal, Decimal),
 ) -> Option<TrimSide> {
-    let grid_size = plan.per_grid_base_size.unwrap_or_else(|| {
-        plan.bids
-            .first()
-            .or_else(|| plan.asks.first())
-            .map(|level| level.size)
-            .unwrap_or(Decimal::ZERO)
-    });
-    let (max_long, max_short) =
-        perp_theoretical_limits(config, plan.asks.len(), plan.bids.len(), grid_size);
+    let (max_long, max_short) = limits;
     let (worst_long, worst_short) = perp_worst_case(position, plan);
     match config.perp_mode {
         PerpMode::Long => {
@@ -173,11 +178,30 @@ pub(crate) fn apply_perp_risk_trim(
     if plan.bids.is_empty() && plan.asks.is_empty() {
         return Ok(());
     }
+    // These limits describe the complete pinned ladder. Do not recompute them after removing a
+    // consumed level: a passive fill raises the position by one lot while removing that same bid
+    // from the venue. Recomputing the limit from the shrinking plan double-counts that fill and
+    // can make a safe Long/Short grid impossible to trim.
+    let grid_size = plan.per_grid_base_size.unwrap_or_else(|| {
+        plan.bids
+            .first()
+            .or_else(|| plan.asks.first())
+            .map(|level| level.size)
+            .unwrap_or(Decimal::ZERO)
+    });
+    let limits = plan
+        .perp_max_long
+        .zip(plan.perp_max_short)
+        .unwrap_or_else(|| {
+            perp_theoretical_limits(config, plan.asks.len(), plan.bids.len(), grid_size)
+        });
+    plan.perp_max_long = Some(limits.0);
+    plan.perp_max_short = Some(limits.1);
     loop {
-        if perp_position_is_safe(position, plan, config) {
+        if perp_position_is_safe_with_limits(position, plan, config, limits) {
             return Ok(());
         }
-        let Some(side) = trim_violation_side(config, position, plan) else {
+        let Some(side) = trim_violation_side(config, position, plan, limits) else {
             break;
         };
         let removed = match side {
@@ -196,7 +220,9 @@ pub(crate) fn apply_perp_risk_trim(
         // intentionally bilateral even though worst-case exposure checks fail at zero.
         return Ok(());
     }
-    if !perp_position_is_safe(position, plan, config) || side_constraint_broken(config, plan) {
+    if !perp_position_is_safe_with_limits(position, plan, config, limits)
+        || side_constraint_broken(config, plan)
+    {
         bail!("perp pending ladder cannot be trimmed to a safe bilateral shape")
     }
     Ok(())
@@ -353,5 +379,30 @@ mod tests {
         // fill, taking the position to the three-unit grid maximum.
         assert!(perp_position_is_safe(dec!(1), &plan, &config));
         assert!(!perp_position_is_safe(Decimal::ZERO, &plan, &config));
+    }
+
+    #[test]
+    fn long_passive_bid_fill_removes_only_the_consumed_bid() {
+        let mut plan = GridPlan {
+            bids: vec![level(Side::Bid, dec!(99), dec!(1)); 2],
+            asks: vec![level(Side::Ask, dec!(101), dec!(1)); 1],
+            target_position: Some(dec!(1)),
+            per_grid_base_size: Some(dec!(1)),
+            ..GridPlan::default()
+        };
+        let config = GridConfig {
+            perp_mode: PerpMode::Long,
+            max_position: None,
+            ..short_config()
+        };
+
+        // One bid filled: the position rises by one lot while that bid is no longer resting.
+        // Keep the ask in place so a rebound can naturally reduce inventory.
+        apply_perp_risk_trim(&config, &mut plan, dec!(2)).unwrap();
+
+        assert_eq!(plan.bids.len(), 1);
+        assert_eq!(plan.asks.len(), 1);
+        assert_eq!(plan.perp_max_long, Some(dec!(3)));
+        assert!(perp_position_is_safe(dec!(2), &plan, &config));
     }
 }

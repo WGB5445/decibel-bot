@@ -13,58 +13,6 @@ use rust_decimal::Decimal;
 
 use crate::cli::settings::Settings;
 use crate::cli::settings::decimal;
-use tokio::sync::mpsc;
-
-fn apply_spot_fill_to_ladder(
-    ladder: &mut journal::BulkLadder,
-    fill: &events::SpotBulkFill,
-) -> Result<()> {
-    if ladder.product != Product::Spot || ladder.state != journal::BulkLadderState::VenueObserved {
-        anyhow::bail!("fill does not belong to a venue-observed Spot ladder")
-    }
-    let sequence = fill
-        .bulk_sequence_number
-        .as_deref()
-        .ok_or_else(|| anyhow::anyhow!("Spot bulk fill has no bulk sequence number"))?
-        .parse::<u64>()
-        .context("Spot bulk fill has an invalid bulk sequence number")?;
-    if sequence != ladder.sequence {
-        anyhow::bail!(
-            "Spot bulk fill sequence {sequence} does not match active sequence {}",
-            ladder.sequence
-        )
-    }
-    let side = match fill.side.as_deref().map(str::to_ascii_lowercase).as_deref() {
-        Some("buy" | "bid") => Side::Bid,
-        Some("sell" | "ask") => Side::Ask,
-        _ => anyhow::bail!("Spot bulk fill has no recognized side"),
-    };
-    let matches = ladder
-        .levels
-        .iter()
-        .enumerate()
-        .filter(|(_, level)| level.side == side && level.price == fill.price)
-        .map(|(index, _)| index)
-        .collect::<Vec<_>>();
-    let [index] = matches.as_slice() else {
-        anyhow::bail!(
-            "Spot bulk fill cannot be uniquely mapped to sequence {sequence}: side={side:?} price={}",
-            fill.price
-        )
-    };
-    let level = &mut ladder.levels[*index];
-    let updated = level.filled_size + fill.size;
-    if updated > level.original_size {
-        anyhow::bail!(
-            "Spot bulk fill exceeds original level size: {} filled plus {} new exceeds {}",
-            level.filled_size,
-            fill.size,
-            level.original_size
-        )
-    }
-    level.filled_size = updated;
-    Ok(())
-}
 
 fn perp_pnl_status(
     accounting: &decibel_grid_tui::strategy::perp::accounting::PerpAccounting,
@@ -128,6 +76,7 @@ pub async fn run_cli(
     execute: bool,
     confirm_mainnet: Option<&str>,
     engine_runtime: Option<control::EngineHandle>,
+    notifier: Option<decibel_grid_tui::notify::Notifier>,
 ) -> Result<()> {
     if execute
         && (settings.api_key.trim().is_empty()
@@ -306,6 +255,9 @@ pub async fn run_cli(
     let mut perp_accounting_initialized =
         resumed && config.product == Product::Perp && !legacy_perp_state;
     let mut perp_accounting_blocked: Option<String> = None;
+    let mut perp_risk_pause_reason: Option<String> = None;
+    let mut last_perp_preflight_deferral: Option<String> = None;
+    let mut last_perp_submission_block_reason: Option<String> = None;
     // Trade history is the reliable fill signal. Bulk synthetic order IDs change on every
     // replacement because the sequence number changes, so comparing those IDs would falsely
     // classify every replacement as a fill.
@@ -340,24 +292,30 @@ pub async fn run_cli(
             println!("\nShutdown requested.");
         });
     }
-    let (spot_event_tx, mut spot_event_rx) = mpsc::channel(256);
-    let _spot_event_listener =
-        if execute && config.product == Product::Spot && !settings.subaccount.trim().is_empty() {
-            let market = api
-                .market(&config.market_name, Product::Spot)
-                .await
-                .context("resolve Spot market before subscribing to lifecycle events")?;
-            Some(events::spawn_spot_event_listener(
-                api.clone(),
-                market.address,
-                settings.subaccount.clone(),
-                config.spot.ws_reconnect_backoff.clone(),
-                spot_event_tx,
-                Arc::clone(&cancel),
-            ))
-        } else {
-            None
-        };
+    let (ws_lifecycle_tx, mut ws_lifecycle_rx) = ws_state::lifecycle_channel();
+    let ws_state = ws_state::new_handle();
+    let _ws_session = if !settings.subaccount.trim().is_empty() {
+        let market = api
+            .market(&config.market_name, config.product)
+            .await
+            .context("resolve market before subscribing to WebSocket state")?;
+        Some(ws_state::spawn_ws_session(
+            api.clone(),
+            ws_state::WsSessionConfig {
+                product: config.product,
+                market_address: market.address,
+                subaccount: settings.subaccount.clone(),
+                depth_aggregation: ws_state::DEFAULT_DEPTH_AGGREGATION,
+                reconnect_backoff: config.spot.ws_reconnect_backoff.clone(),
+            },
+            Arc::clone(&ws_state),
+            Arc::clone(&cancel),
+            ws_lifecycle_tx,
+        ))
+    } else {
+        None
+    };
+    let mut last_ws_generation = ws_state::generation(&ws_state);
     macro_rules! check_cancel {
         () => {
             if cancel.load(Ordering::Relaxed) {
@@ -368,7 +326,19 @@ pub async fn run_cli(
 
     loop {
         let cycle_start = tokio::time::Instant::now();
-        let snapshot = match fetch_snapshot(&api, &config, optional_subaccount(&settings)).await {
+        let snapshot_result = if settings.subaccount.trim().is_empty() {
+            fetch_snapshot(&api, &config, optional_subaccount(&settings)).await
+        } else {
+            fetch_snapshot_ws_first(
+                &api,
+                &config,
+                optional_subaccount(&settings),
+                &ws_state,
+                Duration::from_secs(2),
+            )
+            .await
+        };
+        let snapshot = match snapshot_result {
             Ok(s) => s,
             Err(e) => {
                 let error = format!("{e:#}");
@@ -505,9 +475,7 @@ pub async fn run_cli(
                 .as_ref()
                 .expect("checked above")
                 .clone();
-            if api
-                .active_bulk_ladder(&settings.subaccount, &snapshot.market)
-                .await?
+            if ws_state::active_bulk_ladder(&ws_state)?
                 .is_some_and(|active| active.matches(&expected))
             {
                 let event = journal::JournalEvent::BulkVenueObserved {
@@ -527,63 +495,164 @@ pub async fn run_cli(
             }
         }
         if execute && snapshot.market.product == Product::Perp && !legacy_perp_state {
-            match api
-                .perp_fill_history(
-                    &settings.subaccount,
-                    &snapshot.market,
-                    perp_accounting_initialized
-                        .then(|| perp_accounting.history_cursor())
-                        .flatten(),
-                )
-                .await
-            {
-                Ok(fills) if !perp_accounting_initialized => {
-                    if !snapshot.account.position.size.is_zero() {
-                        anyhow::bail!(
-                            "refusing Perp startup with existing position {}; no verified grid journal is available",
-                            snapshot.account.position.size
-                        )
-                    }
-                    // Existing historical trades are not strategy PnL for this new run.
-                    perp_accounting.seed_historical_fills(&fills, snapshot.observed_at);
-                    perp_accounting_initialized = true;
-                    perp_runtime.accounting = perp_accounting.clone();
-                    run_state.perp_runtime = Some(perp_runtime.clone());
-                    if let Some(journal) = &journal {
-                        journal.save_state(&run_state)?;
-                    }
-                }
-                Ok(fills) => {
-                    let mut changed = false;
-                    for fill in &fills {
-                        changed |= perp_accounting.apply_fill(fill)?;
-                    }
-                    if !perp_accounting.position_matches_exchange(
-                        snapshot.account.position.size,
-                        snapshot.market.lot_size,
-                    ) {
-                        perp_accounting_blocked = Some(format!(
-                            "Perp accounting mismatch: exchange position {} vs ledger {}",
-                            snapshot.account.position.size, perp_accounting.position_base
-                        ));
-                    } else {
-                        perp_accounting_blocked = None;
-                    }
-                    if changed {
+            if !perp_accounting_initialized {
+                match api
+                    .perp_fill_history(&settings.subaccount, &snapshot.market, None)
+                    .await
+                {
+                    Ok(fills) => {
+                        if !snapshot.account.position.size.is_zero() {
+                            anyhow::bail!(
+                                "refusing Perp startup with existing position {}; no verified grid journal is available",
+                                snapshot.account.position.size
+                            )
+                        }
+                        // Existing historical trades are not strategy PnL for this new run.
+                        perp_accounting.seed_historical_fills(&fills, snapshot.observed_at);
+                        perp_accounting_initialized = true;
                         perp_runtime.accounting = perp_accounting.clone();
                         run_state.perp_runtime = Some(perp_runtime.clone());
                         if let Some(journal) = &journal {
                             journal.save_state(&run_state)?;
                         }
                     }
+                    Err(error) => {
+                        perp_accounting_blocked = Some(format!(
+                            "Perp accounting unavailable; refusing new risk: {error:#}"
+                        ));
+                    }
                 }
-                Err(error) => {
+            } else {
+                let current_generation = ws_state::generation(&ws_state);
+                if current_generation != last_ws_generation {
+                    last_ws_generation = current_generation;
+                    // The private stream has no replay cursor. Recover the bounded overlap once
+                    // per new connection generation before trusting newly hydrated WS trades.
+                    match api
+                        .perp_fill_history(
+                            &settings.subaccount,
+                            &snapshot.market,
+                            perp_accounting.history_cursor(),
+                        )
+                        .await
+                    {
+                        Ok(fills) => {
+                            for fill in fills {
+                                if !perp_accounting.has_processed_fill(&fill.id) {
+                                    let event = journal::JournalEvent::PerpFillApplied {
+                                        at: Utc::now(),
+                                        fill: fill.clone(),
+                                    };
+                                    let journal = journal
+                                        .as_ref()
+                                        .expect("live Perp execution always has a durable journal");
+                                    journal.append(&event)?;
+                                    run_state.apply(&event);
+                                    perp_accounting.apply_fill(&fill)?;
+                                    journal.save_state(&run_state)?;
+                                }
+                            }
+                        }
+                        Err(error) => {
+                            perp_accounting_blocked = Some(format!(
+                                "Perp trade backfill after WS reconnect failed: {error:#}"
+                            ));
+                        }
+                    }
+                }
+                match ws_state::perp_fills(&ws_state) {
+                    Ok(fills) => {
+                        for fill in fills {
+                            if perp_accounting.has_processed_fill(&fill.id) {
+                                continue;
+                            }
+                            let event = journal::JournalEvent::PerpFillApplied {
+                                at: Utc::now(),
+                                fill: fill.clone(),
+                            };
+                            let journal = journal
+                                .as_ref()
+                                .expect("live Perp execution always has a durable journal");
+                            journal.append(&event)?;
+                            run_state.apply(&event);
+                            perp_accounting.apply_fill(&fill)?;
+                            journal.save_state(&run_state)?;
+                        }
+                        perp_runtime.accounting = perp_accounting.clone();
+                        run_state.perp_runtime = Some(perp_runtime.clone());
+                    }
+                    Err(error) => {
+                        // A Net action has no trustworthy side in the WS DTO. This is the narrow
+                        // recovery path that may consult order history through the REST helper.
+                        match api
+                            .perp_fill_history(
+                                &settings.subaccount,
+                                &snapshot.market,
+                                perp_accounting.history_cursor(),
+                            )
+                            .await
+                        {
+                            Ok(fills) => {
+                                for fill in fills {
+                                    if !perp_accounting.has_processed_fill(&fill.id) {
+                                        let event = journal::JournalEvent::PerpFillApplied {
+                                            at: Utc::now(),
+                                            fill: fill.clone(),
+                                        };
+                                        let journal = journal.as_ref().expect(
+                                            "live Perp execution always has a durable journal",
+                                        );
+                                        journal.append(&event)?;
+                                        run_state.apply(&event);
+                                        perp_accounting.apply_fill(&fill)?;
+                                        journal.save_state(&run_state)?;
+                                    }
+                                }
+                            }
+                            Err(recovery_error) => {
+                                perp_accounting_blocked = Some(format!(
+                                    "Perp WS trade could not be resolved ({error:#}); recovery failed: {recovery_error:#}"
+                                ))
+                            }
+                        }
+                    }
+                }
+                if perp_accounting_blocked.is_none()
+                    && !perp_accounting.position_matches_exchange(
+                        snapshot.account.position.size,
+                        snapshot.market.lot_size,
+                    )
+                {
                     perp_accounting_blocked = Some(format!(
-                        "Perp accounting unavailable; refusing new risk: {error:#}"
+                        "Perp accounting mismatch: exchange position {} vs ledger {}",
+                        snapshot.account.position.size, perp_accounting.position_base
                     ));
+                } else if perp_accounting_blocked.is_none() {
+                    perp_accounting_blocked = None;
                 }
             }
-            let mark_price = api.mark_price(&snapshot.market).await.ok();
+            let mark_price = match api.mark_price(&snapshot.market).await {
+                Ok(price) => Some(price),
+                Err(error) => {
+                    let message =
+                        format!("Perp mark-price unavailable; PnL is incomplete: {error:#}");
+                    eprintln!("{message}");
+                    if let Some(runtime) = &engine_runtime {
+                        runtime
+                            .update_status(|status| {
+                                status.events.push(decibel_grid_tui::control::EngineEvent {
+                                    at: Utc::now(),
+                                    message: message.clone(),
+                                });
+                                if status.events.len() > 200 {
+                                    status.events.drain(..status.events.len() - 200);
+                                }
+                            })
+                            .await;
+                    }
+                    None
+                }
+            };
             if let Some(runtime) = &engine_runtime {
                 let pnl =
                     perp_pnl_status(&perp_accounting, snapshot.account.position.size, mark_price);
@@ -673,12 +742,78 @@ pub async fn run_cli(
                     }
                 }
                 snapshot.plan =
-                    decibel_grid_tui::strategy::perp::runtime::finalize_perp_executable_plan(
+                    match decibel_grid_tui::strategy::perp::runtime::finalize_perp_executable_plan(
                         &config,
                         snapshot.plan.clone(),
                         snapshot.account.position.size,
                         snapshot.account.available_margin,
-                    )?;
+                    ) {
+                        Ok(plan) => {
+                            perp_risk_pause_reason = None;
+                            plan
+                        }
+                        Err(error) => {
+                            let reason = format!("Perp risk evaluation paused: {error:#}");
+                            eprintln!("RISK PAUSED: {reason}");
+                            if let Some(runtime) = &engine_runtime {
+                                runtime
+                                    .update_status(|status| {
+                                        status.phase = "risk_paused".to_owned();
+                                        status.last_error = Some(reason.clone());
+                                        status.perp_blocked_reason = Some(reason.clone());
+                                    })
+                                    .await;
+                            }
+                            if perp_risk_pause_reason.is_none() {
+                                let event = journal::JournalEvent::RiskRejected {
+                                    at: Utc::now(),
+                                    reason: reason.clone(),
+                                };
+                                if let Some(journal) = &journal {
+                                    if let Err(journal_error) = journal.append(&event) {
+                                        eprintln!(
+                                            "could not persist Perp risk pause: {journal_error:#}"
+                                        );
+                                    } else {
+                                        run_state.apply(&event);
+                                        if let Err(journal_error) = journal.save_state(&run_state) {
+                                            eprintln!(
+                                                "could not save Perp risk pause state: {journal_error:#}"
+                                            );
+                                        }
+                                    }
+                                }
+                                if execute {
+                                    match spot_lifecycle::cancel_bulk_ladder(
+                                        &settings.network,
+                                        &settings.aptos_private_key,
+                                        &settings.subaccount,
+                                        &snapshot.market,
+                                        gas_station,
+                                    )
+                                    .await
+                                    {
+                                        Ok(hash) => println!(
+                                            "Perp risk pause cancelled the active ladder in tx {hash}; position retained."
+                                        ),
+                                        Err(cancel_error) => eprintln!(
+                                            "Perp risk pause could not cancel the active ladder: {cancel_error:#}"
+                                        ),
+                                    }
+                                }
+                            }
+                            perp_risk_pause_reason = Some(reason);
+                            if let Some(notifier) = &notifier {
+                                let notifier = notifier.clone();
+                                let reason = perp_risk_pause_reason.clone().unwrap_or_default();
+                                tokio::spawn(async move {
+                                    notifier.send("Decibel Perp risk paused", &reason).await;
+                                });
+                            }
+                            tokio::time::sleep(config.refresh).await;
+                            continue;
+                        }
+                    };
                 if perp_runtime.bootstrap_status == journal::PerpBootstrapStatus::Pending
                     && perp_runtime.bootstrap_target_position.is_none()
                 {
@@ -796,13 +931,27 @@ pub async fn run_cli(
         // exactly (`0 missing`) and hides the very shortfall that funding is supposed to close.
         let mut actual_for_execution = None;
         if execute {
-            let actual = match api
-                .open_orders(&settings.subaccount, &snapshot.market)
-                .await
-            {
+            if ws_state::bulk_ladder_desynced(&ws_state) {
+                eprintln!(
+                    "WebSocket bulk sequence gap detected; recovering the authoritative ladder once."
+                );
+                match api
+                    .active_bulk_ladder(&settings.subaccount, &snapshot.market)
+                    .await
+                {
+                    Ok(ladder) => ws_state::recover_bulk_ladder(&ws_state, ladder),
+                    Err(error) => {
+                        eprintln!("bulk ladder recovery failed: {error:#}; skipping cycle");
+                        check_cancel!();
+                        tokio::time::sleep(config.refresh).await;
+                        continue;
+                    }
+                }
+            }
+            let actual = match ws_state::actual_orders(&ws_state) {
                 Ok(orders) => orders,
                 Err(e) => {
-                    eprintln!("reconciliation failed (open_orders): {e:#}; skipping cycle");
+                    eprintln!("reconciliation failed (WebSocket orders): {e:#}; skipping cycle");
                     check_cancel!();
                     tokio::time::sleep(config.refresh).await;
                     continue;
@@ -835,6 +984,7 @@ pub async fn run_cli(
                         .expect("live Spot execution fetched fee rates"),
                     &config.spot,
                     gas_station,
+                    Some(&ws_state),
                 )
                 .await;
                 check_cancel!();
@@ -1214,6 +1364,7 @@ pub async fn run_cli(
                                     &bootstrap_plan,
                                     &config.spot,
                                     gas_station,
+                                    Some(&ws_state),
                                 )
                                 .await
                                 {
@@ -1236,6 +1387,26 @@ pub async fn run_cli(
                                         snapshot.account = account;
                                     }
                                     Err(error) => {
+                                        if decibel_grid_tui::strategy::perp::convergence::preflight_failure_is_retryable(&error) {
+                                            let reason = format!(
+                                                "Perp bootstrap waiting for a safe executable book: {error:#}"
+                                            );
+                                            if last_perp_preflight_deferral.as_deref()
+                                                != Some(reason.as_str())
+                                            {
+                                                eprintln!("{reason}");
+                                            }
+                                            last_perp_preflight_deferral = Some(reason.clone());
+                                            exec_plan.perp_blocked_reason = Some(reason);
+                                            perp_runtime.accounting = perp_accounting.clone();
+                                            run_state.perp_runtime = Some(perp_runtime.clone());
+                                            if let Some(journal) = &journal {
+                                                journal.save_state(&run_state)?;
+                                            }
+                                            tokio::time::sleep(config.refresh).await;
+                                            continue;
+                                        }
+                                        last_perp_preflight_deferral = None;
                                         let reason = format!("Perp bootstrap blocked: convergence failed: {error:#}");
                                         perp_runtime.block_bootstrap();
                                         eprintln!("{reason}");
@@ -1271,7 +1442,6 @@ pub async fn run_cli(
                         | journal::PerpBootstrapStatus::LegacyUnknown => {
                             let reason = "Perp bootstrap blocked; refusing automatic grid submission until operator restarts or explicitly retries".to_owned();
                             exec_plan.perp_blocked_reason = Some(reason.clone());
-                            eprintln!("{reason}");
                         }
                     }
                 } // end Perp convergence block
@@ -1290,10 +1460,18 @@ pub async fn run_cli(
                         )
                         .is_some())
                 {
-                    let account = api
+                    let account = match api
                         .account(Some(&settings.subaccount), &snapshot.market)
                         .await
-                        .ok();
+                    {
+                        Ok(account) => Some(account),
+                        Err(error) => {
+                            eprintln!(
+                                "could not refresh Spot funds before underfunded submission check; retaining conservative skip: {error:#}"
+                            );
+                            None
+                        }
+                    };
                     let fresh_funds = account
                         .and_then(|a| a.spot_funds)
                         .unwrap_or_else(|| funds.clone());
@@ -1385,11 +1563,15 @@ pub async fn run_cli(
                                         == journal::PerpBootstrapStatus::Pending,
                                 )
                         {
-                            decibel_grid_tui::strategy::perp::runtime::record_perp_risk_rejection(
-                                reason,
-                                journal.as_ref(),
-                                &mut run_state,
-                            )?;
+                            if last_perp_submission_block_reason.as_deref() != Some(reason.as_str())
+                            {
+                                decibel_grid_tui::strategy::perp::runtime::record_perp_risk_rejection(
+                                    reason.clone(),
+                                    journal.as_ref(),
+                                    &mut run_state,
+                                )?;
+                                last_perp_submission_block_reason = Some(reason);
+                            }
                         } else if run_state.bulk_ladder.as_ref().is_some_and(|ladder| {
                             matches!(
                                 ladder.state,
@@ -1407,16 +1589,9 @@ pub async fn run_cli(
                                 ladder.operation_id, ladder.state
                             );
                         } else {
-                            let observed = api
-                                .active_bulk_ladder(&settings.subaccount, &snapshot.market)
-                                .await?;
-                            let sequence = api
-                                .next_bulk_sequence(
-                                    &settings.subaccount,
-                                    &snapshot.market.address,
-                                    snapshot.market.product,
-                                )
-                                .await?;
+                            last_perp_submission_block_reason = None;
+                            let observed = ws_state::active_bulk_ladder(&ws_state)?;
+                            let sequence = ws_state::next_bulk_sequence(&ws_state)?;
                             let intent = bulk_ladder_intent(
                                 format!(
                                     "{}:{}:{}",
@@ -1472,18 +1647,24 @@ pub async fn run_cli(
                                 Ok(execution) => {
                                     let mut venue_observed = false;
                                     for _ in 0..6 {
-                                        if api
-                                            .active_bulk_ladder(
-                                                &settings.subaccount,
-                                                &snapshot.market,
-                                            )
-                                            .await?
+                                        if ws_state::active_bulk_ladder(&ws_state)?
                                             .is_some_and(|active| active.matches(&intent))
                                         {
                                             venue_observed = true;
                                             break;
                                         }
                                         tokio::time::sleep(Duration::from_secs(1)).await;
+                                    }
+                                    if !venue_observed {
+                                        // A committed transaction without its expected WS event is
+                                        // an exceptional recovery path, not normal reconciliation.
+                                        venue_observed = api
+                                            .active_bulk_ladder(
+                                                &settings.subaccount,
+                                                &snapshot.market,
+                                            )
+                                            .await?
+                                            .is_some_and(|active| active.matches(&intent));
                                     }
                                     if !venue_observed {
                                         let blocked = journal::JournalEvent::BulkLifecycleBlocked {
@@ -1618,82 +1799,31 @@ pub async fn run_cli(
             config.refresh
         };
         let wait = interval.saturating_sub(elapsed);
-        if execute && config.product == Product::Spot {
+        if execute {
             let sleep = tokio::time::sleep(wait);
             tokio::pin!(sleep);
             loop {
                 tokio::select! {
                     _ = &mut sleep => break,
-                    event = spot_event_rx.recv() => match event {
-                        Some(events::SpotEvent::BulkFill(fill)) => {
-                            println!("Spot bulk fill {} {} at {}; reconciling immediately.", fill.size, fill.market_addr, fill.price);
-                            if run_state
-                                .processed_spot_fill_uids
-                                .iter()
-                                .any(|uid| uid == &fill.event_uid)
-                            {
-                                println!("Ignoring duplicate Spot bulk fill event {}.", fill.event_uid);
-                                break;
-                            }
+                    event = ws_lifecycle_rx.recv() => match event {
+                        Ok(ws_state::WsLifecycleEvent::BulkFillApplied(fill)) => {
+                            println!("Bulk fill {} at {}; reconciling immediately.", fill.size, fill.price);
                             if let Some(runtime) = &engine_runtime {
-                                let message = format!("fill: {} {} at {}", fill.size, fill.market_addr, fill.price);
+                                let message = format!("bulk fill: {} at {}", fill.size, fill.price);
                                 runtime.update_status(|status| {
                                     status.events.push(decibel_grid_tui::control::EngineEvent { at: Utc::now(), message });
                                     if status.events.len() > 200 { status.events.drain(..status.events.len() - 200); }
                                 }).await;
                             }
                             if let Some(journal) = &journal {
-                                let operation_id = run_state
-                                    .bulk_ladder
-                                    .as_ref()
-                                    .map(|ladder| ladder.operation_id.clone())
-                                    .unwrap_or_else(|| "unknown".to_owned());
-                                let attribution = run_state
-                                    .bulk_ladder
-                                    .as_mut()
-                                    .ok_or_else(|| anyhow::anyhow!("Spot bulk fill arrived with no local bulk ladder"))
-                                    .and_then(|ladder| apply_spot_fill_to_ladder(ladder, &fill));
-                                let event = journal::JournalEvent::SpotFill {
+                                let event = journal::JournalEvent::BulkLevelFilled {
                                     at: Utc::now(),
-                                    market: fill.market_addr.clone(),
-                                    price: fill.price.normalize().to_string(),
-                                    size: fill.size.normalize().to_string(),
-                                    side: fill.side.clone(),
+                                    trade_id: fill.trade_id,
                                     event_uid: fill.event_uid.clone(),
-                                    bulk_sequence_number: fill.bulk_sequence_number.clone(),
-                                    order_id: fill.order_id.clone(),
-                                    fee: fill.fee.map(|fee| fee.normalize().to_string()),
-                                    venue_timestamp: fill.timestamp.clone(),
-                                };
-                                journal.append(&event)?;
-                                run_state.apply(&event);
-                                if let Err(error) = attribution {
-                                    let blocked = journal::JournalEvent::BulkLifecycleBlocked {
-                                        at: Utc::now(),
-                                        operation_id,
-                                        reason: format!("Spot fill could not be attributed safely: {error:#}"),
-                                    };
-                                    journal.append(&blocked)?;
-                                    run_state.apply(&blocked);
-                                    eprintln!("BULK LIFECYCLE BLOCKED: Spot fill attribution failed: {error:#}");
-                                }
-                                journal.save_state(&run_state)?;
-                            }
-                            break;
-                        }
-                        Some(events::SpotEvent::BulkOrderRejected(rejected)) => {
-                            eprintln!("Spot bulk order rejected for {}: {}; reconciling immediately.", rejected.market_addr, rejected.reason);
-                            if let Some(runtime) = &engine_runtime {
-                                let message = format!("bulk rejected: {}", rejected.reason);
-                                runtime.update_status(|status| {
-                                    status.events.push(decibel_grid_tui::control::EngineEvent { at: Utc::now(), message });
-                                    if status.events.len() > 200 { status.events.drain(..status.events.len() - 200); }
-                                }).await;
-                            }
-                            if let Some(journal) = &journal {
-                                let event = journal::JournalEvent::RiskRejected {
-                                    at: Utc::now(),
-                                    reason: format!("bulk order rejected for {}: {}", rejected.market_addr, rejected.reason),
+                                    sequence: fill.sequence,
+                                    side: fill.side,
+                                    price: fill.price,
+                                    size: fill.size,
                                 };
                                 journal.append(&event)?;
                                 run_state.apply(&event);
@@ -1701,15 +1831,16 @@ pub async fn run_cli(
                             }
                             break;
                         }
-                        Some(events::SpotEvent::Reconnected(reconnected)) => {
-                            println!("Spot event connection re-established ({}); reconciling REST state.", reconnected.reconnect_count);
+                        Ok(ws_state::WsLifecycleEvent::TradeApplied | ws_state::WsLifecycleEvent::BulkOrderChanged | ws_state::WsLifecycleEvent::OrderChanged) => {
                             break;
                         }
-                        Some(events::SpotEvent::Mid(_) | events::SpotEvent::Depth(_)) => {
-                            // Depth/mid updates refresh the local feed but only fills, rejects,
-                            // reconnects, or the periodic timer may trigger a ladder replacement.
+                        Ok(ws_state::WsLifecycleEvent::Desynced(reason)) => {
+                            eprintln!("WebSocket state desynced: {reason}; recovery cycle required.");
+                            break;
                         }
-                        None => break,
+                        Ok(ws_state::WsLifecycleEvent::Ready | ws_state::WsLifecycleEvent::Reconnected | ws_state::WsLifecycleEvent::Disconnected) => break,
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                     }
                 }
             }

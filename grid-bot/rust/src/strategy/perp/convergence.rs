@@ -3,6 +3,7 @@
 use anyhow::{Result, anyhow, bail};
 use rust_decimal::Decimal;
 
+use crate::ws_state::WsStateHandle;
 use crate::{
     DecibelClient, GasStationConfig, GridPlan, Market, OrderBook, SpotExecutionConfig, round_down,
     submit_perp_market_order,
@@ -77,6 +78,13 @@ pub fn preflight_perp_market_order(
     Ok(average)
 }
 
+/// A preflight failure means no transaction was submitted. The engine may wait for a healthier
+/// book and retry it; submission and post-submission failures remain operator-visible blocks.
+pub fn preflight_failure_is_retryable(error: &anyhow::Error) -> bool {
+    let message = format!("{error:#}");
+    message.contains("Perp market-order preflight")
+}
+
 pub async fn execute_perp_convergence_market(
     network: &str,
     client: &DecibelClient,
@@ -86,6 +94,7 @@ pub async fn execute_perp_convergence_market(
     plan: &GridPlan,
     guard: &SpotExecutionConfig,
     gas_station: Option<&GasStationConfig>,
+    ws_state: Option<&WsStateHandle>,
 ) -> Result<ConvergencePlan> {
     let target = plan
         .target_position
@@ -124,12 +133,11 @@ pub async fn execute_perp_convergence_market(
         } else {
             guard.entry_max_slippage_bps
         };
-        let average = preflight_perp_market_order(
-            &client.order_book(market, 50).await?,
-            side_buy,
-            size,
-            max_slippage_bps,
-        )?;
+        let book = match ws_state {
+            Some(state) => crate::ws_state::fresh_depth(state, std::time::Duration::from_secs(2))?,
+            None => client.order_book(market, 50).await?,
+        };
+        let average = preflight_perp_market_order(&book, side_buy, size, max_slippage_bps)?;
         println!(
             "Perp market-order preflight: {} {} at estimated average {} ({} bps guard; no hard price cap)",
             if side_buy { "buy" } else { "sell" },
@@ -204,7 +212,7 @@ mod tests {
 
     use crate::{BookLevel, OrderBook};
 
-    use super::preflight_perp_market_order;
+    use super::{preflight_failure_is_retryable, preflight_perp_market_order};
 
     #[test]
     fn preflight_rejects_a_market_buy_beyond_the_slippage_guard() {
@@ -226,5 +234,20 @@ mod tests {
             preflight_perp_market_order(&book, true, dec!(2), dec!(100)).unwrap(),
             dec!(101)
         );
+    }
+
+    #[test]
+    fn preflight_failures_are_retryable_without_submitting_an_order() {
+        let error = preflight_perp_market_order(
+            &OrderBook {
+                bids: vec![],
+                asks: vec![],
+            },
+            true,
+            dec!(1),
+            dec!(50),
+        )
+        .unwrap_err();
+        assert!(preflight_failure_is_retryable(&error));
     }
 }
