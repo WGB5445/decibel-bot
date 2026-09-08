@@ -1112,9 +1112,70 @@ pub async fn perp_cli(settings: Settings, cmd: crate::cli::settings::PerpCmd) ->
                 "  range_action:       {:?}",
                 snapshot.plan.out_of_range_action_applied
             );
-            if let Some(reason) = snapshot.plan.perp_blocked_reason {
-                println!("  blocked_reason:     {reason}");
+            Ok(())
+        }
+        crate::cli::settings::PerpCmd::BootstrapClearBlocked { confirm_clear } => {
+            if !confirm_clear {
+                anyhow::bail!("bootstrap-clear-blocked requires --confirm-clear to proceed");
             }
+            let api = settings.api_client()?;
+            let config = settings.to_grid_config()?;
+            let run_id = journal::persistent_run_id(
+                &settings.network,
+                &settings.subaccount,
+                &config.market_name,
+            );
+            let journal =
+                journal::Journal::new(&run_id).context("open run journal for bootstrap reset")?;
+            let mut state = journal
+                .load_state()?
+                .ok_or_else(|| anyhow::anyhow!("no journal state found for run {run_id}"))?;
+
+            let market = api.market(&config.market_name, config.product).await?;
+            let snapshot = fetch_snapshot(
+                &api,
+                &config,
+                (!settings.subaccount.trim().is_empty()).then_some(settings.subaccount.as_str()),
+            )
+            .await?;
+
+            // Safety checks before clearing blocked state.
+            if !snapshot.account.position.size.is_zero() {
+                anyhow::bail!(
+                    "refusing to clear bootstrap-blocked: exchange position is {} (must be flat)",
+                    snapshot.account.position.size
+                );
+            }
+            if api
+                .active_bulk_ladder(&settings.subaccount, &market)
+                .await?
+                .is_some()
+            {
+                anyhow::bail!(
+                    "refusing to clear bootstrap-blocked: active bulk ladder exists on venue"
+                );
+            }
+
+            let perp = state
+                .perp_runtime
+                .as_mut()
+                .ok_or_else(|| anyhow::anyhow!("no Perp runtime state in journal"))?;
+            if perp.bootstrap_status != decibel_grid_tui::journal::PerpBootstrapStatus::Blocked {
+                anyhow::bail!(
+                    "bootstrap status is {:?}, not Blocked; nothing to clear",
+                    perp.bootstrap_status
+                );
+            }
+            perp.bootstrap_status = decibel_grid_tui::journal::PerpBootstrapStatus::Pending;
+            perp.bootstrap_target_position = None;
+            journal.save_state(&state)?;
+            let cleared = journal::JournalEvent::RiskRejected {
+                at: Utc::now(),
+                reason: "operator cleared bootstrap-blocked status via CLI".to_owned(),
+            };
+            journal.append(&cleared)?;
+            println!("Bootstrap status reset to Pending. Run `perp bootstrap-inspect` to verify.");
+            println!("Next engine start will attempt bootstrap convergence again.");
             Ok(())
         }
     }

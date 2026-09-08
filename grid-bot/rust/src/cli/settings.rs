@@ -81,6 +81,13 @@ pub(crate) enum JournalCmd {
 pub(crate) enum PerpCmd {
     /// Read-only Perp bootstrap diagnostics: target, position, convergence delta, ledger, fills.
     BootstrapInspect,
+    /// Reset bootstrap status from Blocked back to Pending. Requires --confirm-clear.
+    /// This is safe only when the exchange position is flat and no active bulk ladder exists.
+    BootstrapClearBlocked {
+        /// Confirm the clear operation.
+        #[arg(long)]
+        confirm_clear: bool,
+    },
 }
 
 #[derive(ClapArgs, Clone)]
