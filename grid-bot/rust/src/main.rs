@@ -1,5 +1,6 @@
 mod cli;
 mod engine;
+mod logging;
 mod tui;
 
 use std::{
@@ -20,8 +21,9 @@ use dotenvy::dotenv;
 use cli::settings::has_complete_grid_config;
 use cli::{Cli, Cmd, Settings, control_paths, redirect_output_to_log};
 use cli::{
-    attach_client, check_api_key, doctor_cli, engine_cli, logs_client, reconcile_cli, shadow_cli,
-    simulate_cli, spot_funding_setup_cli, start_cli, status_client, stop_client,
+    attach_client, check_api_key, doctor_cli, engine_cli, journal_cli, logs_client, perp_cli,
+    reconcile_cli, shadow_cli, simulate_cli, spot_funding_setup_cli, start_cli, status_client,
+    stop_client,
 };
 use tui::{TAB_CONFIG, TAB_MONITOR, TAB_PREVIEW, run_tui, save_error_report};
 
@@ -92,10 +94,10 @@ async fn main() -> Result<()> {
             anyhow::bail!("--log-file is only supported by CLI commands, not TUI/preview")
         }
         redirect_output_to_log(path)?;
-        println!(
-            "CLI log started; output is being overwritten at {}",
-            path.display()
-        );
+    }
+    logging::init();
+    if let Some(path) = log_path.as_deref() {
+        tracing::info!(target: "startup", log_path = %path.display(), "CLI log started");
     }
     match cli.command {
         Some(Cmd::Start) => {
@@ -139,6 +141,8 @@ async fn main() -> Result<()> {
             )
             .await
         }
+        Some(Cmd::Journal(cmd)) => journal_cli(Settings::from(&cli.args), cmd).await,
+        Some(Cmd::Perp(cmd)) => perp_cli(Settings::from(&cli.args), cmd).await,
         Some(Cmd::Preview) => {
             run_tui(
                 Settings::from(&cli.args),

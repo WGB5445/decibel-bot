@@ -140,6 +140,23 @@ pub enum JournalEvent {
         at: DateTime<Utc>,
         fill: PerpFill,
     },
+    BootstrapIntentRecorded {
+        at: DateTime<Utc>,
+        target: String,
+        delta: String,
+        side: String,
+    },
+    BootstrapConverged {
+        at: DateTime<Utc>,
+        target: String,
+        position_before: String,
+        position_after: String,
+    },
+    BootstrapFailed {
+        at: DateTime<Utc>,
+        target: String,
+        reason: String,
+    },
     RiskRejected {
         at: DateTime<Utc>,
         reason: String,
@@ -318,6 +335,32 @@ pub struct RunState {
     pub last_event_at: DateTime<Utc>,
 }
 
+impl Default for RunState {
+    fn default() -> Self {
+        Self {
+            metadata: RunMetadata {
+                run_id: String::new(),
+                started_at: Utc::now(),
+                network: String::new(),
+                subaccount: String::new(),
+                market: String::new(),
+                product: String::new(),
+                config_hash: String::new(),
+                program_version: String::new(),
+            },
+            spot_runtime: None,
+            perp_runtime: None,
+            bulk_ladder: None,
+            processed_spot_fill_uids: Vec::new(),
+            last_reconciliation: None,
+            plan_generation: 0,
+            submitted_orders: 0,
+            failed_orders: 0,
+            last_event_at: Utc::now(),
+        }
+    }
+}
+
 impl RunState {
     pub fn new(metadata: RunMetadata) -> Self {
         Self {
@@ -462,6 +505,17 @@ impl RunState {
             JournalEvent::PerpFillApplied { fill, .. } => {
                 if let Some(runtime) = self.perp_runtime.as_mut() {
                     let _ = runtime.accounting.apply_fill(fill);
+                }
+            }
+            JournalEvent::BootstrapIntentRecorded { .. } => {}
+            JournalEvent::BootstrapConverged { .. } => {
+                if let Some(runtime) = self.perp_runtime.as_mut() {
+                    runtime.bootstrap_status = PerpBootstrapStatus::Completed;
+                }
+            }
+            JournalEvent::BootstrapFailed { .. } => {
+                if let Some(runtime) = self.perp_runtime.as_mut() {
+                    runtime.bootstrap_status = PerpBootstrapStatus::Blocked;
                 }
             }
             JournalEvent::BulkOrderFailed { .. } => self.failed_orders += 1,

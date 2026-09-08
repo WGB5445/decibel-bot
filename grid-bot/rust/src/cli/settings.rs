@@ -20,7 +20,7 @@ pub struct Cli {
     pub(crate) args: Args,
 }
 
-#[derive(Subcommand, Clone, Copy, Eq, PartialEq)]
+#[derive(Subcommand, Clone, Eq, PartialEq)]
 pub enum Cmd {
     /// Launch a local engine child and return once its control socket is ready.
     Start,
@@ -53,6 +53,34 @@ pub enum Cmd {
     /// Offline multi-step scenario simulation (zero network); writes JSONL to stdout.
     Simulate,
     Tui,
+    /// Read-only journal and run diagnostics.
+    #[command(subcommand)]
+    Journal(JournalCmd),
+    /// Perp-specific read-only diagnostics.
+    #[command(subcommand)]
+    Perp(PerpCmd),
+}
+
+#[derive(Subcommand, Clone, Eq, PartialEq)]
+pub(crate) enum JournalCmd {
+    /// Read-only run diagnostics: persistent state, bulk lifecycle, bootstrap status.
+    Status,
+    /// Attempt automatic recovery of a diverged bulk operation by re-querying the exchange.
+    /// Requires --confirm-operation <operation-id>.
+    ResolveDivergence {
+        /// The exact operation-id of the diverged bulk ladder.
+        #[arg(long)]
+        operation_id: String,
+        /// Confirm the operation-id to execute recovery.
+        #[arg(long)]
+        confirm_operation: Option<String>,
+    },
+}
+
+#[derive(Subcommand, Clone, Eq, PartialEq)]
+pub(crate) enum PerpCmd {
+    /// Read-only Perp bootstrap diagnostics: target, position, convergence delta, ledger, fills.
+    BootstrapInspect,
 }
 
 #[derive(ClapArgs, Clone)]

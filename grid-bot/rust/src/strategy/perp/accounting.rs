@@ -123,6 +123,10 @@ pub struct PerpPnlSnapshot {
 }
 
 impl PerpAccounting {
+    pub fn fills_count(&self) -> usize {
+        self.processed_fill_ids.len()
+    }
+
     pub fn has_processed_fill(&self, id: &str) -> bool {
         self.processed_fill_ids.contains(id)
     }

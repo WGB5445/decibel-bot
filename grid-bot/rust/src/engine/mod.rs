@@ -14,6 +14,20 @@ use rust_decimal::Decimal;
 use crate::cli::settings::Settings;
 use crate::cli::settings::decimal;
 
+// The engine predates the structured logger and has many operational messages. Keep legacy call
+// sites on one parseable sink while migration adds typed fields to high-value state transitions.
+macro_rules! println {
+    ($($arg:tt)*) => {
+        tracing::info!(target: "engine", "{}", format_args!($($arg)*))
+    };
+}
+
+macro_rules! eprintln {
+    ($($arg:tt)*) => {
+        tracing::warn!(target: "engine", "{}", format_args!($($arg)*))
+    };
+}
+
 fn perp_pnl_status(
     accounting: &decibel_grid_tui::strategy::perp::accounting::PerpAccounting,
     exchange_position: Decimal,
@@ -42,23 +56,125 @@ fn perp_pnl_status(
 
 pub(crate) fn print_snapshot(snapshot: &MonitorSnapshot, config: &GridConfig) {
     let profit = snapshot.plan.profit_preview(config.maker_fee_rate);
-    println!(
-        "{} {:?} mid={} net-scenario={}",
-        snapshot.market.name, snapshot.market.product, snapshot.plan.mid, profit.net_capture
+    tracing::debug!(
+        target: "engine::plan",
+        market = %snapshot.market.name,
+        product = ?snapshot.market.product,
+        mid = %snapshot.plan.mid,
+        net_scenario = %profit.net_capture,
+        bid_levels = snapshot.plan.bids.len(),
+        ask_levels = snapshot.plan.asks.len(),
+        "plan snapshot"
     );
     for level in snapshot.plan.all_levels() {
-        println!(
-            "{:3} {:>12} × {:>10} {:?}",
-            level.side.as_str(),
-            format_decimal(level.price, 8),
-            format_decimal(level.size, 8),
-            level.state
+        tracing::debug!(
+            target: "engine::plan",
+            side = level.side.as_str(),
+            price = %format_decimal(level.price, 8),
+            size = %format_decimal(level.size, 8),
+            level_state = ?level.state,
+            "planned level"
         );
     }
 }
 
 pub(crate) fn optional_subaccount(settings: &Settings) -> Option<&str> {
     (!settings.subaccount.trim().is_empty()).then_some(settings.subaccount.as_str())
+}
+
+/// Compute the current execution phase from WS state and journal lifecycle. This is the single
+/// authority for whether the bot may compute plans, reconcile, and submit orders. Every execution
+/// path consults this before acting; non-Ready phases still run status updates for visibility.
+/// Journal a full cancel lifecycle: intent → broadcast → observed. Returns the cancel outcome.
+/// If there is no tracked bulk ladder, skips the cancel entirely.
+async fn journaled_bulk_cancel(
+    journal: Option<&decibel_grid_tui::journal::Journal>,
+    run_state: &mut decibel_grid_tui::journal::RunState,
+    network: &str,
+    private_key: &str,
+    subaccount: &str,
+    market: &decibel_grid_tui::Market,
+    gas_station: Option<&decibel_grid_tui::GasStationConfig>,
+) -> Result<Option<String>> {
+    let operation_id = run_state
+        .bulk_ladder
+        .as_ref()
+        .map(|ladder| ladder.operation_id.clone());
+    let Some(op_id) = operation_id else {
+        return Ok(None);
+    };
+    let journal = match journal {
+        Some(j) => j,
+        None => return Ok(None),
+    };
+    let cancel_intent = decibel_grid_tui::journal::JournalEvent::BulkCancelIntentRecorded {
+        at: Utc::now(),
+        operation_id: op_id.clone(),
+    };
+    journal.append(&cancel_intent)?;
+    run_state.apply(&cancel_intent);
+    journal.save_state(&run_state)?;
+
+    let cancel_op_id = op_id.clone();
+    let hash = decibel_grid_tui::spot_lifecycle::cancel_bulk_ladder_with_broadcast(
+        network,
+        private_key,
+        subaccount,
+        market,
+        gas_station,
+        |tx_hash| {
+            let broadcast = decibel_grid_tui::journal::JournalEvent::BulkCancelBroadcast {
+                at: Utc::now(),
+                operation_id: cancel_op_id.clone(),
+                transaction_hash: tx_hash.to_owned(),
+            };
+            journal.append(&broadcast)?;
+            run_state.apply(&broadcast);
+            journal.save_state(&run_state)
+        },
+    )
+    .await?;
+
+    let observed = decibel_grid_tui::journal::JournalEvent::BulkCancelledObserved {
+        at: Utc::now(),
+        operation_id: op_id,
+    };
+    journal.append(&observed)?;
+    run_state.apply(&observed);
+    journal.save_state(&run_state)?;
+    Ok(Some(hash))
+}
+
+fn engine_phase(
+    ws_state: &decibel_grid_tui::ws_state::WsStateHandle,
+    run_state: &decibel_grid_tui::journal::RunState,
+) -> control::EnginePhase {
+    if !decibel_grid_tui::ws_state::can_execute(ws_state) {
+        let state = ws_state.read().expect("WS state lock poisoned");
+        if !state.subscriptions_ready {
+            return control::EnginePhase::Connecting;
+        }
+        if state.orders_desynced || state.bulk_ladder_desynced {
+            return control::EnginePhase::Desynced;
+        }
+        return control::EnginePhase::Hydrating;
+    }
+    // Market data freshness is checked inside fetch_snapshot_ws_first. This phase gate focuses on
+    // the WS state that determines whether a plan can be computed safely.
+    if run_state.bulk_ladder.as_ref().is_some_and(|ladder| {
+        matches!(
+            ladder.state,
+            decibel_grid_tui::journal::BulkLadderState::IntentRecorded
+                | decibel_grid_tui::journal::BulkLadderState::BroadcastPending
+                | decibel_grid_tui::journal::BulkLadderState::BroadcastUnknown
+                | decibel_grid_tui::journal::BulkLadderState::Committed
+                | decibel_grid_tui::journal::BulkLadderState::Diverged
+                | decibel_grid_tui::journal::BulkLadderState::CancelPending
+        )
+    }) {
+        return control::EnginePhase::LifecycleBlocked;
+    }
+    control::EnginePhase::Ready
 }
 
 /// Run the grid from a non-interactive terminal.
@@ -233,7 +349,12 @@ pub async fn run_cli(
     // Retain a short Spot-only cooldown for transient reconciliation drift. Perp geometry is
     // pinned below, so a mid-price refresh cannot create price-only ladder drift.
     const BULK_REPLACEMENT_COOLDOWN: Duration = Duration::from_secs(30);
+    // A divergent bulk submission is exceptional. Retry the targeted REST recovery, but never
+    // turn a temporarily lagging indexer into one HTTP request (or one log entry) per cycle.
+    const DIVERGED_BULK_RECOVERY_INTERVAL: Duration = Duration::from_secs(30);
     let mut last_bulk_replacement_at: Option<tokio::time::Instant> = None;
+    let mut last_diverged_bulk_recovery_at: Option<tokio::time::Instant> = None;
+    let mut last_bulk_lifecycle_blocked_operation: Option<String> = None;
     // Total resting levels (bid_count + ask_count) from the last submitted bulk ladder. A
     // changed level count means inventory/affordability moved (a fill, funding, or a PFS-driven
     // shrink), which must replace immediately regardless of the cooldown.
@@ -356,6 +477,20 @@ pub async fn run_cli(
             }
         };
         check_cancel!();
+        let phase = if execute {
+            engine_phase(&ws_state, &run_state)
+        } else {
+            control::EnginePhase::Ready
+        };
+        // Log a single-line phase transition so operator can see hydration progress without DEBUG.
+        // (Structured engine logging will later push this as a typed field.)
+        if execute && phase != control::EnginePhase::Ready {
+            tracing::info!(
+                target: "engine",
+                phase = ?phase,
+                "execution paused; awaiting WS hydration or lifecycle recovery"
+            );
+        }
         if let Some(runtime) = &engine_runtime {
             let mid = snapshot.plan.mid.to_string();
             let funds = snapshot.account.spot_funds.as_ref().map(|funds| {
@@ -431,6 +566,7 @@ pub async fn run_cli(
             runtime
                 .update_status(|status| {
                     status.phase = "running".to_owned();
+                    status.engine_phase = phase.clone();
                     status.last_cycle_at = Some(Utc::now());
                     status.mid = Some(mid);
                     status.last_error = None;
@@ -784,7 +920,9 @@ pub async fn run_cli(
                                     }
                                 }
                                 if execute {
-                                    match spot_lifecycle::cancel_bulk_ladder(
+                                    match journaled_bulk_cancel(
+                                        journal.as_ref(),
+                                        &mut run_state,
                                         &settings.network,
                                         &settings.aptos_private_key,
                                         &settings.subaccount,
@@ -793,9 +931,10 @@ pub async fn run_cli(
                                     )
                                     .await
                                     {
-                                        Ok(hash) => println!(
+                                        Ok(Some(hash)) => println!(
                                             "Perp risk pause cancelled the active ladder in tx {hash}; position retained."
                                         ),
+                                        Ok(None) => {}
                                         Err(cancel_error) => eprintln!(
                                             "Perp risk pause could not cancel the active ladder: {cancel_error:#}"
                                         ),
@@ -860,10 +999,13 @@ pub async fn run_cli(
                         None
                     };
                 if perp_runtime.bootstrap_status == journal::PerpBootstrapStatus::Blocked {
-                    snapshot.plan.perp_blocked_reason = Some(
+                    // Preserve the initial fail-closed cause (invalid target, missing target, or
+                    // convergence failure). Replacing it with this generic status hides the
+                    // operator action required to unblock the durable bootstrap state.
+                    snapshot.plan.perp_blocked_reason.get_or_insert_with(|| {
                         "Perp bootstrap blocked; automatic market convergence and grid submission are paused"
-                            .to_owned(),
-                    );
+                            .to_owned()
+                    });
                 }
                 if execute {
                     decibel_grid_tui::strategy::perp::runtime::handle_perp_out_of_range(
@@ -930,6 +1072,7 @@ pub async fn run_cli(
         // ask side to whatever base is already held, which makes the plan match the chain
         // exactly (`0 missing`) and hides the very shortfall that funding is supposed to close.
         let mut actual_for_execution = None;
+        let execution_permitted = execute && phase == control::EnginePhase::Ready;
         if execute {
             if ws_state::bulk_ladder_desynced(&ws_state) {
                 eprintln!(
@@ -1156,7 +1299,7 @@ pub async fn run_cli(
             journal.save_state(&run_state)?;
         }
 
-        if execute {
+        if execution_permitted {
             // 1. Reconcile using the order snapshot fetched before Spot funding/fitting.
             let actual = actual_for_execution
                 .ok_or_else(|| anyhow::anyhow!("execution order snapshot was not available"))?;
@@ -1172,7 +1315,14 @@ pub async fn run_cli(
                 snapshot.market.lot_size,
             );
 
-            println!("RECONCILE CYCLE — {}", reconcile_result.summary());
+            tracing::debug!(
+                target: "engine::reconcile",
+                matched = reconcile_result.matched.len(),
+                missing = reconcile_result.missing.len(),
+                unmanaged = reconcile_result.unmanaged.len(),
+                converged = reconcile_result.is_converged(),
+                "reconciliation complete"
+            );
             if let Some(runtime) = &engine_runtime {
                 let matched = reconcile_result.matched.len();
                 let missing = reconcile_result.missing.len();
@@ -1355,6 +1505,22 @@ pub async fn run_cli(
                                 let mut bootstrap_plan = exec_plan.clone();
                                 bootstrap_plan.target_position = Some(target);
                                 bootstrap_plan.convergence_delta = Some(bootstrap_state.delta);
+                                let side = if bootstrap_state.delta > Decimal::ZERO {
+                                    "buy"
+                                } else {
+                                    "sell"
+                                };
+                                let intent_event = journal::JournalEvent::BootstrapIntentRecorded {
+                                    at: Utc::now(),
+                                    target: target.to_string(),
+                                    delta: bootstrap_state.delta.to_string(),
+                                    side: side.to_owned(),
+                                };
+                                if let Some(journal) = &journal {
+                                    journal.append(&intent_event)?;
+                                    run_state.apply(&intent_event);
+                                    journal.save_state(&run_state)?;
+                                }
                                 match decibel_grid_tui::strategy::perp::runtime::run_perp_convergence(
                                     &settings.network,
                                     &api,
@@ -1373,6 +1539,20 @@ pub async fn run_cli(
                                             "Perp bootstrap convergence: position {} -> locked target {} (delta {})",
                                             convergence.current, convergence.target, convergence.delta
                                         );
+                                        let converged_event =
+                                            journal::JournalEvent::BootstrapConverged {
+                                                at: Utc::now(),
+                                                target: target.to_string(),
+                                                position_before: convergence.current.to_string(),
+                                                position_after: convergence
+                                                    .current
+                                                    .to_string(),
+                                            };
+                                        if let Some(journal) = &journal {
+                                            journal.append(&converged_event)?;
+                                            run_state.apply(&converged_event);
+                                            journal.save_state(&run_state)?;
+                                        }
                                         perp_runtime.complete_bootstrap();
                                         let account = api
                                             .account(Some(&settings.subaccount), &snapshot.market)
@@ -1411,12 +1591,14 @@ pub async fn run_cli(
                                         perp_runtime.block_bootstrap();
                                         eprintln!("{reason}");
                                         if let Some(journal) = &journal {
-                                            let event = journal::JournalEvent::RiskRejected {
-                                                at: Utc::now(),
-                                                reason: reason.clone(),
-                                            };
-                                            journal.append(&event)?;
-                                            run_state.apply(&event);
+                                            let failed_event =
+                                                journal::JournalEvent::BootstrapFailed {
+                                                    at: Utc::now(),
+                                                    target: target.to_string(),
+                                                    reason: reason.clone(),
+                                                };
+                                            journal.append(&failed_event)?;
+                                            run_state.apply(&failed_event);
                                         }
                                         perp_runtime.accounting = perp_accounting.clone();
                                         run_state.perp_runtime = Some(perp_runtime.clone());
@@ -1583,13 +1765,61 @@ pub async fn run_cli(
                                     | journal::BulkLadderState::Diverged
                             )
                         }) {
-                            let ladder = run_state.bulk_ladder.as_ref().expect("checked above");
-                            eprintln!(
-                                "BULK LIFECYCLE BLOCKED: operation {} is {:?}; refusing another replacement until recovery resolves it",
-                                ladder.operation_id, ladder.state
-                            );
+                            let ladder = run_state.bulk_ladder.clone().expect("checked above");
+                            if ladder.state == journal::BulkLadderState::Diverged
+                                && last_diverged_bulk_recovery_at.is_none_or(|last| {
+                                    last.elapsed() >= DIVERGED_BULK_RECOVERY_INTERVAL
+                                })
+                            {
+                                last_diverged_bulk_recovery_at = Some(tokio::time::Instant::now());
+                                match api
+                                    .active_bulk_ladder(&settings.subaccount, &snapshot.market)
+                                    .await
+                                {
+                                    Ok(Some(active)) if active.matches(&ladder) => {
+                                        ws_state::recover_bulk_ladder(&ws_state, Some(active));
+                                        let observed = journal::JournalEvent::BulkVenueObserved {
+                                            at: Utc::now(),
+                                            operation_id: ladder.operation_id.clone(),
+                                        };
+                                        if let Some(journal) = &journal {
+                                            journal.append(&observed)?;
+                                            run_state.apply(&observed);
+                                            journal.save_state(&run_state)?;
+                                        }
+                                        last_bulk_lifecycle_blocked_operation = None;
+                                        println!(
+                                            "Bulk lifecycle recovered: operation {} now matches the exchange ladder.",
+                                            ladder.operation_id
+                                        );
+                                    }
+                                    Ok(_) | Err(_) => {
+                                        if last_bulk_lifecycle_blocked_operation.as_deref()
+                                            != Some(ladder.operation_id.as_str())
+                                        {
+                                            eprintln!(
+                                                "BULK LIFECYCLE BLOCKED: operation {} is Diverged; waiting for targeted REST recovery before another replacement.",
+                                                ladder.operation_id
+                                            );
+                                            last_bulk_lifecycle_blocked_operation =
+                                                Some(ladder.operation_id.clone());
+                                        }
+                                    }
+                                }
+                            } else if ladder.state != journal::BulkLadderState::Diverged
+                                && last_bulk_lifecycle_blocked_operation.as_deref()
+                                    != Some(ladder.operation_id.as_str())
+                            {
+                                eprintln!(
+                                    "BULK LIFECYCLE BLOCKED: operation {} is {:?}; refusing another replacement until recovery resolves it",
+                                    ladder.operation_id, ladder.state
+                                );
+                                last_bulk_lifecycle_blocked_operation =
+                                    Some(ladder.operation_id.clone());
+                            }
                         } else {
                             last_perp_submission_block_reason = None;
+                            last_bulk_lifecycle_blocked_operation = None;
                             let observed = ws_state::active_bulk_ladder(&ws_state)?;
                             let sequence = ws_state::next_bulk_sequence(&ws_state)?;
                             let intent = bulk_ladder_intent(
@@ -1607,7 +1837,7 @@ pub async fn run_cli(
                                 &snapshot.market,
                             )?;
                             let operation_id = intent.operation_id.clone();
-                            let journal = journal.as_ref().ok_or_else(|| {
+                            let jrnl = journal.as_ref().ok_or_else(|| {
                                 anyhow::anyhow!(
                                     "live bulk execution requires a durable journal before broadcast"
                                 )
@@ -1616,9 +1846,9 @@ pub async fn run_cli(
                                 at: Utc::now(),
                                 ladder: intent.clone(),
                             };
-                            journal.append(&intent_event)?;
+                            jrnl.append(&intent_event)?;
                             run_state.apply(&intent_event);
-                            journal.save_state(&run_state)?;
+                            jrnl.save_state(&run_state)?;
 
                             match execute_bulk_grid_with_broadcast(
                                 BulkGridExecutionRequest {
@@ -1637,49 +1867,58 @@ pub async fn run_cli(
                                         operation_id: operation_id.clone(),
                                         transaction_hash: transaction_hash.to_owned(),
                                     };
-                                    journal.append(&broadcast)?;
+                                    jrnl.append(&broadcast)?;
                                     run_state.apply(&broadcast);
-                                    journal.save_state(&run_state)
+                                    jrnl.save_state(&run_state)
                                 },
                             )
                             .await
                             {
                                 Ok(execution) => {
+                                    const WS_OBSERVATION_WAIT_MS: &[u64] =
+                                        &[1_000, 2_000, 4_000, 8_000];
                                     let mut venue_observed = false;
-                                    for _ in 0..6 {
+                                    for delay_ms in WS_OBSERVATION_WAIT_MS {
+                                        tokio::time::sleep(Duration::from_millis(*delay_ms)).await;
+                                        check_cancel!();
+                                        // Fast path: WS event arrived.
                                         if ws_state::active_bulk_ladder(&ws_state)?
                                             .is_some_and(|active| active.matches(&intent))
                                         {
                                             venue_observed = true;
                                             break;
                                         }
-                                        tokio::time::sleep(Duration::from_secs(1)).await;
-                                    }
-                                    if !venue_observed {
-                                        // A committed transaction without its expected WS event is
-                                        // an exceptional recovery path, not normal reconciliation.
-                                        venue_observed = api
+                                        // Slow path: REST authoritative ladder present.
+                                        if let Some(active) = api
                                             .active_bulk_ladder(
                                                 &settings.subaccount,
                                                 &snapshot.market,
                                             )
                                             .await?
-                                            .is_some_and(|active| active.matches(&intent));
+                                            .filter(|active| active.matches(&intent))
+                                        {
+                                            ws_state::recover_bulk_ladder(&ws_state, Some(active));
+                                            venue_observed = true;
+                                            break;
+                                        }
                                     }
                                     if !venue_observed {
                                         let blocked = journal::JournalEvent::BulkLifecycleBlocked {
                                             at: Utc::now(),
                                             operation_id,
                                             reason: format!(
-                                                "transaction {} committed but /bulk_orders did not expose expected sequence {} and levels",
-                                                execution.transaction_hash, execution.bulk_sequence
+                                                "transaction {} committed but /bulk_orders did not expose expected sequence {} and levels after {} total observation",
+                                                execution.transaction_hash,
+                                                execution.bulk_sequence,
+                                                WS_OBSERVATION_WAIT_MS.iter().sum::<u64>()
                                             ),
                                         };
-                                        journal.append(&blocked)?;
+                                        jrnl.append(&blocked)?;
                                         run_state.apply(&blocked);
-                                        journal.save_state(&run_state)?;
+                                        jrnl.save_state(&run_state)?;
                                         eprintln!(
-                                            "BULK LIFECYCLE BLOCKED: committed ladder was not observed; automatic replacement paused."
+                                            "BULK LIFECYCLE BLOCKED: committed ladder was not observed after ~{}s; automatic replacement paused.",
+                                            WS_OBSERVATION_WAIT_MS.iter().sum::<u64>() / 1000
                                         );
                                         continue;
                                     }
@@ -1687,9 +1926,9 @@ pub async fn run_cli(
                                         at: Utc::now(),
                                         operation_id,
                                     };
-                                    journal.append(&observed_event)?;
+                                    jrnl.append(&observed_event)?;
                                     run_state.apply(&observed_event);
-                                    journal.save_state(&run_state)?;
+                                    jrnl.save_state(&run_state)?;
                                     consecutive_bulk_failures = 0;
                                     last_bulk_replacement_at = Some(tokio::time::Instant::now());
                                     last_submitted_level_count =
@@ -1717,9 +1956,9 @@ pub async fn run_cli(
                                         bid_count: execution.bid_count,
                                         ask_count: execution.ask_count,
                                     };
-                                    journal.append(&event)?;
+                                    jrnl.append(&event)?;
                                     run_state.apply(&event);
-                                    journal.save_state(&run_state)?;
+                                    jrnl.save_state(&run_state)?;
                                 }
                                 Err(error) => {
                                     // `execute_bulk_grid` may fail after a broadcast timeout, so
@@ -1732,9 +1971,9 @@ pub async fn run_cli(
                                             "bulk submission outcome is unresolved after intent was recorded: {error:#}"
                                         ),
                                     };
-                                    journal.append(&blocked)?;
+                                    jrnl.append(&blocked)?;
                                     run_state.apply(&blocked);
-                                    journal.save_state(&run_state)?;
+                                    jrnl.save_state(&run_state)?;
                                     consecutive_bulk_failures =
                                         consecutive_bulk_failures.saturating_add(1);
                                     eprintln!(
@@ -1746,9 +1985,9 @@ pub async fn run_cli(
                                         at: Utc::now(),
                                         error: format!("{error:#}"),
                                     };
-                                    journal.append(&event)?;
+                                    jrnl.append(&event)?;
                                     run_state.apply(&event);
-                                    journal.save_state(&run_state)?;
+                                    jrnl.save_state(&run_state)?;
                                     if consecutive_bulk_failures
                                         >= config.spot.max_consecutive_bulk_failures
                                     {
@@ -1763,10 +2002,12 @@ pub async fn run_cli(
                                             at: Utc::now(),
                                             reason,
                                         };
-                                        journal.append(&event)?;
+                                        jrnl.append(&event)?;
                                         run_state.apply(&event);
-                                        journal.save_state(&run_state)?;
-                                        match spot_lifecycle::cancel_bulk_ladder(
+                                        jrnl.save_state(&run_state)?;
+                                        match journaled_bulk_cancel(
+                                            journal.as_ref(),
+                                            &mut run_state,
                                             &settings.network,
                                             &settings.aptos_private_key,
                                             &settings.subaccount,
@@ -1775,9 +2016,10 @@ pub async fn run_cli(
                                         )
                                         .await
                                         {
-                                            Ok(hash) => println!(
+                                            Ok(Some(hash)) => println!(
                                                 "Failure-circuit cancellation submitted in tx {hash}"
                                             ),
+                                            Ok(None) => {}
                                             Err(cancel_error) => eprintln!(
                                                 "Failure-circuit cancellation failed: {cancel_error:#}"
                                             ),
@@ -1921,7 +2163,9 @@ pub async fn run_cli(
                     println!(
                         "Exit policy is RETAIN: cancelling the ladder and retaining released assets."
                     );
-                    match spot_lifecycle::cancel_bulk_ladder(
+                    match journaled_bulk_cancel(
+                        journal.as_ref(),
+                        &mut run_state,
                         &settings.network,
                         &settings.aptos_private_key,
                         &settings.subaccount,
@@ -1930,9 +2174,10 @@ pub async fn run_cli(
                     )
                     .await
                     {
-                        Ok(hash) => {
+                        Ok(Some(hash)) => {
                             println!("Bulk ladder cancelled in tx {hash}; assets retained.")
                         }
+                        Ok(None) => {}
                         Err(error) => eprintln!(
                             "Bulk cancellation failed; ladder may still be live: {error:#}"
                         ),
@@ -1941,6 +2186,24 @@ pub async fn run_cli(
             }
         } else {
             println!("No market snapshot was loaded; no ladder lifecycle action was sent.");
+        }
+        if let Some(journal) = journal.as_ref() {
+            let shutdown_event = decibel_grid_tui::journal::JournalEvent::Shutdown {
+                at: Utc::now(),
+                reason: format!(
+                    "engine stopped (exit policy: {})",
+                    match engine_runtime
+                        .as_ref()
+                        .and_then(|r| r.requested_exit_mode())
+                    {
+                        Some(decibel_grid_tui::control::ExitMode::Hold) => "retain",
+                        Some(decibel_grid_tui::control::ExitMode::Liquidate) => "sell",
+                        None => "terminated",
+                    }
+                ),
+            };
+            let _ = journal.append(&shutdown_event);
+            let _ = journal.save_state(&run_state);
         }
     }
     Ok(())

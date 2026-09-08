@@ -828,3 +828,293 @@ pub async fn shadow_cli(settings: Settings, max_cycles: Option<usize>) -> Result
         tokio::time::sleep(wait).await;
     }
 }
+
+pub async fn journal_cli(settings: Settings, cmd: crate::cli::settings::JournalCmd) -> Result<()> {
+    match cmd {
+        crate::cli::settings::JournalCmd::Status => {
+            let api = settings.api_client()?;
+            let config = settings.to_grid_config()?;
+            let run_id = journal::persistent_run_id(
+                &settings.network,
+                &settings.subaccount,
+                &config.market_name,
+            );
+            let journal =
+                journal::Journal::new(&run_id).context("open run journal for diagnostics")?;
+            let state = journal.load_state()?.unwrap_or_default();
+
+            println!("=== Journal Status ===");
+            println!("  run_id:       {run_id}");
+            println!("  network:      {}", state.metadata.network);
+            println!("  subaccount:   {}", state.metadata.subaccount);
+            println!("  market:       {}", state.metadata.market);
+            println!("  product:      {}", state.metadata.product);
+            println!("  config_hash:  {}", state.metadata.config_hash);
+            println!("  program_ver:  {}", state.metadata.program_version);
+            println!("  started_at:   {}", state.metadata.started_at);
+            println!("  plan_gen:     {}", state.plan_generation);
+            println!("  orders_sub:   {}", state.submitted_orders);
+            println!("  orders_fail:  {}", state.failed_orders);
+            println!("  last_event:   {:?}", state.last_event_at);
+
+            if let Some(ladder) = &state.bulk_ladder {
+                println!();
+                println!("=== Bulk Ladder ===");
+                println!("  operation_id: {}", ladder.operation_id);
+                println!("  state:        {:?}", ladder.state);
+                println!("  sequence:     {}", ladder.sequence);
+                println!("  prior_seq:    {:?}", ladder.prior_sequence);
+                println!("  intent_at:    {}", ladder.intent_at);
+                println!("  tx_hash:      {:?}", ladder.transaction_hash);
+                println!("  levels:       {}", ladder.levels.len());
+                println!(
+                    "  filled_bids:  {}",
+                    ladder
+                        .levels
+                        .iter()
+                        .filter(|l| l.side == Side::Bid)
+                        .map(|l| l.filled_size)
+                        .sum::<Decimal>()
+                );
+                println!(
+                    "  filled_asks:  {}",
+                    ladder
+                        .levels
+                        .iter()
+                        .filter(|l| l.side == Side::Ask)
+                        .map(|l| l.filled_size)
+                        .sum::<Decimal>()
+                );
+                println!("  cancel_tx:    {:?}", ladder.cancel_transaction_hash);
+            } else {
+                println!("\n=== Bulk Ladder ===");
+                println!("  (none)");
+            }
+
+            if let Some(perp) = &state.perp_runtime {
+                println!();
+                println!("=== Perp Runtime ===");
+                println!("  bootstrap_status:    {:?}", perp.bootstrap_status);
+                println!(
+                    "  bootstrap_target:    {:?}",
+                    perp.bootstrap_target_position
+                );
+                println!("  pinned_plan:         {:?}", perp.pinned_plan.is_some());
+                println!("  acct_position_base:  {}", perp.accounting.position_base);
+                println!(
+                    "  acct_realized_pnl:   {}",
+                    perp.accounting.realized_gross_quote
+                );
+                println!(
+                    "  acct_fees_quote:     {:?}",
+                    perp.accounting.trade_fees_quote
+                );
+                println!(
+                    "  acct_funding_recv:  {}",
+                    perp.accounting.funding_received_quote
+                );
+                println!(
+                    "  acct_funding_paid:  {}",
+                    perp.accounting.funding_paid_quote
+                );
+                println!("  acct_fills:          {:?}", perp.accounting.fills_count());
+                println!("  fees_complete:       {}", perp.accounting.fees_complete);
+                println!(
+                    "  funding_complete:    {}",
+                    perp.accounting.funding_complete
+                );
+                println!("  last_fill_at:        {:?}", perp.accounting.last_fill_at);
+                println!(
+                    "  last_funding_at:     {:?}",
+                    perp.accounting.last_funding_at
+                );
+            }
+
+            // Read current REST state for comparison.
+            let market = api.market(&config.market_name, config.product).await?;
+            match api.active_bulk_ladder(&settings.subaccount, &market).await {
+                Ok(Some(active)) => {
+                    println!();
+                    println!("=== REST Active Bulk Ladder ===");
+                    println!("  sequence:  {}", active.sequence);
+                    println!("  levels:    {}", active.levels.len());
+                    let matches = state.bulk_ladder.as_ref().is_some_and(|expected| {
+                        expected.sequence == active.sequence && expected.levels == active.levels
+                    });
+                    println!("  matches_journal: {matches}");
+                }
+                Ok(None) => println!("\n=== REST Active Bulk Ladder: (none)"),
+                Err(e) => println!("\n=== REST Active Bulk Ladder: fetch failed: {e:#}"),
+            }
+
+            Ok(())
+        }
+        crate::cli::settings::JournalCmd::ResolveDivergence {
+            operation_id,
+            confirm_operation,
+        } => {
+            if confirm_operation.as_deref() != Some(&operation_id) {
+                anyhow::bail!(
+                    "resolve-divergence requires --confirm-operation <operation-id> matching the diverged operation\n  operation-id: {operation_id}"
+                );
+            }
+            let api = settings.api_client()?;
+            let config = settings.to_grid_config()?;
+            let run_id = journal::persistent_run_id(
+                &settings.network,
+                &settings.subaccount,
+                &config.market_name,
+            );
+            let journal =
+                journal::Journal::new(&run_id).context("open run journal for recovery")?;
+            let mut state = journal
+                .load_state()?
+                .ok_or_else(|| anyhow::anyhow!("no journal state found for run {run_id}"))?;
+
+            let ladder = state
+                .bulk_ladder
+                .as_ref()
+                .filter(|l| l.operation_id == operation_id)
+                .ok_or_else(|| {
+                    anyhow::anyhow!("operation {operation_id} not found in journal state")
+                })?
+                .clone();
+
+            let market = api.market(&config.market_name, config.product).await?;
+            match api
+                .active_bulk_ladder(&settings.subaccount, &market)
+                .await?
+            {
+                Some(active) if active.matches(&ladder) => {
+                    let observed = journal::JournalEvent::BulkVenueObserved {
+                        at: Utc::now(),
+                        operation_id: ladder.operation_id.clone(),
+                    };
+                    journal.append(&observed)?;
+                    state.apply(&observed);
+                    journal.save_state(&state)?;
+                    println!(
+                        "Recovery complete: operation {operation_id} verified on venue and marked VenueObserved."
+                    );
+                    println!("Next cycle will proceed with normal replacement.");
+                }
+                Some(active) => {
+                    // Different ladder exists; report the mismatch.
+                    println!(
+                        "Recovery blocked: venue has sequence {} with {} level(s),",
+                        active.sequence,
+                        active.levels.len()
+                    );
+                    println!(
+                        "  but journal expects sequence {} with {} level(s).",
+                        ladder.sequence,
+                        ladder.levels.len()
+                    );
+                    println!(
+                        "  Manual operator action required (the ladder belongs to another entity or run)."
+                    );
+                }
+                None => {
+                    println!(
+                        "Recovery blocked: no active bulk ladder found on venue for this market."
+                    );
+                    println!(
+                        "  The operation's ladder may have been cancelled or never committed."
+                    );
+                    println!(
+                        "  Use `journal abandon-bulk-intent` (not yet implemented) to clear the journal state."
+                    );
+                }
+            }
+            Ok(())
+        }
+    }
+}
+
+pub async fn perp_cli(settings: Settings, cmd: crate::cli::settings::PerpCmd) -> Result<()> {
+    match cmd {
+        crate::cli::settings::PerpCmd::BootstrapInspect => {
+            let api = settings.api_client()?;
+            let config = settings.to_grid_config()?;
+            let run_id = journal::persistent_run_id(
+                &settings.network,
+                &settings.subaccount,
+                &config.market_name,
+            );
+            let journal = journal::Journal::new(&run_id).ok();
+            let state = journal
+                .as_ref()
+                .and_then(|j| j.load_state().ok())
+                .flatten()
+                .unwrap_or_default();
+
+            let market = api.market(&config.market_name, config.product).await?;
+            let snapshot = fetch_snapshot(
+                &api,
+                &config,
+                (!settings.subaccount.trim().is_empty()).then_some(settings.subaccount.as_str()),
+            )
+            .await?;
+
+            println!("=== Perp Bootstrap Inspect ===");
+            println!("  run_id:             {run_id}");
+            println!("  market:             {}", market.name);
+            if let Some(perp) = &state.perp_runtime {
+                println!("  bootstrap_status:   {:?}", perp.bootstrap_status);
+                println!("  bootstrap_target:   {:?}", perp.bootstrap_target_position);
+                println!("  position_size:      {}", snapshot.account.position.size);
+                if let Some(target) = perp.bootstrap_target_position {
+                    let delta = target - snapshot.account.position.size;
+                    println!("  convergence_delta:  {delta}");
+                }
+                println!(
+                    "  available_margin:   {:?}",
+                    snapshot.account.available_margin
+                );
+                if let Some(margin) = snapshot.plan.estimated_margin {
+                    println!("  estimated_margin:   {margin}");
+                }
+                println!(
+                    "  realized_pnl:       {}",
+                    perp.accounting.realized_gross_quote
+                );
+                println!(
+                    "  fees_quote:         {:?}",
+                    perp.accounting.trade_fees_quote
+                );
+                println!(
+                    "  funding_recv:       {}",
+                    perp.accounting.funding_received_quote
+                );
+                println!(
+                    "  funding_paid:       {}",
+                    perp.accounting.funding_paid_quote
+                );
+                println!("  filled_trades:      {}", perp.accounting.fills_count());
+                println!("  fees_complete:      {}", perp.accounting.fees_complete);
+                println!("  funding_complete:   {}", perp.accounting.funding_complete);
+                println!("  last_fill_at:       {:?}", perp.accounting.last_fill_at);
+                println!(
+                    "  last_funding_at:    {:?}",
+                    perp.accounting.last_funding_at
+                );
+            } else {
+                println!("  (no Perp runtime state in journal)");
+            }
+            println!();
+            println!("  mid_price:          {}", snapshot.plan.mid);
+            println!(
+                "  out_of_range:       {}",
+                snapshot.plan.paused_by_out_of_range
+            );
+            println!(
+                "  range_action:       {:?}",
+                snapshot.plan.out_of_range_action_applied
+            );
+            if let Some(reason) = snapshot.plan.perp_blocked_reason {
+                println!("  blocked_reason:     {reason}");
+            }
+            Ok(())
+        }
+    }
+}

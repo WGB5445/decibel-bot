@@ -122,6 +122,28 @@ pub struct EngineEvent {
     pub message: String,
 }
 
+/// Live execution authority. Engine logic gates every submission and reconciliation path on this
+/// phase: a non-`Ready` phase means ws_state hydration, desync detection, or journal lifecycle
+/// recovery is still in progress and the bot must not compute execution plans or submit orders.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EnginePhase {
+    /// Engine loop started, market resolved, WS session spawned but subscription ACKs pending.
+    #[default]
+    Connecting,
+    /// All topics acknowledged, but initial account/order/bulk snapshots have not all arrived.
+    Hydrating,
+    /// All WS hydration complete, no desync, no pending lifecycle block. Execution permitted.
+    Ready,
+    /// WS data is stale or a reconnect generation has not completed hydration.
+    Stale,
+    /// WS state is desynced (sequence gap, diverged ladder). Operator recovery required.
+    Desynced,
+    /// A bulk lifecycle operation (intent recorded, broadcast pending, or committed awaiting
+    /// observation) is blocking new submissions until resolved through WS or REST recovery.
+    LifecycleBlocked,
+}
+
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct PerpPnlStatus {
     pub exchange_position_base: String,
@@ -149,6 +171,7 @@ pub struct EngineStatus {
     pub market: String,
     pub product: String,
     pub phase: String,
+    pub engine_phase: EnginePhase,
     pub last_cycle_at: Option<DateTime<Utc>>,
     pub mid: Option<String>,
     pub matched: Option<usize>,

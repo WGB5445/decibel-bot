@@ -28,7 +28,10 @@ pub enum LogSeverity {
 
 pub fn classify_log_line(line: &str) -> LogSeverity {
     let lower = line.to_ascii_lowercase();
-    if lower.contains("error")
+    if lower.contains(" error ")
+        || lower.contains("error:")
+        || lower.contains("error]")
+        || lower.contains("error")
         || lower.contains("failed")
         || lower.contains("rejected")
         || lower.contains("risk rejected")
@@ -36,7 +39,9 @@ pub fn classify_log_line(line: &str) -> LogSeverity {
         || lower.contains("panic")
     {
         LogSeverity::Error
-    } else if lower.contains("warning")
+    } else if lower.contains(" warn ")
+        || lower.contains("warn:")
+        || lower.contains("warning")
         || lower.contains("skipped")
         || lower.contains("paused")
         || lower.contains("retry")
@@ -462,6 +467,18 @@ mod tests {
         assert_eq!(classify_log_line("RISK REJECTED"), LogSeverity::Error);
         assert_eq!(classify_log_line("blocked by policy"), LogSeverity::Error);
         assert_eq!(classify_log_line("cycle complete"), LogSeverity::Info);
+    }
+
+    #[test]
+    fn classify_log_line_detects_structured_log_levels() {
+        assert_eq!(
+            classify_log_line("2026-09-08T12:00:00Z  WARN engine: reconnecting"),
+            LogSeverity::Warn
+        );
+        assert_eq!(
+            classify_log_line("2026-09-08T12:00:00Z ERROR engine: submission failed"),
+            LogSeverity::Error
+        );
     }
 
     #[test]

@@ -44,6 +44,8 @@ serde_yaml = "0.9"
 tokio = { version = "1.43", features = ["macros", "rt-multi-thread", "time", "sync", "signal", "net", "io-util"] }
 tokio-tungstenite = { version = "0.26", features = ["rustls-tls-native-roots"] }
 fslock = "0.2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.59", features = [

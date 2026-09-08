@@ -151,6 +151,7 @@ pub struct WsState {
     pub orders_hydrated: bool,
     pub orders_desynced: bool,
     pub bulk_ladder: Option<Versioned<WsBulkLadder>>,
+    pub bulk_ladder_hydrated: bool,
     pub bulk_ladder_desynced: bool,
     pub trades: Vec<Versioned<Trade>>,
     pub user_trades: Vec<Versioned<WsUserTrade>>,
@@ -241,6 +242,18 @@ pub fn generation(state: &WsStateHandle) -> u64 {
     state.read().expect("WS state lock poisoned").generation
 }
 
+/// Whether the engine may compute execution plans and derive bulk sequences. A subscription ACK
+/// without a first `bulk_orders` snapshot is not enough: an empty WS cache cannot prove there is
+/// no active ladder, and deriving sequence 1 from Nothing would cause a repeated full replace.
+pub fn can_execute(state: &WsStateHandle) -> bool {
+    let state = state.read().expect("WS state lock poisoned");
+    state.subscriptions_ready
+        && state.orders_hydrated
+        && state.bulk_ladder_hydrated
+        && !state.orders_desynced
+        && !state.bulk_ladder_desynced
+}
+
 /// Return the last valid venue ladder. A detected sequence gap is a hard execution block until
 /// targeted recovery replaces this state; callers must not derive a new sequence from a gap.
 pub fn active_bulk_ladder(state: &WsStateHandle) -> Result<Option<ActiveBulkLadder>> {
@@ -300,6 +313,7 @@ pub fn recover_bulk_ladder(state: &WsStateHandle, ladder: Option<ActiveBulkLadde
         )
     });
     state.bulk_ladder_desynced = false;
+    state.bulk_ladder_hydrated = true;
 }
 
 /// Convert the complete typed account-order snapshot plus the active bulk ladder into the
@@ -372,6 +386,7 @@ pub fn spawn_ws_session(
                 current.orders_hydrated = false;
                 current.orders_desynced = false;
                 current.bulk_ladder = None;
+                current.bulk_ladder_hydrated = false;
                 current.bulk_ladder_desynced = false;
                 current.trades.clear();
                 current.user_trades.clear();
@@ -559,6 +574,7 @@ fn apply_bulk_ladder(
     let Some(ladder) = parse_bulk_ladder(payload, config)? else {
         return Ok(());
     };
+    state.bulk_ladder_hydrated = true;
     let Some(current) = state.bulk_ladder.as_ref() else {
         state.bulk_ladder = Some(versioned(ladder, venue_ms, received_at, generation));
         return Ok(());
@@ -1226,6 +1242,28 @@ mod tests {
                 .iter()
                 .all(|order| order.origin == reconcile::OrderOrigin::Bulk)
         );
+    }
+
+    #[test]
+    fn recovered_bulk_ladder_is_available_to_reconciliation() {
+        let config = bulk_config();
+        let source = new_handle();
+        source.write().unwrap().subscriptions_ready = true;
+        apply_test(&source, &config, &bulk_payload(7, None, 10)).unwrap();
+        let active = active_bulk_ladder(&source).unwrap();
+
+        let state = new_handle();
+        state.write().unwrap().subscriptions_ready = true;
+        apply_test(
+            &state,
+            &config,
+            &serde_json::json!({"topic":"account_open_orders:0xaccount","orders":[]}),
+        )
+        .unwrap();
+        recover_bulk_ladder(&state, active);
+
+        assert_eq!(next_bulk_sequence(&state).unwrap(), 8);
+        assert_eq!(actual_orders(&state).unwrap().len(), 2);
     }
 
     #[test]
