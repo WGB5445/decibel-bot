@@ -445,6 +445,97 @@ pub async fn run_cli(
         };
     }
 
+    // ── Boot-time health diagnostics ─────────────────────────────────────────
+    if execute && _ws_session.is_some() {
+        tracing::info!(target: "engine::boot", "Running pre-flight diagnostics...");
+        // 1. Wait for WS subscriptions to acknowledge (up to 15s)
+        let ws_ready = {
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+            let mut ready = false;
+            while tokio::time::Instant::now() < deadline {
+                if ws_state::can_execute(&ws_state) {
+                    ready = true;
+                    break;
+                }
+                // Even if can_execute is false, subscriptions_ready might be true but
+                // bulk_ladder_hydrated is false — try REST to unblock.
+                {
+                    let s = ws_state.read().expect("WS lock");
+                    if s.subscriptions_ready && !s.bulk_ladder_hydrated {
+                        drop(s);
+                        let market = api.market(&config.market_name, config.product).await.ok();
+                        if let Some(m) = market {
+                            if let Ok(rest_ladder) =
+                                api.active_bulk_ladder(&settings.subaccount, &m).await
+                            {
+                                ws_state::recover_bulk_ladder(&ws_state, rest_ladder);
+                            }
+                        }
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(500)).await;
+                check_cancel!();
+            }
+            ready
+        };
+        if !ws_ready {
+            let s = ws_state.read().expect("WS lock");
+            let reasons: Vec<&str> = {
+                let mut r = Vec::new();
+                if !s.subscriptions_ready {
+                    r.push("subscriptions not acknowledged");
+                }
+                if s.last_error.is_some() {
+                    r.push("connection error");
+                }
+                r
+            };
+            drop(s);
+            anyhow::bail!(
+                "WebSocket did not become ready within 15s: {}. Check network connectivity, API key validity, and testnet status.",
+                reasons.join(", ")
+            );
+        }
+        tracing::info!(target: "engine::boot", "WS ready, subscriptions acknowledged.");
+
+        // 2. Check market data sanity
+        let market = api
+            .market(&config.market_name, config.product)
+            .await
+            .context("resolve market for health check")?;
+        // Check depth crossed
+        let depth_ok = {
+            let s = ws_state.read().expect("WS lock");
+            s.depth.as_ref().map(|d| {
+                let bid = d.value.bids.first().map(|l| l.price);
+                let ask = d.value.asks.first().map(|l| l.price);
+                (bid, ask)
+            })
+        };
+        match depth_ok {
+            Some((Some(bid), Some(ask))) if bid >= ask => {
+                tracing::warn!(target: "engine::boot", bid = %bid, ask = %ask, "depth crossed (bid >= ask) — market data may be stale or abnormal");
+            }
+            Some((Some(bid), Some(ask))) => {
+                tracing::info!(target: "engine::boot", bid = %bid, ask = %ask, spread = %(ask - bid), "depth healthy");
+            }
+            _ => {
+                tracing::warn!(target: "engine::boot", "depth not yet available; will retry during cycles");
+            }
+        }
+        // Check mid price / perp price
+        if let Ok(mid) = api.mid_price(&market, config.price_source).await {
+            if mid <= Decimal::ZERO {
+                tracing::warn!(target: "engine::boot", "mid price is non-positive ({mid}); market may be untradable");
+            } else {
+                tracing::info!(target: "engine::boot", mid = %mid, "price source healthy");
+            }
+        } else {
+            tracing::warn!(target: "engine::boot", "mid price unavailable at boot; will retry during cycles");
+        }
+        tracing::info!(target: "engine::boot", "Pre-flight diagnostics complete.");
+    }
+
     loop {
         let cycle_start = tokio::time::Instant::now();
         let snapshot_result = if settings.subaccount.trim().is_empty() {
