@@ -56,3 +56,6 @@ windows-sys = { version = "0.59", features = [
 
 [dev-dependencies]
 pretty_assertions = "1.4"
+
+[build-dependencies]
+built = "0.8.1"

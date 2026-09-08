@@ -172,6 +172,7 @@ pub struct EngineStatus {
     pub product: String,
     pub phase: String,
     pub engine_phase: EnginePhase,
+    pub program_version: String,
     pub last_cycle_at: Option<DateTime<Utc>>,
     pub mid: Option<String>,
     pub matched: Option<usize>,

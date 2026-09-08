@@ -297,6 +297,7 @@ pub async fn engine_cli(
         market: settings.market.clone(),
         product: format!("{:?}", settings.product).to_lowercase(),
         phase: "starting".to_owned(),
+        program_version: crate::build_info::version_string(),
         log_path: active_log_path.map(|path| path.display().to_string()),
         ..Default::default()
     });

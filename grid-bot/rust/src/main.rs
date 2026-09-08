@@ -1,3 +1,4 @@
+mod build_info;
 mod cli;
 mod engine;
 mod logging;
@@ -96,6 +97,7 @@ async fn main() -> Result<()> {
         redirect_output_to_log(path)?;
     }
     logging::init();
+    tracing::info!(target: "startup", version = %build_info::version_string(), commit = %build_info::short_commit(), "grid engine started");
     if let Some(path) = log_path.as_deref() {
         tracing::info!(target: "startup", log_path = %path.display(), "CLI log started");
     }
