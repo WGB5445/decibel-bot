@@ -482,14 +482,22 @@ pub async fn run_cli(
         } else {
             control::EnginePhase::Ready
         };
-        // Log a single-line phase transition so operator can see hydration progress without DEBUG.
-        // (Structured engine logging will later push this as a typed field.)
-        if execute && phase != control::EnginePhase::Ready {
-            tracing::info!(
-                target: "engine",
-                phase = ?phase,
-                "execution paused; awaiting WS hydration or lifecycle recovery"
-            );
+        // If phase is Hydrating because bulk_ladder snapshot hasn't arrived yet, proactively
+        // query REST to unblock execution rather than waiting indefinitely for a WS push.
+        if execute && phase == control::EnginePhase::Hydrating {
+            if let Ok(Some(active)) = api
+                .active_bulk_ladder(&settings.subaccount, &snapshot.market)
+                .await
+            {
+                let seq = active.sequence;
+                ws_state::recover_bulk_ladder(&ws_state, Some(active));
+                tracing::info!(target: "engine", sequence = seq, "bulk ladder hydrated via REST");
+            } else {
+                // REST also has no ladder — seed an empty bulk snapshot so the engine can
+                // derive sequence 1 and proceed.
+                ws_state::recover_bulk_ladder(&ws_state, None);
+                tracing::info!(target: "engine", "no active bulk ladder on venue; proceeding with empty state");
+            }
         }
         if let Some(runtime) = &engine_runtime {
             let mid = snapshot.plan.mid.to_string();
