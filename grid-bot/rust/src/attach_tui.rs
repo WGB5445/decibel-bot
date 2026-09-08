@@ -154,6 +154,7 @@ struct App {
     confirm_liquidate: bool,
     connected: bool,
     subscribed: bool,
+    engine_phase: String,
     received_snapshot: bool,
     live_sequence: u64,
     notice: String,
@@ -265,7 +266,8 @@ pub async fn run(client: EngineClient) -> Result<()> {
                 Some(Ok(status)) => {
                     // Keep the last complete snapshot during later reconnects. This update is
                     // the authoritative initial snapshot or a subsequent full state broadcast.
-                    app.status = status;
+                    app.status = status.clone();
+                    app.engine_phase = format!("{:?}", status.engine_phase).to_lowercase();
                     app.log_panel
                         .sync_engine_log_path(app.status.log_path.as_deref());
                     app.connected = true;
@@ -1042,36 +1044,50 @@ fn render(
 
     let connection = if app.connected {
         Span::styled(
-            "● Connected",
+            "WS ●",
             Style::default()
                 .fg(Color::Green)
                 .add_modifier(Modifier::BOLD),
         )
     } else {
         Span::styled(
-            "● Disconnected",
+            "WS ●",
             Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
         )
     };
-    let subscription = if app.subscribed {
-        Span::styled(
-            "● Subscribed",
+    let subscription = match &*app.engine_phase {
+        "ready" => Span::styled(
+            "Ready",
             Style::default()
                 .fg(Color::Green)
                 .add_modifier(Modifier::BOLD),
-        )
-    } else if app.connected {
-        Span::styled(
-            "● Waiting for snapshot",
+        ),
+        "connecting" => Span::styled(
+            "Connecting",
             Style::default()
                 .fg(Color::Yellow)
                 .add_modifier(Modifier::BOLD),
-        )
-    } else {
-        Span::styled(
-            "● Live updates retrying",
+        ),
+        "hydrating" => Span::styled(
+            "Hydrating",
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ),
+        "desynced" => Span::styled(
+            "Desynced",
             Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
-        )
+        ),
+        "lifecycle_blocked" => Span::styled(
+            "Blocked",
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+        ),
+        _ => Span::styled(
+            &*app.engine_phase,
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ),
     };
     let snapshot = snapshot_indicator(app);
     let last_update = app
