@@ -14,8 +14,14 @@ use rust_decimal::Decimal;
 use crate::cli::settings::Settings;
 use crate::cli::settings::decimal;
 
-// The engine predates the structured logger and has many operational messages. Keep legacy call
-// sites on one parseable sink while migration adds typed fields to high-value state transitions.
+pub(crate) mod helpers;
+pub(crate) mod cancel;
+pub(crate) mod pre_submit;
+pub(crate) mod shutdown;
+
+pub use helpers::{engine_phase, optional_subaccount, perp_pnl_status, print_snapshot};
+pub use cancel::journaled_bulk_cancel;
+
 macro_rules! println {
     ($($arg:tt)*) => {
         tracing::info!(target: "engine", "{}", format_args!($($arg)*))
@@ -26,155 +32,6 @@ macro_rules! eprintln {
     ($($arg:tt)*) => {
         tracing::warn!(target: "engine", "{}", format_args!($($arg)*))
     };
-}
-
-fn perp_pnl_status(
-    accounting: &decibel_grid_tui::strategy::perp::accounting::PerpAccounting,
-    exchange_position: Decimal,
-    mark_price: Option<Decimal>,
-) -> control::PerpPnlStatus {
-    let snapshot = accounting.pnl_snapshot(exchange_position, mark_price);
-    control::PerpPnlStatus {
-        exchange_position_base: snapshot.exchange_position_base.to_string(),
-        ledger_position_base: snapshot.ledger_position_base.to_string(),
-        reconciliation_delta_base: snapshot.reconciliation_delta_base.to_string(),
-        average_entry_price: snapshot.average_entry_price.map(|value| value.to_string()),
-        mark_price: snapshot.mark_price.map(|value| value.to_string()),
-        unrealized_gross_quote: snapshot
-            .unrealized_gross_quote
-            .map(|value| value.to_string()),
-        realized_gross_quote: snapshot.realized_gross_quote.to_string(),
-        trade_fees_quote: snapshot.trade_fees_quote.map(|value| value.to_string()),
-        funding_pnl_quote: snapshot.funding_pnl_quote.map(|value| value.to_string()),
-        net_pnl_quote: snapshot.net_pnl_quote.map(|value| value.to_string()),
-        fees_complete: accounting.fees_complete,
-        funding_complete: accounting.funding_complete,
-        last_fill_at: accounting.last_fill_at,
-        last_funding_at: accounting.last_funding_at,
-    }
-}
-
-pub(crate) fn print_snapshot(snapshot: &MonitorSnapshot, config: &GridConfig) {
-    let profit = snapshot.plan.profit_preview(config.maker_fee_rate);
-    tracing::debug!(
-        target: "engine::plan",
-        market = %snapshot.market.name,
-        product = ?snapshot.market.product,
-        mid = %snapshot.plan.mid,
-        net_scenario = %profit.net_capture,
-        bid_levels = snapshot.plan.bids.len(),
-        ask_levels = snapshot.plan.asks.len(),
-        "plan snapshot"
-    );
-    for level in snapshot.plan.all_levels() {
-        tracing::debug!(
-            target: "engine::plan",
-            side = level.side.as_str(),
-            price = %format_decimal(level.price, 8),
-            size = %format_decimal(level.size, 8),
-            level_state = ?level.state,
-            "planned level"
-        );
-    }
-}
-
-pub(crate) fn optional_subaccount(settings: &Settings) -> Option<&str> {
-    (!settings.subaccount.trim().is_empty()).then_some(settings.subaccount.as_str())
-}
-
-/// Compute the current execution phase from WS state and journal lifecycle. This is the single
-/// authority for whether the bot may compute plans, reconcile, and submit orders. Every execution
-/// path consults this before acting; non-Ready phases still run status updates for visibility.
-/// Journal a full cancel lifecycle: intent → broadcast → observed. Returns the cancel outcome.
-/// If there is no tracked bulk ladder, skips the cancel entirely.
-async fn journaled_bulk_cancel(
-    journal: Option<&decibel_grid_tui::journal::Journal>,
-    run_state: &mut decibel_grid_tui::journal::RunState,
-    network: &str,
-    private_key: &str,
-    subaccount: &str,
-    market: &decibel_grid_tui::Market,
-    gas_station: Option<&decibel_grid_tui::GasStationConfig>,
-) -> Result<Option<String>> {
-    let operation_id = run_state
-        .bulk_ladder
-        .as_ref()
-        .map(|ladder| ladder.operation_id.clone());
-    let Some(op_id) = operation_id else {
-        return Ok(None);
-    };
-    let journal = match journal {
-        Some(j) => j,
-        None => return Ok(None),
-    };
-    let cancel_intent = decibel_grid_tui::journal::JournalEvent::BulkCancelIntentRecorded {
-        at: Utc::now(),
-        operation_id: op_id.clone(),
-    };
-    journal.append(&cancel_intent)?;
-    run_state.apply(&cancel_intent);
-    journal.save_state(&run_state)?;
-
-    let cancel_op_id = op_id.clone();
-    let hash = decibel_grid_tui::spot_lifecycle::cancel_bulk_ladder_with_broadcast(
-        network,
-        private_key,
-        subaccount,
-        market,
-        gas_station,
-        |tx_hash| {
-            let broadcast = decibel_grid_tui::journal::JournalEvent::BulkCancelBroadcast {
-                at: Utc::now(),
-                operation_id: cancel_op_id.clone(),
-                transaction_hash: tx_hash.to_owned(),
-            };
-            journal.append(&broadcast)?;
-            run_state.apply(&broadcast);
-            journal.save_state(&run_state)
-        },
-    )
-    .await?;
-
-    let observed = decibel_grid_tui::journal::JournalEvent::BulkCancelledObserved {
-        at: Utc::now(),
-        operation_id: op_id,
-    };
-    journal.append(&observed)?;
-    run_state.apply(&observed);
-    journal.save_state(&run_state)?;
-    Ok(Some(hash))
-}
-
-fn engine_phase(
-    ws_state: &decibel_grid_tui::ws_state::WsStateHandle,
-    run_state: &decibel_grid_tui::journal::RunState,
-) -> control::EnginePhase {
-    if !decibel_grid_tui::ws_state::can_execute(ws_state) {
-        let state = ws_state.read().expect("WS state lock poisoned");
-        if !state.subscriptions_ready {
-            return control::EnginePhase::Connecting;
-        }
-        if state.orders_desynced || state.bulk_ladder_desynced {
-            return control::EnginePhase::Desynced;
-        }
-        return control::EnginePhase::Hydrating;
-    }
-    // Market data freshness is checked inside fetch_snapshot_ws_first. This phase gate focuses on
-    // the WS state that determines whether a plan can be computed safely.
-    if run_state.bulk_ladder.as_ref().is_some_and(|ladder| {
-        matches!(
-            ladder.state,
-            decibel_grid_tui::journal::BulkLadderState::IntentRecorded
-                | decibel_grid_tui::journal::BulkLadderState::BroadcastPending
-                | decibel_grid_tui::journal::BulkLadderState::BroadcastUnknown
-                | decibel_grid_tui::journal::BulkLadderState::Committed
-                | decibel_grid_tui::journal::BulkLadderState::Diverged
-                | decibel_grid_tui::journal::BulkLadderState::CancelPending
-        )
-    }) {
-        return control::EnginePhase::LifecycleBlocked;
-    }
-    control::EnginePhase::Ready
 }
 
 /// Run the grid from a non-interactive terminal.
@@ -1969,62 +1826,21 @@ journal.append(&event)?;
                             last_bulk_lifecycle_blocked_operation = None;
 
                             // ---- pre-submission race guard ----
-                            // A resting entry may have filled between risk evaluation and this
-                            // point. Re-read the account position and active ladder, then
-                            // rebuild and re-check worst-case exposure before signing.
                             if snapshot.market.product == Product::Perp {
-                                match api
-                                    .account(Some(&settings.subaccount), &snapshot.market)
-                                    .await
-                                {
-                                    Ok(refreshed) => {
-                                        let latest_position = refreshed.position.size;
-                                        let latest_margin = refreshed.available_margin;
-                                        if (latest_position - snapshot.account.position.size).abs()
-                                            > snapshot.market.lot_size
-                                        {
-                                            println!(
-                                                "Pre-submit position changed: {} → {}. Rebuilding plan.",
-                                                snapshot.account.position.size, latest_position
-                                            );
-                                        }
-                                        snapshot.account = refreshed;
-                                        exec_plan = decibel_grid_tui::strategy::perp::runtime::finalize_perp_executable_plan(
-                                            &config,
-                                            exec_plan.clone(),
-                                            latest_position,
-                                            latest_margin,
-                                        )?;
-                                        // Re-check submission gates.
-                                        if let Some(reason) =
-                                            decibel_grid_tui::strategy::perp::runtime::perp_submission_blocked(
-                                                &config,
-                                                &exec_plan,
-                                                latest_position,
-                                                latest_margin,
-                                                snapshot.market.lot_size,
-                                                perp_runtime.bootstrap_status
-                                                    == journal::PerpBootstrapStatus::Pending,
-                                            )
-                                        {
-                                            eprintln!("PRE-SUBMIT BLOCKED: {reason}");
-                                            decibel_grid_tui::strategy::perp::runtime::record_perp_risk_rejection(
-                                                reason.clone(),
-                                                journal.as_ref(),
-                                                &mut run_state,
-                                            )?;
-                                            last_perp_submission_block_reason = Some(reason);
-                                            tokio::time::sleep(config.refresh).await;
-                                            continue;
-                                        }
-                                    }
-                                    Err(error) => {
-                                        eprintln!(
-                                            "PRE-SUBMIT account refresh failed: {error:#}; submitting with stale position {}",
-                                            snapshot.account.position.size
-                                        );
-                                    }
+                                let mut exec_plan = snapshot.plan.clone();
+                                let proceed = pre_submit::run_pre_submit_guard(
+                                    &api, &config, &settings.subaccount, &snapshot.market,
+                                    &mut exec_plan, snapshot.account.position.size,
+                                    snapshot.account.available_margin, journal.as_ref(),
+                                    &mut run_state,
+                                    perp_runtime.bootstrap_status == journal::PerpBootstrapStatus::Pending,
+                                    &mut last_perp_submission_block_reason,
+                                    config.refresh,
+                                ).await?;
+                                if !proceed {
+                                    continue;
                                 }
+                                snapshot.plan = exec_plan;
                             }
 
                             let observed = ws_state::active_bulk_ladder(&ws_state)?;
@@ -2308,110 +2124,48 @@ journal.append(&event)?;
         })
         .unwrap_or(settings.exit_asset_policy);
     if paused_by_breakout || paused_by_failure_circuit {
-        println!(
-            "Risk pause complete: ladder cancellation was attempted; assets were not liquidated."
-        );
+        println!("Risk halt active; market is not liquidated. Re-initialize the bot manually after reviewing the market.");
     } else if stop_loss_liquidated {
-        println!("Stop-loss already liquidated this market; skipping the exit sell policy.");
-    } else if execute {
-        if let Some(market) = last_market {
-            match exit_policy {
-                ExitAssetPolicy::Sell => {
-                    println!(
-                        "Exit policy is SELL: cancelling the ladder and liquidating assets..."
-                    );
-                    if market.product == Product::Perp {
-                        match decibel_grid_tui::strategy::perp::runtime::cancel_and_flatten_perp(
-                            &settings.network,
-                            &api,
-                            &settings.aptos_private_key,
-                            &settings.subaccount,
-                            &market,
-                            &config.spot,
-                            gas_station,
-                        )
-                        .await
-                        {
-                            Ok(result) => println!(
-                                "Perp exit completed: cancelled {} and position {} -> {}",
-                                result.cancel_transaction_hash,
-                                result.position_before,
-                                result.position_after
-                            ),
-                            Err(error) => eprintln!("Perp exit failed: {error:#}"),
-                        }
-                    } else {
-                        match exit_sell_assets(
-                            &settings.network,
-                            &settings.api_key,
-                            &settings.aptos_private_key,
-                            &settings.subaccount,
-                            &market,
-                            Some((
-                                &config.spot,
-                                spot_fee_rates
-                                    .as_ref()
-                                    .expect("live Spot execution fetched fee rates"),
-                            )),
-                            gas_station,
-                        )
-                        .await
-                        {
-                            Ok(hashes) => println!(
-                                "Exit cleanup completed: {} transaction(s): {:?}",
-                                hashes.len(),
-                                hashes
-                            ),
-                            Err(error) => eprintln!("Exit cleanup failed: {error:#}"),
-                        }
-                    }
-                }
-                ExitAssetPolicy::Retain => {
-                    println!(
-                        "Exit policy is RETAIN: cancelling the ladder and retaining released assets."
-                    );
-                    match journaled_bulk_cancel(
-                        journal.as_ref(),
-                        &mut run_state,
-                        &settings.network,
-                        &settings.aptos_private_key,
-                        &settings.subaccount,
-                        &market,
-                        gas_station,
-                    )
-                    .await
-                    {
-                        Ok(Some(hash)) => {
-                            println!("Bulk ladder cancelled in tx {hash}; assets retained.")
-                        }
-                        Ok(None) => {}
-                        Err(error) => eprintln!(
-                            "Bulk cancellation failed; ladder may still be live: {error:#}"
-                        ),
-                    }
-                }
+        println!("Stop-loss already liquidated; exit skip active.");
+    } else if config.product == Product::Perp {
+        shutdown::handle_perp_exit(
+            exit_policy, execute, &settings, &mut run_state, &mut last_market,
+            &api, &config, gas_station, journal.as_ref(),
+        ).await?;
+    } else if config.product == Product::Spot {
+        if exit_policy == ExitAssetPolicy::Sell {
+            if let Some(market) = &last_market {
+                let _ = exit_sell_assets(
+                    &settings.network,
+                    &settings.api_key,
+                    &settings.aptos_private_key,
+                    &settings.subaccount,
+                    market,
+                    None,
+                    gas_station,
+                )
+                .await;
             }
         } else {
-            println!("No market snapshot was loaded; no ladder lifecycle action was sent.");
+            let market = last_market.clone().context("no market captured for exit")?;
+            let _ = journaled_bulk_cancel(
+                journal.as_ref(), &mut run_state,
+                &settings.network, &settings.aptos_private_key,
+                &settings.subaccount, &market, gas_station,
+            ).await;
         }
-        if let Some(journal) = journal.as_ref() {
-            let shutdown_event = decibel_grid_tui::journal::JournalEvent::Shutdown {
-                at: Utc::now(),
-                reason: format!(
-                    "engine stopped (exit policy: {})",
-                    match engine_runtime
-                        .as_ref()
-                        .and_then(|r| r.requested_exit_mode())
-                    {
-                        Some(decibel_grid_tui::control::ExitMode::Hold) => "retain",
-                        Some(decibel_grid_tui::control::ExitMode::Liquidate) => "sell",
-                        None => "terminated",
-                    }
-                ),
-            };
-            let _ = journal.append(&shutdown_event);
-            let _ = journal.save_state(&run_state);
-        }
+    }
+
+    let reason = match exit_policy {
+        ExitAssetPolicy::Retain => "retain",
+        ExitAssetPolicy::Sell => "sell",
+    };
+    if let Some(j) = &journal {
+        j.append(&journal::JournalEvent::Shutdown {
+            at: Utc::now(),
+            reason: reason.to_owned(),
+        })?;
+        j.save_state(&run_state)?;
     }
     Ok(())
 }
