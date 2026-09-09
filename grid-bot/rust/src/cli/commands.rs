@@ -999,21 +999,45 @@ pub async fn journal_cli(settings: Settings, cmd: crate::cli::settings::JournalC
                     );
                     println!("Next cycle will proceed with normal replacement.");
                 }
-                Some(active) => {
-                    // Different ladder exists; report the mismatch.
+                Some(active) if active.sequence == ladder.sequence => {
+                    // Same sequence but levels differ — likely fills or REST compaction.
+                    // Adopt the REST levels as the current active ladder state.
                     println!(
-                        "Recovery blocked: venue has sequence {} with {} level(s),",
+                        "Venue has sequence {} with {} level(s) (journal had {}). Adopting observed levels.",
                         active.sequence,
+                        active.levels.len(),
+                        ladder.levels.len(),
+                    );
+                    // Record the venue observation.
+                    let observed = journal::JournalEvent::BulkVenueObserved {
+                        at: Utc::now(),
+                        operation_id: ladder.operation_id.clone(),
+                    };
+                    journal.append(&observed)?;
+                    state.apply(&observed);
+                    // Update journal levels to match REST.
+                    if let Some(bulk) = state.bulk_ladder.as_mut()
+                        && bulk.operation_id == ladder.operation_id
+                    {
+                        bulk.levels = active.levels.clone();
+                    }
+                    journal.save_state(&state)?;
+                    println!(
+                        "Journal levels updated to match venue ({}/{}).",
+                        active.levels.len(),
                         active.levels.len()
                     );
+                    println!("Next cycle will proceed with normal replacement.");
+                }
+                Some(active) => {
+                    // Different sequence — the ladder belongs to another operation.
                     println!(
-                        "  but journal expects sequence {} with {} level(s).",
+                        "Recovery blocked: venue has sequence {} (journal expects {}), {} level(s).",
+                        active.sequence,
                         ladder.sequence,
-                        ladder.levels.len()
+                        active.levels.len()
                     );
-                    println!(
-                        "  Manual operator action required (the ladder belongs to another entity or run)."
-                    );
+                    println!("  The ladder belongs to a different operation.");
                 }
                 None => {
                     println!(
