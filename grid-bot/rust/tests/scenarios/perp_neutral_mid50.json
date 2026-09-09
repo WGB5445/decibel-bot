@@ -1,0 +1,30 @@
+{
+  "name": "perp_neutral_mid50",
+  "product": "perp",
+  "config": {
+    "total_count": 40,
+    "perp_mode": "neutral",
+    "range": { "kind": "bounds", "lower": "1", "upper": "100" },
+    "allocation": { "kind": "total_budget", "value": "1000" },
+    "maker_fee_rate": "0.0001",
+    "preview_leverage": "1"
+  },
+  "market": {
+    "name": "BTC/USD",
+    "tick_size": "1",
+    "lot_size": "0.01",
+    "min_size": "0.01",
+    "px_decimals": 0,
+    "sz_decimals": 2
+  },
+  "steps": [
+    {
+      "mid": "50",
+      "expect": {
+        "bid_count": 20,
+        "ask_count": 20,
+        "perp_blocked": false
+      }
+    }
+  ]
+}

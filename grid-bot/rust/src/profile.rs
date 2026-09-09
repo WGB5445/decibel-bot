@@ -111,6 +111,9 @@ pub struct ProfileData {
     pub market: String,
     pub subaccount: String,
     pub perp_mode: String,
+    /// Unified Perp action outside the configured range.
+    #[serde(default = "default_out_of_range_action")]
+    pub out_of_range_action: String,
     pub range_kind: String,
     pub range_value: String,
     pub upper_bound: String,
@@ -154,9 +157,15 @@ pub struct ProfileData {
     pub price_buffer_bps: String,
     #[serde(default)]
     pub max_consecutive_bulk_failures: String,
+    #[serde(default)]
+    pub max_position: Option<String>,
     /// Argon2id + XChaCha20-Poly1305 envelopes. `None` when a credential has not been saved.
     pub encrypted_api_key: Option<EncryptedSecret>,
     pub encrypted_aptos_private_key: Option<EncryptedSecret>,
+}
+
+fn default_out_of_range_action() -> String {
+    "pause".to_owned()
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

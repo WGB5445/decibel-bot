@@ -9,12 +9,17 @@ from grid_bot import (
     GridMath,
     GridOrders,
     SpotFunds,
+    build_perp_orders,
     chain_units_to_decimal,
+    compute_perp_target,
     compute_spot_taker_funding,
     fit_spot_orders_to_funds,
     grid_side_counts,
+    perp_position_is_safe,
+    perp_out_of_range_decision,
     quantize_down,
     scale_to_chain_units,
+    trim_perp_pending_to_risk,
 )
 
 
@@ -41,6 +46,7 @@ def config(**overrides: object) -> GridConfig:
         "maker_fee_rate": Decimal("0.001"),
         "preview_leverage": Decimal("1"),
         "price_source": "depth",
+        "out_of_range_action": "pause",
         "dry_run": True,
     }
     values.update(overrides)
@@ -114,6 +120,39 @@ def test_spot_budget_auto_sizes_each_side_using_half_budget() -> None:
     assert orders.ask_sizes == [Decimal("0.93"), Decimal("0.93")]
 
 
+def test_perp_budget_auto_sizes_using_total_levels_formula() -> None:
+    cfg = config(
+        product="perp",
+        perp_mode="long",
+        total_budget=Decimal("412.412"),
+        order_size=None,
+        lower_price=Decimal("90"),
+        upper_price=Decimal("110"),
+        total_grid_count=4,
+    )
+    orders = GridMath.orders(
+        cfg,
+        Decimal("100"),
+        Decimal("1"),
+        Decimal("0.01"),
+        Decimal("0.01"),
+        cfg.maker_fee_rate,
+    )
+    rep = orders.ask_prices[0]
+    total_levels = len(orders.bid_prices) + len(orders.ask_prices)
+    expected = quantize_down(
+        cfg.total_budget
+        / (
+            Decimal(total_levels) * rep / cfg.preview_leverage
+            + Decimal(total_levels) * rep * cfg.maker_fee_rate
+        ),
+        Decimal("0.01"),
+    )
+    assert orders.bid_sizes == [expected] * len(orders.bid_prices)
+    assert orders.ask_sizes == [expected] * len(orders.ask_prices)
+    assert expected == Decimal("1")
+
+
 def test_40_per_side_grid_is_supported() -> None:
     orders = GridMath.orders(
         config(levels_per_side=MAX_BULK_LEVELS_PER_SIDE),
@@ -126,16 +165,177 @@ def test_40_per_side_grid_is_supported() -> None:
     assert len(orders.ask_prices) == MAX_BULK_LEVELS_PER_SIDE
 
 
-def test_long_perp_grid_places_bids_only() -> None:
-    orders = grid_orders(product="perp", perp_mode="long")
+def test_long_perp_grid_is_bilateral_with_target() -> None:
+    orders = grid_orders(
+        product="perp",
+        perp_mode="long",
+        lower_price=Decimal("90"),
+        upper_price=Decimal("110"),
+        total_grid_count=4,
+    )
     assert len(orders.bid_prices) == 2
+    assert len(orders.ask_prices) == 2
+    assert compute_perp_target("long", len(orders.ask_prices), len(orders.bid_prices), orders.bid_sizes[0]) == Decimal("0.02")
+
+
+def test_short_perp_grid_target_is_negative() -> None:
+    orders = grid_orders(
+        product="perp",
+        perp_mode="short",
+        lower_price=Decimal("90"),
+        upper_price=Decimal("110"),
+        total_grid_count=4,
+    )
+    assert compute_perp_target("short", len(orders.ask_prices), len(orders.bid_prices), orders.bid_sizes[0]) == Decimal("-0.02")
+
+
+def test_shared_perp_contract_table() -> None:
+    cases = [
+        ("long", Decimal("0.02")),
+        ("short", Decimal("-0.02")),
+        ("neutral", Decimal(0)),
+    ]
+    for mode, expected_target in cases:
+        orders = grid_orders(
+            product="perp",
+            perp_mode=mode,
+            lower_price=Decimal("90"),
+            upper_price=Decimal("110"),
+            total_grid_count=4,
+        )
+        assert len(orders.bid_prices) == 2
+        assert len(orders.ask_prices) == 2
+        target = compute_perp_target(mode, len(orders.ask_prices), len(orders.bid_prices), orders.bid_sizes[0])
+        assert target == expected_target
+
+
+def test_perp_position_is_safe_requires_convergence_at_zero() -> None:
+    cfg = config(
+        product="perp",
+        perp_mode="long",
+        lower_price=Decimal("90"),
+        upper_price=Decimal("110"),
+        total_grid_count=4,
+        max_position=Decimal("0.04"),
+    )
+    orders = grid_orders(
+        product="perp",
+        perp_mode="long",
+        lower_price=Decimal("90"),
+        upper_price=Decimal("110"),
+        total_grid_count=4,
+        max_position=Decimal("0.04"),
+    )
+    assert not perp_position_is_safe(cfg, Decimal(0), orders)
+    assert perp_position_is_safe(cfg, Decimal("0.02"), orders)
+
+
+def test_long_perp_at_target_is_safe_without_max_position() -> None:
+    cfg = config(
+        product="perp",
+        perp_mode="long",
+        lower_price=Decimal("90"),
+        upper_price=Decimal("110"),
+        total_grid_count=4,
+    )
+    orders = grid_orders(
+        product="perp",
+        perp_mode="long",
+        lower_price=Decimal("90"),
+        upper_price=Decimal("110"),
+        total_grid_count=4,
+    )
+    target = compute_perp_target(
+        "long", len(orders.ask_prices), len(orders.bid_prices), orders.bid_sizes[0]
+    )
+    assert perp_position_is_safe(cfg, target, orders)
+
+
+def test_uniform_range_rejects_tick_collisions() -> None:
+    with pytest.raises(ValueError, match="too narrow for 4 distinct price points"):
+        build_perp_orders(
+            config(
+                product="perp",
+                lower_price=Decimal("100"),
+                upper_price=Decimal("101"),
+                total_grid_count=4,
+            ),
+            Decimal("100.5"),
+            Decimal("1"),
+            Decimal("0.01"),
+            Decimal("0.01"),
+            Decimal(0),
+        )
+
+
+def test_out_of_range_pause_returns_empty_orders() -> None:
+    orders = build_perp_orders(
+        config(
+            product="perp",
+            lower_price=Decimal("90"),
+            upper_price=Decimal("110"),
+            total_grid_count=4,
+        ),
+        Decimal("120"),
+        Decimal("1"),
+        Decimal("0.01"),
+        Decimal("0.01"),
+        Decimal(0),
+    )
+    assert orders.bid_prices == []
     assert orders.ask_prices == []
 
 
-def test_short_perp_grid_places_asks_only() -> None:
-    orders = grid_orders(product="perp", perp_mode="short")
-    assert orders.bid_prices == []
-    assert len(orders.ask_prices) == 2
+@pytest.mark.parametrize(
+    ("action", "skip_bulk", "paused", "cancel", "close", "effective"),
+    [
+        ("pause", True, True, False, False, Decimal("120")),
+        ("cancel_orders", True, False, True, False, Decimal("120")),
+        ("close_position", True, False, True, True, Decimal("120")),
+        ("clamp_continue", False, False, False, False, Decimal("110")),
+    ],
+)
+def test_perp_out_of_range_action_contract(
+    action: str,
+    skip_bulk: bool,
+    paused: bool,
+    cancel: bool,
+    close: bool,
+    effective: Decimal,
+) -> None:
+    decision = perp_out_of_range_decision(
+        config(
+            product="perp",
+            out_of_range_action=action,
+            lower_price=Decimal("90"),
+            upper_price=Decimal("110"),
+            total_grid_count=4,
+        ),
+        Decimal("120"),
+    )
+    assert decision.direction == "above"
+    assert decision.skip_bulk is skip_bulk
+    assert decision.paused is paused
+    assert decision.cancel_orders is cancel
+    assert decision.close_position is close
+    assert decision.effective_planning_price == effective
+
+
+def test_perp_risk_trim_keeps_nearest_pending_levels() -> None:
+    cfg = config(
+        product="perp",
+        perp_mode="neutral",
+        max_position=Decimal("0.02"),
+    )
+    orders = GridOrders(
+        [Decimal("99"), Decimal("98"), Decimal("97")],
+        [Decimal("0.01")] * 3,
+        [Decimal("101"), Decimal("102"), Decimal("103")],
+        [Decimal("0.01")] * 3,
+    )
+    trimmed = trim_perp_pending_to_risk(cfg, Decimal(0), orders)
+    assert trimmed.bid_prices == [Decimal("99"), Decimal("98")]
+    assert trimmed.ask_prices == [Decimal("101"), Decimal("102")]
 
 
 def test_profit_preview_subtracts_maker_fees_for_both_fills() -> None:
@@ -165,10 +365,17 @@ def test_perp_margin_uses_larger_side_notional_and_preview_leverage() -> None:
 
 def test_directional_grid_has_no_completed_cycle_profit_estimate() -> None:
     preview = GridMath.profit_preview(
-        grid_orders(product="perp", perp_mode="long"), Decimal("0.001")
+        grid_orders(
+            product="perp",
+            perp_mode="long",
+            lower_price=Decimal("90"),
+            upper_price=Decimal("110"),
+            total_grid_count=4,
+        ),
+        Decimal("0.001"),
     )
-    assert preview.pair_count == 0
-    assert preview.net_profit == 0
+    assert preview.pair_count == 2
+    assert preview.net_profit > 0
 
 
 def test_grid_rejects_mid_outside_range() -> None:

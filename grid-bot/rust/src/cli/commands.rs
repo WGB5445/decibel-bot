@@ -1,0 +1,1206 @@
+use std::{
+    collections::BTreeSet,
+    fs,
+    io::{self, Write},
+    path::{Path, PathBuf},
+    process::{Command, Stdio},
+    str::FromStr,
+    time::Duration,
+};
+
+use anyhow::{Context, Result};
+use chrono::Utc;
+use decibel_grid_tui::notify::{NotificationConfig, Notifier};
+use decibel_grid_tui::process_lock::{SubaccountRunLock, SubaccountStartupLock};
+use decibel_grid_tui::*;
+use rust_decimal::{Decimal, prelude::ToPrimitive};
+
+use crate::cli::settings::Settings;
+use crate::engine::{optional_subaccount, print_snapshot, run_cli};
+use crate::tui::USDC_CROSS_DUST;
+
+/// Send this process's stdout and stderr to `path`, replacing any previous contents.
+///
+/// This replaces file descriptors 1 and 2 (or the Windows standard handles) rather than merely
+/// wrapping `println!`, so panic reports and anything a dependency writes directly to those
+/// descriptors land in the same file. Rust's stdout is line-buffered even when it is not a
+/// terminal, so the file stays readable while a long `run` is still going.
+#[cfg(unix)]
+pub(crate) fn redirect_output_to_log(path: &Path) -> Result<()> {
+    use std::os::fd::AsRawFd;
+
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("cannot create log directory {}", parent.display()))?;
+    }
+    // Truncating open: each run starts from a clean file instead of appending to stale output.
+    let file = fs::File::create(path)
+        .with_context(|| format!("cannot create log file {}", path.display()))?;
+    let fd = file.as_raw_fd();
+    for (target, name) in [
+        (libc::STDOUT_FILENO, "stdout"),
+        (libc::STDERR_FILENO, "stderr"),
+    ] {
+        // SAFETY: `fd` is a valid descriptor owned by `file` and still open here, and `target`
+        // is one of the two standard descriptors, which are always valid dup2 targets.
+        if unsafe { libc::dup2(fd, target) } < 0 {
+            return Err(io::Error::last_os_error())
+                .with_context(|| format!("cannot redirect {name} to {}", path.display()));
+        }
+    }
+    // Descriptors 1 and 2 now reference the same open file, so the original handle is redundant.
+    drop(file);
+    Ok(())
+}
+
+#[cfg(windows)]
+pub(crate) fn redirect_output_to_log(path: &Path) -> Result<()> {
+    use std::os::windows::io::AsRawHandle;
+
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("cannot create log directory {}", parent.display()))?;
+    }
+    let file = fs::File::create(path)
+        .with_context(|| format!("cannot create log file {}", path.display()))?;
+    let handle = file.as_raw_handle();
+
+    // SAFETY: `handle` is a valid file handle owned by `file`. It is intentionally leaked so
+    // the standard handles remain valid for the lifetime of the process.
+    unsafe {
+        let ok = windows_sys::Win32::System::Console::SetStdHandle(
+            windows_sys::Win32::System::Console::STD_OUTPUT_HANDLE,
+            handle as _,
+        ) != 0
+            && windows_sys::Win32::System::Console::SetStdHandle(
+                windows_sys::Win32::System::Console::STD_ERROR_HANDLE,
+                handle as _,
+            ) != 0;
+        if !ok {
+            return Err(io::Error::last_os_error())
+                .with_context(|| format!("cannot redirect stdout/stderr to {}", path.display()));
+        }
+    }
+    std::mem::forget(file);
+    Ok(())
+}
+
+pub(crate) fn simulate_cli(scenario_path: Option<&Path>) -> Result<()> {
+    let path = scenario_path.context("simulate requires --scenario <path> (YAML or JSON)")?;
+    let raw =
+        fs::read_to_string(path).with_context(|| format!("read scenario {}", path.display()))?;
+    let scenario = decibel_grid_tui::simulation::parse_scenario(&raw)?;
+    decibel_grid_tui::simulation::simulate_scenario(&scenario, std::io::stdout())?;
+    Ok(())
+}
+
+pub async fn check_api_key(settings: Settings) -> Result<()> {
+    validate_api_key_format(&settings.api_key).context("API key format check failed")?;
+    let api = DecibelClient::new(&settings.network, &settings.api_key)?;
+    api.verify_api_key().await?;
+    println!(
+        "API key format is valid and the key is accepted by the {} API.",
+        settings.network
+    );
+    Ok(())
+}
+
+struct EngineRuntimeGuard {
+    paths: control::ControlPaths,
+}
+
+impl Drop for EngineRuntimeGuard {
+    fn drop(&mut self) {
+        self.paths.remove_runtime_files();
+    }
+}
+
+pub(crate) fn control_paths(settings: &Settings) -> Result<control::ControlPaths> {
+    control::ControlPaths::for_subaccount(&settings.subaccount)
+}
+
+pub(crate) async fn control_request(
+    settings: &Settings,
+    request: control::Request,
+) -> Result<control::Response> {
+    control::request(&control_paths(settings)?, &request).await
+}
+
+pub async fn status_client(settings: Settings) -> Result<()> {
+    match control_request(&settings, control::Request::Status).await? {
+        control::Response::Status { status } => {
+            println!("engine pid={} phase={}", status.pid, status.phase);
+            println!(
+                "{} {} {} {}",
+                status.network, status.subaccount, status.product, status.market
+            );
+            println!(
+                "last cycle: {:?}; mid: {:?}",
+                status.last_cycle_at, status.mid
+            );
+            println!(
+                "reconciliation: matched={:?} missing={:?} unmanaged={:?}",
+                status.matched, status.missing, status.unmanaged
+            );
+            if let Some(error) = status.last_error {
+                println!("last error: {error}");
+            }
+            Ok(())
+        }
+        control::Response::Error { message } => {
+            anyhow::bail!("engine rejected status request: {message}")
+        }
+        response => anyhow::bail!("unexpected engine status response: {response:?}"),
+    }
+}
+
+pub async fn stop_client(settings: Settings, confirm_mainnet: Option<&str>) -> Result<()> {
+    if settings.network.eq_ignore_ascii_case("mainnet") && confirm_mainnet != Some("MAINNET") {
+        anyhow::bail!("mainnet stop requires --confirm-mainnet MAINNET")
+    }
+    let mode = match settings.exit_asset_policy {
+        ExitAssetPolicy::Retain => control::ExitMode::Hold,
+        ExitAssetPolicy::Sell => control::ExitMode::Liquidate,
+    };
+    println!("Sending stop request to engine (mode: {mode:?})...");
+    match control_request(&settings, control::Request::Stop { exit_mode: mode }).await? {
+        control::Response::Accepted { message } => {
+            println!("{message}");
+            Ok(())
+        }
+        control::Response::Error { message } => {
+            anyhow::bail!("engine rejected stop request: {message}")
+        }
+        response => anyhow::bail!("unexpected engine stop response: {response:?}"),
+    }
+}
+
+pub async fn logs_client(settings: Settings, follow: bool) -> Result<()> {
+    let paths = control_paths(&settings)?;
+    let shown = control::tail_lines(&paths.log, 200)?;
+    if !shown.is_empty() {
+        println!("{shown}");
+    }
+    if !follow {
+        return Ok(());
+    }
+    let mut offset = fs::metadata(&paths.log)?.len();
+    loop {
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        let bytes = fs::read(&paths.log)?;
+        if bytes.len() < offset as usize {
+            offset = 0;
+        }
+        if bytes.len() > offset as usize {
+            let appended = String::from_utf8_lossy(&bytes[offset as usize..]);
+            print!("{appended}");
+            io::stdout().flush()?;
+            offset = bytes.len() as u64;
+        }
+    }
+}
+
+pub async fn attach_client(settings: Settings) -> Result<()> {
+    let client = decibel_grid_tui::client::EngineClient::for_subaccount(&settings.subaccount)?;
+    decibel_grid_tui::attach_tui::run(client).await
+}
+
+pub async fn start_cli(settings: Settings, confirm_mainnet: Option<&str>) -> Result<()> {
+    if settings.network.eq_ignore_ascii_case("mainnet") && confirm_mainnet != Some("MAINNET") {
+        anyhow::bail!("mainnet start requires --confirm-mainnet MAINNET")
+    }
+    let paths = control_paths(&settings)?;
+    paths.ensure_directory()?;
+    if let Some(pid) = paths.read_pid()? {
+        if control::process_is_alive(pid) {
+            anyhow::bail!("engine already running for this account (pid {pid})")
+        }
+        paths.remove_runtime_files();
+    }
+    // Preflight and hold the startup lock until the child engine responds. This serializes
+    // concurrent `start` invocations without blocking the engine's long-lived run lock.
+    let _startup_lock = SubaccountStartupLock::acquire(&settings.network, &settings.subaccount)?;
+    let executable = std::env::current_exe().context("resolve grid-bot executable")?;
+    let mut args = std::env::args_os().skip(1).collect::<Vec<_>>();
+    let Some(index) = args.iter().position(|arg| arg == "start") else {
+        anyhow::bail!("could not rewrite start command for engine child")
+    };
+    args[index] = "engine".into();
+    let mut child = Command::new(executable)
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .context("launch grid engine child")?;
+    for _ in 0..40 {
+        if let Ok(status) = child.try_wait() {
+            if let Some(status) = status {
+                anyhow::bail!(
+                    "engine process {} exited before opening its control socket (status: {status}); \
+                     inspect {}. If another grid process (engine, shadow, or attach) already holds \
+                     the subaccount run lock, stop it first",
+                    child.id(),
+                    paths.log.display()
+                );
+            }
+        }
+        if matches!(
+            control::request(&paths, &control::Request::Ping).await,
+            Ok(control::Response::Pong)
+        ) {
+            println!(
+                "grid engine started (pid {}); socket {}",
+                child.id(),
+                paths.socket.display()
+            );
+            return Ok(());
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let exit_hint = match child.try_wait() {
+        Ok(Some(status)) => format!(" (exited with status: {status})"),
+        Ok(None) => String::new(),
+        Err(err) => format!(" (could not check exit status: {err})"),
+    };
+    anyhow::bail!(
+        "engine process {} did not open its control socket{exit_hint}; inspect {}. \
+         If another grid process (engine, shadow, or attach) already holds the subaccount run lock, stop it first",
+        child.id(),
+        paths.log.display()
+    )
+}
+
+pub async fn engine_cli(
+    settings: Settings,
+    confirm_mainnet: Option<&str>,
+    active_log_path: Option<PathBuf>,
+) -> Result<()> {
+    let _subaccount_lock = SubaccountRunLock::acquire(&settings.network, &settings.subaccount)?;
+    let paths = control_paths(&settings)?;
+    paths.ensure_directory()?;
+    if let Some(pid) = paths.read_pid()? {
+        if control::process_is_alive(pid) {
+            anyhow::bail!("engine already running for this account (pid {pid})")
+        }
+        paths.remove_runtime_files();
+    }
+    let runtime = control::EngineHandle::new(control::EngineStatus {
+        pid: std::process::id(),
+        started_at: Some(Utc::now()),
+        network: settings.network.clone(),
+        subaccount: settings.subaccount.clone(),
+        market: settings.market.clone(),
+        product: format!("{:?}", settings.product).to_lowercase(),
+        phase: "starting".to_owned(),
+        program_version: crate::build_info::version_string(),
+        log_path: active_log_path.map(|path| path.display().to_string()),
+        ..Default::default()
+    });
+    paths.write_pid(std::process::id())?;
+    let _guard = EngineRuntimeGuard {
+        paths: paths.clone(),
+    };
+    if settings.telegram_bot_token.is_some() != settings.telegram_chat_id.is_some() {
+        anyhow::bail!(
+            "TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID must be configured together for alerts"
+        )
+    }
+    let notifier = Notifier::new(NotificationConfig {
+        discord_webhook_url: settings.discord_webhook_url.clone(),
+        telegram_bot_token: settings.telegram_bot_token.clone(),
+        telegram_chat_id: settings.telegram_chat_id.clone(),
+        telegram_allowed_user_ids: parse_telegram_user_ids(
+            settings.telegram_allowed_user_ids.as_deref(),
+        )?,
+        discord_status_url: settings.discord_status_url.clone(),
+    });
+    let server = control::start_server(&paths, runtime.clone()).await?;
+    if let Some(notifier) = &notifier {
+        notifier.spawn_telegram_controller(runtime.clone());
+    }
+    let mut consecutive_failures = 0u32;
+    let result = loop {
+        if runtime.is_cancelled() {
+            break Ok(());
+        }
+        if consecutive_failures > 0 {
+            runtime
+                .update_status(|status| {
+                    status.phase = "recovering".to_owned();
+                    status.last_error = None;
+                })
+                .await;
+            if let Some(notifier) = &notifier {
+                notifier
+                    .send(
+                        "Decibel grid engine recovering",
+                        "Restarting the strategy loop from its durable journal after a runtime error.",
+                    )
+                    .await;
+            }
+        }
+        match run_cli(
+            settings.clone(),
+            true,
+            confirm_mainnet,
+            Some(runtime.clone()),
+            notifier.clone(),
+        )
+        .await
+        {
+            Ok(()) => break Ok(()),
+            Err(error) => {
+                consecutive_failures += 1;
+                let message = format!("{error:#}");
+                let backoff = Duration::from_secs(
+                    (3u64.saturating_mul(2u64.pow(consecutive_failures.saturating_sub(1).min(4))))
+                        .min(60),
+                );
+                eprintln!(
+                    "grid runtime error (attempt {consecutive_failures}); retrying in {}s: {message}",
+                    backoff.as_secs()
+                );
+                runtime
+                    .update_status(|status| {
+                        status.phase = "degraded".to_owned();
+                        status.last_error = Some(message.clone());
+                    })
+                    .await;
+                if let Some(notifier) = &notifier
+                    && (consecutive_failures == 1 || consecutive_failures.is_power_of_two())
+                {
+                    notifier
+                        .send(
+                            "Decibel grid engine degraded",
+                            &format!(
+                                "Runtime cycle failed {consecutive_failures} time(s); retrying in {}s.\n{message}",
+                                backoff.as_secs()
+                            ),
+                        )
+                        .await;
+                }
+                tokio::time::sleep(backoff).await;
+            }
+        }
+    };
+    runtime
+        .update_status(|status| status.phase = "stopped".to_owned())
+        .await;
+    server.abort();
+    result
+}
+
+fn parse_telegram_user_ids(raw: Option<&str>) -> Result<BTreeSet<i64>> {
+    raw.unwrap_or_default()
+        .split(',')
+        .filter(|value| !value.trim().is_empty())
+        .map(|value| {
+            value.trim().parse::<i64>().with_context(|| {
+                format!("invalid Telegram user ID {value:?} in TELEGRAM_ALLOWED_USER_IDS")
+            })
+        })
+        .collect()
+}
+
+/// Legacy direct status implementation retained for compatibility tests; the public `status`
+/// command now queries the running engine's local socket.
+#[allow(dead_code)]
+async fn status_cli(settings: Settings) -> Result<()> {
+    validate_api_key_format(&settings.api_key).context("API key format check failed")?;
+    let config = settings.to_grid_config()?;
+    let api = settings.api_client()?;
+    let snapshot = fetch_snapshot(&api, &config, optional_subaccount(&settings)).await?;
+    print_snapshot(&snapshot, &config);
+    Ok(())
+}
+
+/// Legacy direct lifecycle implementation retained for compatibility tests; the public `stop`
+/// command now tells the running engine to execute this shutdown flow.
+#[allow(dead_code)]
+async fn stop_cli(settings: Settings, confirm_mainnet: Option<&str>) -> Result<()> {
+    if settings.api_key.trim().is_empty()
+        || settings.aptos_private_key.trim().is_empty()
+        || settings.subaccount.trim().is_empty()
+    {
+        anyhow::bail!("stop requires DECIBEL_API_KEY, APTOS_PRIVATE_KEY, and SUBACCOUNT_ADDRESS")
+    }
+    if settings.network.eq_ignore_ascii_case("mainnet") && confirm_mainnet != Some("MAINNET") {
+        anyhow::bail!("mainnet stop requires --confirm-mainnet MAINNET")
+    }
+    let _lock = SubaccountRunLock::acquire(&settings.network, &settings.subaccount)?;
+    let mut config = settings.to_grid_config()?;
+    let api = settings.api_client()?;
+    let gas_station_config = settings.gas_station_config()?;
+    let gas_station = gas_station_config.as_ref();
+    let market = api.market(&config.market_name, config.product).await?;
+    match settings.exit_asset_policy {
+        ExitAssetPolicy::Retain => {
+            let hash = spot_lifecycle::cancel_bulk_ladder(
+                &settings.network,
+                &settings.aptos_private_key,
+                &settings.subaccount,
+                &market,
+                gas_station,
+            )
+            .await?;
+            println!("Grid stopped: ladder cancelled in tx {hash}; assets retained.");
+        }
+        ExitAssetPolicy::Sell => {
+            if market.product == Product::Perp {
+                let result = decibel_grid_tui::strategy::perp::runtime::cancel_and_flatten_perp(
+                    &settings.network,
+                    &api,
+                    &settings.aptos_private_key,
+                    &settings.subaccount,
+                    &market,
+                    &config.spot,
+                    gas_station,
+                )
+                .await?;
+                println!(
+                    "Grid stopped: cancelled {} and Perp position {} -> {}",
+                    result.cancel_transaction_hash, result.position_before, result.position_after
+                );
+                return Ok(());
+            }
+            let spot_guard = if market.product == Product::Spot {
+                let rates = api.spot_fee_rates(&settings.subaccount).await?;
+                config.maker_fee_rate = rates.maker_rate;
+                Some((config.spot, rates))
+            } else {
+                None
+            };
+            let guard_refs = spot_guard.as_ref().map(|(policy, rates)| (policy, rates));
+            let hashes = exit_sell_assets(
+                &settings.network,
+                &settings.api_key,
+                &settings.aptos_private_key,
+                &settings.subaccount,
+                &market,
+                guard_refs,
+                gas_station,
+            )
+            .await?;
+            println!(
+                "Grid stopped and liquidation attempted in {} transaction(s): {:?}",
+                hashes.len(),
+                hashes
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Explicit, operator-confirmed Cross→PFS transfer. The bot does not attempt to set
+/// HOLD_AS_NON_COLLATERAL: that entry function is owner-only, while the bot signer may only have
+/// delegated trading/funds permissions. The operator must set the future-settlement flag manually
+/// in the Decibel UI/wallet first.
+pub async fn spot_funding_setup_cli(
+    settings: Settings,
+    amount: String,
+    metadata: Option<String>,
+) -> Result<()> {
+    if settings.aptos_private_key.trim().is_empty() {
+        anyhow::bail!("spot-funding-setup requires APTOS_PRIVATE_KEY")
+    }
+    if settings.subaccount.trim().is_empty() {
+        anyhow::bail!("spot-funding-setup requires SUBACCOUNT_ADDRESS")
+    }
+    let metadata = metadata.unwrap_or_else(|| decibel_grid_tui::TESTNET_USDC_METADATA.to_owned());
+    let amount_decimal = Decimal::from_str(amount.trim())
+        .context("--spot-funding-amount/SPOT_FUNDING_AMOUNT must be a decimal USDC amount")?;
+    if amount_decimal < Decimal::ZERO {
+        anyhow::bail!("--spot-funding-amount/SPOT_FUNDING_AMOUNT cannot be negative")
+    }
+    println!(
+        "NOTICE: HOLD_AS_NON_COLLATERAL is owner-only and is not submitted by this bot. Set it manually in the Decibel UI/wallet before relying on future Spot proceeds staying in PFS."
+    );
+    if amount_decimal.is_zero() {
+        println!("No transfer amount given (0); skipping the Cross→PFS transfer.");
+        return Ok(());
+    }
+    let raw = (amount_decimal * Decimal::from(1_000_000u64))
+        .floor()
+        .to_i64()
+        .ok_or_else(|| anyhow::anyhow!("--spot-funding-amount is outside the supported range"))?;
+    println!("Transferring {amount_decimal} USDC from Cross to PFS...");
+    let gas_station_config = settings.gas_station_config()?;
+    let gas_station = gas_station_config.as_ref();
+    let transfer_tx = decibel_grid_tui::transfer_spot_cross_pfs(
+        &settings.network,
+        &settings.aptos_private_key,
+        &settings.subaccount,
+        &metadata,
+        -raw,
+        gas_station,
+    )
+    .await?;
+    println!("  Transfer submitted. tx {transfer_tx}");
+    Ok(())
+}
+
+/// Verify the prerequisites for a safe Testnet/Mainnet run without modifying Decibel state.
+pub async fn doctor_cli(settings: Settings) -> Result<()> {
+    validate_api_key_format(&settings.api_key).context("API key format check failed")?;
+    if settings.subaccount.trim().is_empty() {
+        anyhow::bail!("doctor requires SUBACCOUNT_ADDRESS")
+    }
+    let config = settings.to_grid_config()?;
+    let api = settings.api_client()?;
+    let gas_station_enabled = settings.gas_station_config()?.is_some();
+    api.verify_api_key()
+        .await
+        .context("API key verification failed")?;
+    if gas_station_enabled && !settings.aptos_private_key.trim().is_empty() {
+        use aptos_sdk::account::Ed25519Account;
+
+        let signer = Ed25519Account::from_private_key_hex(settings.aptos_private_key.trim())
+            .context("invalid Aptos Ed25519 private key")?;
+        let profile = settings.network_profile()?;
+        let aptos = decibel_grid_tui::network::default_registry().aptos(profile)?;
+        let balance = aptos.get_balance(signer.address()).await?;
+        const LOW_APT_OCTAS: u64 = 100_000;
+        if balance < LOW_APT_OCTAS {
+            println!(
+                "  note: signer APT balance is low ({balance} octas); Geomi Gas Station sponsors on-chain gas"
+            );
+        }
+    }
+    let (snapshot, result) = reconcile_snapshot(&api, &config, &settings.subaccount).await?;
+    println!(
+        "DOCTOR OK — {} {} on {}",
+        snapshot.market.name,
+        match config.product {
+            Product::Spot => "Spot",
+            Product::Perp => "Perp",
+        },
+        settings.network
+    );
+    println!(
+        "  rules: tick={} lot={} min_size={}",
+        snapshot.market.tick_size, snapshot.market.lot_size, snapshot.market.min_size
+    );
+    println!(
+        "  plan: {} bid(s), {} ask(s), quote={}, base={}",
+        snapshot.plan.bids.len(),
+        snapshot.plan.asks.len(),
+        snapshot.plan.quote_required,
+        snapshot.plan.base_required
+    );
+    match config.product {
+        Product::Spot => {
+            let funds = snapshot.account.spot_funds.as_ref().ok_or_else(|| {
+                anyhow::anyhow!("spot PFS balances unavailable in account overview")
+            })?;
+            println!(
+                "  PFS: {} {} available, {} {} available",
+                funds.available_base(),
+                funds.base_symbol,
+                funds.available_quote(),
+                funds.quote_symbol
+            );
+            // A bulk replacement also gets credit for whatever is already escrowed in the
+            // resting ladder, so report that separately rather than implying it is unusable.
+            if funds.base_reserved > Decimal::ZERO || funds.quote_reserved > Decimal::ZERO {
+                println!(
+                    "  bulk escrow (credited on replacement): {} {}, {} {} → usable {} {} / {} {}",
+                    funds.base_reserved,
+                    funds.base_symbol,
+                    funds.quote_reserved,
+                    funds.quote_symbol,
+                    funds.available_base_for_bulk(),
+                    funds.base_symbol,
+                    funds.available_quote_for_bulk(),
+                    funds.quote_symbol
+                );
+            }
+            if funds.quote_cross_balance() >= USDC_CROSS_DUST {
+                println!(
+                    "  note: {} {} sits in Cross and is NOT spendable by spot bulk orders; transfer it into PFS to fund bids.",
+                    funds.quote_cross_balance(),
+                    funds.quote_symbol
+                );
+            }
+            if funds.available_base_for_bulk() < snapshot.plan.base_required
+                || funds.available_quote_for_bulk() < snapshot.plan.quote_required
+            {
+                println!(
+                    "  note: the pinned Spot grid is underfunded; it will not be placed until the missing asset is funded."
+                );
+            }
+        }
+        Product::Perp => {
+            let margin = snapshot.account.available_margin.ok_or_else(|| {
+                anyhow::anyhow!("available Perp margin unavailable in account overview")
+            })?;
+            let required = snapshot.plan.estimated_margin.unwrap_or(Decimal::ZERO);
+            let position = snapshot.account.position.size;
+            println!("  margin: available={} estimated={}", margin, required);
+            println!("  position: {}", position);
+            if let Some(max) = config.max_position {
+                println!("  max_position: {}", max);
+                if !perp_position_is_safe(position, &snapshot.plan, &config) {
+                    anyhow::bail!(
+                        "Perp position {position} or worst-case exposure exceeds max_position {max}"
+                    )
+                }
+            }
+            if margin < required {
+                anyhow::bail!(
+                    "estimated Perp margin {} exceeds available {}",
+                    required,
+                    margin
+                )
+            }
+        }
+    }
+    println!("  reconciliation: {}", result.summary());
+    let blocking = decibel_grid_tui::reconcile::blocking_orders(&result.unmanaged);
+    if !blocking.is_empty() {
+        println!(
+            "  warning: {} standalone order(s) of unprovable ownership will block live bulk replacement.",
+            blocking.len()
+        );
+    } else if !result.unmanaged.is_empty() {
+        println!(
+            "  note: {} unmanaged level(s) belong to this account's bulk ladder; a new bulk submission replaces them atomically.",
+            result.unmanaged.len()
+        );
+    }
+    println!("  result: read-only checks passed; no exchange state changed.");
+    Ok(())
+}
+
+/// Compare the current desired grid with open orders. This is intentionally read-only: any order
+/// not exactly covered by the current plan remains unmanaged until a future client-ID-backed
+/// execution ledger can establish ownership safely.
+pub async fn reconcile_cli(settings: Settings) -> Result<()> {
+    validate_api_key_format(&settings.api_key).context("API key format check failed")?;
+    if settings.subaccount.trim().is_empty() {
+        anyhow::bail!("reconcile requires SUBACCOUNT_ADDRESS")
+    }
+    let config = settings.to_grid_config()?;
+    let api = settings.api_client()?;
+    let (snapshot, result) = reconcile_snapshot(&api, &config, &settings.subaccount).await?;
+    print_snapshot(&snapshot, &config);
+    println!("RECONCILE-ONLY — {}", result.summary());
+    for order in &result.missing {
+        println!(
+            "  MISSING {} {} @ {}",
+            order.side.as_str(),
+            format_decimal(order.size, 8),
+            format_decimal(order.price, 8)
+        );
+    }
+    for order in &result.unmanaged {
+        println!(
+            "  UNMANAGED {} {} @ {} (order {})",
+            order.side.as_str(),
+            format_decimal(order.remaining_size, 8),
+            format_decimal(order.price, 8),
+            order.order_id
+        );
+    }
+    if result.is_converged() {
+        println!("Grid and exchange snapshot converge; no changes were made.");
+    } else {
+        println!("No changes were made. Unmanaged orders are never cancelled automatically.");
+    }
+    Ok(())
+}
+
+/// Continuous shadow reconciliation: the same loop as `run -e` but never signs or submits.
+/// Every cycle fetches a snapshot, reconciles, journals events, and reports drift — without
+/// sending any Aptos transaction. Use this as a long-lived dry-run monitor that produces a
+/// complete audit trail.
+pub async fn shadow_cli(settings: Settings, max_cycles: Option<usize>) -> Result<()> {
+    validate_api_key_format(&settings.api_key).context("API key format check failed")?;
+    if settings.subaccount.trim().is_empty() {
+        anyhow::bail!("shadow requires SUBACCOUNT_ADDRESS")
+    }
+    if max_cycles == Some(0) {
+        anyhow::bail!("shadow --cycles must be at least 1")
+    }
+    let _subaccount_lock = SubaccountRunLock::acquire(&settings.network, &settings.subaccount)?;
+    let config = settings.to_grid_config()?;
+    let api = settings.api_client()?;
+    let run_id = journal::generate_run_id();
+    let journal = journal::Journal::new(&run_id)
+        .context("shadow reconciliation requires a writable run journal")?;
+    let mut metadata = journal::RunMetadata {
+        run_id: run_id.clone(),
+        started_at: Utc::now(),
+        network: settings.network.clone(),
+        subaccount: settings.subaccount.clone(),
+        market: config.market_name.clone(),
+        product: format!("{:?}", config.product).to_lowercase(),
+        config_hash: {
+            use sha3::{Digest, Sha3_256};
+            hex::encode(Sha3_256::digest(format!("{config:?}")))
+        },
+        program_version: env!("CARGO_PKG_VERSION").to_owned(),
+    };
+    metadata.fingerprint_subaccount();
+    let _ = journal.append(&journal::JournalEvent::RunStart(metadata));
+    println!("Shadow reconciliation run {run_id}. No orders will be placed or cancelled.");
+    if config.product == Product::Spot {
+        println!("Spot: only PFS balances will be used. No automatic Cross→PFS transfer.");
+    }
+    let mut remaining_cycles = max_cycles.unwrap_or(usize::MAX);
+    loop {
+        let cycle_start = tokio::time::Instant::now();
+        let snapshot = match fetch_snapshot(&api, &config, optional_subaccount(&settings)).await {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("shadow refresh failed: {e:#}");
+                tokio::time::sleep(config.refresh).await;
+                continue;
+            }
+        };
+        let mut snapshot = snapshot;
+        // Preserve the fixed Spot geometry across refreshes; only clear historical fill markers.
+        snapshot.plan = snapshot.plan.executable();
+        if let Some(adjustment) = fit_spot_snapshot_to_pfs(&mut snapshot)? {
+            println!("Spot funding check: {adjustment}");
+        }
+        print_snapshot(&snapshot, &config);
+        let event = journal::JournalEvent::PlanGenerated {
+            at: Utc::now(),
+            mid: snapshot.plan.mid.normalize().to_string(),
+            bid_levels: snapshot.plan.bids.len(),
+            ask_levels: snapshot.plan.asks.len(),
+            quote_required: snapshot.plan.quote_required.normalize().to_string(),
+            base_required: snapshot.plan.base_required.normalize().to_string(),
+        };
+        journal.append(&event)?;
+        if let Ok(actual) = api
+            .open_orders(&settings.subaccount, &snapshot.market)
+            .await
+        {
+            let desired = decibel_grid_tui::reconcile::desired_orders(
+                &snapshot.plan,
+                snapshot.market.tick_size,
+                snapshot.market.lot_size,
+            );
+            let result = decibel_grid_tui::reconcile::reconcile(
+                &desired,
+                &actual,
+                snapshot.market.tick_size,
+                snapshot.market.lot_size,
+            );
+            println!("SHADOW RECONCILE — {}", result.summary());
+            let event = journal::JournalEvent::ReconciliationResult {
+                at: Utc::now(),
+                matched: result.matched.len(),
+                missing: result.missing.len(),
+                unmanaged: result.unmanaged.clone(),
+                is_converged: result.is_converged(),
+            };
+            journal.append(&event)?;
+            let blocking = decibel_grid_tui::reconcile::blocking_orders(&result.unmanaged);
+            if !blocking.is_empty() {
+                println!(
+                    "  {} standalone order(s) of unprovable ownership detected. Bulk replacement would be blocked until operator review.",
+                    blocking.len()
+                );
+            } else if !result.unmanaged.is_empty() {
+                println!(
+                    "  {} unmanaged level(s) belong to this account's bulk ladder; a new bulk submission would replace them atomically.",
+                    result.unmanaged.len()
+                );
+            }
+            remaining_cycles = remaining_cycles.saturating_sub(1);
+            if remaining_cycles == 0 {
+                journal.append(&journal::JournalEvent::Shutdown {
+                    at: Utc::now(),
+                    reason: "requested shadow cycle limit reached".to_owned(),
+                })?;
+                println!("Shadow cycle limit reached. No orders were placed or cancelled.");
+                return Ok(());
+            }
+        }
+        let elapsed = cycle_start.elapsed();
+        let wait = config.refresh.saturating_sub(elapsed);
+        tokio::time::sleep(wait).await;
+    }
+}
+
+pub async fn journal_cli(settings: Settings, cmd: crate::cli::settings::JournalCmd) -> Result<()> {
+    match cmd {
+        crate::cli::settings::JournalCmd::Status => {
+            let api = settings.api_client()?;
+            let config = settings.to_grid_config()?;
+            let run_id = journal::persistent_run_id(
+                &settings.network,
+                &settings.subaccount,
+                &config.market_name,
+            );
+            let journal =
+                journal::Journal::new(&run_id).context("open run journal for diagnostics")?;
+            let state = journal.load_state()?.unwrap_or_default();
+
+            println!("=== Journal Status ===");
+            println!("  run_id:       {run_id}");
+            println!("  network:      {}", state.metadata.network);
+            println!("  subaccount:   {}", state.metadata.subaccount);
+            println!("  market:       {}", state.metadata.market);
+            println!("  product:      {}", state.metadata.product);
+            println!("  config_hash:  {}", state.metadata.config_hash);
+            println!("  program_ver:  {}", state.metadata.program_version);
+            println!("  started_at:   {}", state.metadata.started_at);
+            println!("  plan_gen:     {}", state.plan_generation);
+            println!("  orders_sub:   {}", state.submitted_orders);
+            println!("  orders_fail:  {}", state.failed_orders);
+            println!("  last_event:   {:?}", state.last_event_at);
+
+            if let Some(ladder) = &state.bulk_ladder {
+                println!();
+                println!("=== Bulk Ladder ===");
+                println!("  operation_id: {}", ladder.operation_id);
+                println!("  state:        {:?}", ladder.state);
+                println!("  sequence:     {}", ladder.sequence);
+                println!("  prior_seq:    {:?}", ladder.prior_sequence);
+                println!("  intent_at:    {}", ladder.intent_at);
+                println!("  tx_hash:      {:?}", ladder.transaction_hash);
+                println!("  levels:       {}", ladder.levels.len());
+                println!(
+                    "  filled_bids:  {}",
+                    ladder
+                        .levels
+                        .iter()
+                        .filter(|l| l.side == Side::Bid)
+                        .map(|l| l.filled_size)
+                        .sum::<Decimal>()
+                );
+                println!(
+                    "  filled_asks:  {}",
+                    ladder
+                        .levels
+                        .iter()
+                        .filter(|l| l.side == Side::Ask)
+                        .map(|l| l.filled_size)
+                        .sum::<Decimal>()
+                );
+                println!("  cancel_tx:    {:?}", ladder.cancel_transaction_hash);
+            } else {
+                println!("\n=== Bulk Ladder ===");
+                println!("  (none)");
+            }
+
+            if let Some(perp) = &state.perp_runtime {
+                println!();
+                println!("=== Perp Runtime ===");
+                println!("  bootstrap_status:    {:?}", perp.bootstrap_status);
+                println!(
+                    "  bootstrap_target:    {:?}",
+                    perp.bootstrap_target_position
+                );
+                println!("  pinned_plan:         {:?}", perp.pinned_plan.is_some());
+                println!("  acct_position_base:  {}", perp.accounting.position_base);
+                println!(
+                    "  acct_realized_pnl:   {}",
+                    perp.accounting.realized_gross_quote
+                );
+                println!(
+                    "  acct_fees_quote:     {:?}",
+                    perp.accounting.trade_fees_quote
+                );
+                println!(
+                    "  acct_funding_recv:  {}",
+                    perp.accounting.funding_received_quote
+                );
+                println!(
+                    "  acct_funding_paid:  {}",
+                    perp.accounting.funding_paid_quote
+                );
+                println!("  acct_fills:          {:?}", perp.accounting.fills_count());
+                println!("  fees_complete:       {}", perp.accounting.fees_complete);
+                println!(
+                    "  funding_complete:    {}",
+                    perp.accounting.funding_complete
+                );
+                println!("  last_fill_at:        {:?}", perp.accounting.last_fill_at);
+                println!(
+                    "  last_funding_at:     {:?}",
+                    perp.accounting.last_funding_at
+                );
+            }
+
+            // Read current REST state for comparison.
+            let market = api.market(&config.market_name, config.product).await?;
+            match api.active_bulk_ladder(&settings.subaccount, &market).await {
+                Ok(Some(active)) => {
+                    println!();
+                    println!("=== REST Active Bulk Ladder ===");
+                    println!("  sequence:  {}", active.sequence);
+                    println!("  levels:    {}", active.levels.len());
+                    let matches = state.bulk_ladder.as_ref().is_some_and(|expected| {
+                        expected.sequence == active.sequence && expected.levels == active.levels
+                    });
+                    println!("  matches_journal: {matches}");
+                }
+                Ok(None) => println!("\n=== REST Active Bulk Ladder: (none)"),
+                Err(e) => println!("\n=== REST Active Bulk Ladder: fetch failed: {e:#}"),
+            }
+
+            Ok(())
+        }
+        crate::cli::settings::JournalCmd::ResolveDivergence {
+            operation_id,
+            confirm_operation,
+        } => {
+            if confirm_operation.as_deref() != Some(&operation_id) {
+                anyhow::bail!(
+                    "resolve-divergence requires --confirm-operation <operation-id> matching the diverged operation\n  operation-id: {operation_id}"
+                );
+            }
+            let api = settings.api_client()?;
+            let config = settings.to_grid_config()?;
+            let run_id = journal::persistent_run_id(
+                &settings.network,
+                &settings.subaccount,
+                &config.market_name,
+            );
+            let journal =
+                journal::Journal::new(&run_id).context("open run journal for recovery")?;
+            let mut state = journal
+                .load_state()?
+                .ok_or_else(|| anyhow::anyhow!("no journal state found for run {run_id}"))?;
+
+            let ladder = state
+                .bulk_ladder
+                .as_ref()
+                .filter(|l| l.operation_id == operation_id)
+                .ok_or_else(|| {
+                    anyhow::anyhow!("operation {operation_id} not found in journal state")
+                })?
+                .clone();
+
+            let market = api.market(&config.market_name, config.product).await?;
+            match api
+                .active_bulk_ladder(&settings.subaccount, &market)
+                .await?
+            {
+                Some(active) if active.matches(&ladder) => {
+                    let observed = journal::JournalEvent::BulkVenueObserved {
+                        at: Utc::now(),
+                        operation_id: ladder.operation_id.clone(),
+                    };
+                    journal.append(&observed)?;
+                    state.apply(&observed);
+                    journal.save_state(&state)?;
+                    println!(
+                        "Recovery complete: operation {operation_id} verified on venue and marked VenueObserved."
+                    );
+                    println!("Next cycle will proceed with normal replacement.");
+                }
+                Some(active) if active.sequence == ladder.sequence => {
+                    // Same sequence but levels differ — likely fills or REST compaction.
+                    // Adopt the REST levels as the current active ladder state.
+                    println!(
+                        "Venue has sequence {} with {} level(s) (journal had {}). Adopting observed levels.",
+                        active.sequence,
+                        active.levels.len(),
+                        ladder.levels.len(),
+                    );
+                    // Record the venue observation.
+                    let observed = journal::JournalEvent::BulkVenueObserved {
+                        at: Utc::now(),
+                        operation_id: ladder.operation_id.clone(),
+                    };
+                    journal.append(&observed)?;
+                    state.apply(&observed);
+                    // Update journal levels to match REST.
+                    if let Some(bulk) = state.bulk_ladder.as_mut()
+                        && bulk.operation_id == ladder.operation_id
+                    {
+                        bulk.levels = active.levels.clone();
+                    }
+                    journal.save_state(&state)?;
+                    println!(
+                        "Journal levels updated to match venue ({}/{}).",
+                        active.levels.len(),
+                        active.levels.len()
+                    );
+                    println!("Next cycle will proceed with normal replacement.");
+                }
+                Some(active) => {
+                    // Different sequence — the ladder belongs to another operation.
+                    println!(
+                        "Recovery blocked: venue has sequence {} (journal expects {}), {} level(s).",
+                        active.sequence,
+                        ladder.sequence,
+                        active.levels.len()
+                    );
+                    println!("  The ladder belongs to a different operation.");
+                }
+                None => {
+                    println!(
+                        "Recovery blocked: no active bulk ladder found on venue for this market."
+                    );
+                    println!(
+                        "  The operation's ladder may have been cancelled or never committed."
+                    );
+                    println!(
+                        "  Use `journal abandon-bulk-intent` (not yet implemented) to clear the journal state."
+                    );
+                }
+            }
+            Ok(())
+        }
+    }
+}
+
+pub async fn perp_cli(settings: Settings, cmd: crate::cli::settings::PerpCmd) -> Result<()> {
+    match cmd {
+        crate::cli::settings::PerpCmd::BootstrapInspect => {
+            let api = settings.api_client()?;
+            let config = settings.to_grid_config()?;
+            let run_id = journal::persistent_run_id(
+                &settings.network,
+                &settings.subaccount,
+                &config.market_name,
+            );
+            let journal = journal::Journal::new(&run_id).ok();
+            let state = journal
+                .as_ref()
+                .and_then(|j| j.load_state().ok())
+                .flatten()
+                .unwrap_or_default();
+
+            let market = api.market(&config.market_name, config.product).await?;
+            let snapshot = fetch_snapshot(
+                &api,
+                &config,
+                (!settings.subaccount.trim().is_empty()).then_some(settings.subaccount.as_str()),
+            )
+            .await?;
+
+            println!("=== Perp Bootstrap Inspect ===");
+            println!("  run_id:             {run_id}");
+            println!("  market:             {}", market.name);
+            if let Some(perp) = &state.perp_runtime {
+                println!("  bootstrap_status:   {:?}", perp.bootstrap_status);
+                println!("  bootstrap_target:   {:?}", perp.bootstrap_target_position);
+                println!("  position_size:      {}", snapshot.account.position.size);
+                if let Some(target) = perp.bootstrap_target_position {
+                    let delta = target - snapshot.account.position.size;
+                    println!("  convergence_delta:  {delta}");
+                }
+                println!(
+                    "  available_margin:   {:?}",
+                    snapshot.account.available_margin
+                );
+                if let Some(margin) = snapshot.plan.estimated_margin {
+                    println!("  estimated_margin:   {margin}");
+                }
+                println!(
+                    "  realized_pnl:       {}",
+                    perp.accounting.realized_gross_quote
+                );
+                println!(
+                    "  fees_quote:         {:?}",
+                    perp.accounting.trade_fees_quote
+                );
+                println!(
+                    "  funding_recv:       {}",
+                    perp.accounting.funding_received_quote
+                );
+                println!(
+                    "  funding_paid:       {}",
+                    perp.accounting.funding_paid_quote
+                );
+                println!("  filled_trades:      {}", perp.accounting.fills_count());
+                println!("  fees_complete:      {}", perp.accounting.fees_complete);
+                println!("  funding_complete:   {}", perp.accounting.funding_complete);
+                println!("  last_fill_at:       {:?}", perp.accounting.last_fill_at);
+                println!(
+                    "  last_funding_at:    {:?}",
+                    perp.accounting.last_funding_at
+                );
+            } else {
+                println!("  (no Perp runtime state in journal)");
+            }
+            println!();
+            println!("  mid_price:          {}", snapshot.plan.mid);
+            println!(
+                "  out_of_range:       {}",
+                snapshot.plan.paused_by_out_of_range
+            );
+            println!(
+                "  range_action:       {:?}",
+                snapshot.plan.out_of_range_action_applied
+            );
+            Ok(())
+        }
+        crate::cli::settings::PerpCmd::BootstrapClearBlocked { confirm_clear } => {
+            if !confirm_clear {
+                anyhow::bail!("bootstrap-clear-blocked requires --confirm-clear to proceed");
+            }
+            let api = settings.api_client()?;
+            let config = settings.to_grid_config()?;
+            let run_id = journal::persistent_run_id(
+                &settings.network,
+                &settings.subaccount,
+                &config.market_name,
+            );
+            let journal =
+                journal::Journal::new(&run_id).context("open run journal for bootstrap reset")?;
+            let mut state = journal
+                .load_state()?
+                .ok_or_else(|| anyhow::anyhow!("no journal state found for run {run_id}"))?;
+
+            let market = api.market(&config.market_name, config.product).await?;
+            let snapshot = fetch_snapshot(
+                &api,
+                &config,
+                (!settings.subaccount.trim().is_empty()).then_some(settings.subaccount.as_str()),
+            )
+            .await?;
+
+            // Safety checks before clearing blocked state.
+            if !snapshot.account.position.size.is_zero() {
+                anyhow::bail!(
+                    "refusing to clear bootstrap-blocked: exchange position is {} (must be flat)",
+                    snapshot.account.position.size
+                );
+            }
+            if api
+                .active_bulk_ladder(&settings.subaccount, &market)
+                .await?
+                .is_some()
+            {
+                anyhow::bail!(
+                    "refusing to clear bootstrap-blocked: active bulk ladder exists on venue"
+                );
+            }
+
+            let perp = state
+                .perp_runtime
+                .as_mut()
+                .ok_or_else(|| anyhow::anyhow!("no Perp runtime state in journal"))?;
+            if perp.bootstrap_status != decibel_grid_tui::journal::PerpBootstrapStatus::Blocked {
+                anyhow::bail!(
+                    "bootstrap status is {:?}, not Blocked; nothing to clear",
+                    perp.bootstrap_status
+                );
+            }
+            perp.bootstrap_status = decibel_grid_tui::journal::PerpBootstrapStatus::Pending;
+            perp.bootstrap_target_position = None;
+            journal.save_state(&state)?;
+            let cleared = journal::JournalEvent::RiskRejected {
+                at: Utc::now(),
+                reason: "operator cleared bootstrap-blocked status via CLI".to_owned(),
+            };
+            journal.append(&cleared)?;
+            println!("Bootstrap status reset to Pending. Run `perp bootstrap-inspect` to verify.");
+            println!("Next engine start will attempt bootstrap convergence again.");
+            Ok(())
+        }
+    }
+}

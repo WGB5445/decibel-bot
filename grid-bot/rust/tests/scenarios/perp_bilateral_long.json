@@ -1,0 +1,30 @@
+{
+  "name": "perp_bilateral_long",
+  "product": "perp",
+  "config": {
+    "total_count": 4,
+    "perp_mode": "long",
+    "range": { "kind": "bounds", "lower": "90", "upper": "110" },
+    "allocation": { "kind": "fixed_size", "value": "0.01" },
+    "maker_fee_rate": "0.0001",
+    "preview_leverage": "1"
+  },
+  "market": {
+    "name": "BTC/USD",
+    "tick_size": "1",
+    "lot_size": "0.01",
+    "min_size": "0.01",
+    "px_decimals": 0,
+    "sz_decimals": 2
+  },
+  "steps": [
+    {
+      "mid": "100",
+      "expect": {
+        "bid_count": 2,
+        "ask_count": 2,
+        "perp_blocked": true
+      }
+    }
+  ]
+}

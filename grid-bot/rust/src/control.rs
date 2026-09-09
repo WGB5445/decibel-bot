@@ -1,0 +1,768 @@
+//! Local control plane for one running grid engine.
+//!
+//! The protocol intentionally stays small: one newline-delimited JSON request and response. It
+//! never carries credentials or signed transaction data.
+//!
+//! Transport is a Unix-domain socket on Unix and a local named pipe on Windows. PID/log files live
+//! next to that endpoint (`/tmp/grid-bot` or `%TEMP%\grid-bot`).
+
+use std::{
+    fs,
+    path::{Path, PathBuf},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::Duration,
+};
+
+use anyhow::{Context, Result, anyhow, bail};
+use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
+use tokio::sync::{RwLock, broadcast, mpsc};
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExitMode {
+    Hold,
+    Liquidate,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(tag = "command", rename_all = "snake_case")]
+pub enum Request {
+    Ping,
+    Status,
+    /// Keep this connection open: send one snapshot, then broadcast state changes.
+    Subscribe,
+    Stop {
+        exit_mode: ExitMode,
+    },
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum Response {
+    Pong,
+    Status { status: Box<EngineStatus> },
+    Update { status: Box<EngineStatus> },
+    Accepted { message: String },
+    Error { message: String },
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct LadderLevel {
+    pub side: String,
+    pub price: String,
+    pub size: String,
+    pub state: String,
+}
+
+/// Build attach/TUI ladder rows from the executable grid plan for this cycle.
+pub fn ladder_from_plan(plan: &crate::GridPlan) -> Vec<LadderLevel> {
+    plan.all_levels()
+        .map(|level| LadderLevel {
+            side: format!("{:?}", level.side),
+            price: level.price.to_string(),
+            size: level.size.to_string(),
+            state: format!("{:?}", level.state),
+        })
+        .collect()
+}
+
+/// Build rows from the latest exchange reconciliation. Matched desired levels are
+/// resting on the venue; missing levels remain planned. Unmanaged orders are
+/// appended so attach never hides orders that block a replacement.
+pub fn ladder_from_reconciliation(
+    desired: &[crate::reconcile::DesiredOrder],
+    reconciliation: &crate::reconcile::Reconciliation,
+) -> Vec<LadderLevel> {
+    let mut ladder = desired
+        .iter()
+        .map(|wanted| LadderLevel {
+            side: format!("{:?}", wanted.side),
+            price: wanted.price.to_string(),
+            size: wanted.size.to_string(),
+            state: if reconciliation
+                .matched
+                .iter()
+                .any(|matched| matched.desired == *wanted)
+            {
+                "Resting".to_owned()
+            } else {
+                "Planned".to_owned()
+            },
+        })
+        .collect::<Vec<_>>();
+    ladder.extend(reconciliation.unmanaged.iter().map(|order| LadderLevel {
+        side: format!("{:?}", order.side),
+        price: order.price.to_string(),
+        size: order.remaining_size.to_string(),
+        state: "Unmanaged".to_owned(),
+    }));
+    ladder
+}
+
+/// A successful bulk transaction atomically replaces the complete ladder, so
+/// every submitted level is already resting even before the indexer catches up.
+pub fn ladder_from_submitted_plan(plan: &crate::GridPlan) -> Vec<LadderLevel> {
+    plan.all_levels()
+        .map(|level| LadderLevel {
+            side: format!("{:?}", level.side),
+            price: level.price.to_string(),
+            size: level.size.to_string(),
+            state: "Resting".to_owned(),
+        })
+        .collect()
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct EngineEvent {
+    pub at: DateTime<Utc>,
+    pub message: String,
+}
+
+/// Live execution authority. Engine logic gates every submission and reconciliation path on this
+/// phase: a non-`Ready` phase means ws_state hydration, desync detection, or journal lifecycle
+/// recovery is still in progress and the bot must not compute execution plans or submit orders.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EnginePhase {
+    /// Engine loop started, market resolved, WS session spawned but subscription ACKs pending.
+    #[default]
+    Connecting,
+    /// All topics acknowledged, but initial account/order/bulk snapshots have not all arrived.
+    Hydrating,
+    /// All WS hydration complete, no desync, no pending lifecycle block. Execution permitted.
+    Ready,
+    /// WS data is stale or a reconnect generation has not completed hydration.
+    Stale,
+    /// WS state is desynced (sequence gap, diverged ladder). Operator recovery required.
+    Desynced,
+    /// A bulk lifecycle operation (intent recorded, broadcast pending, or committed awaiting
+    /// observation) is blocking new submissions until resolved through WS or REST recovery.
+    LifecycleBlocked,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct PerpPnlStatus {
+    pub exchange_position_base: String,
+    pub ledger_position_base: String,
+    pub reconciliation_delta_base: String,
+    pub average_entry_price: Option<String>,
+    pub mark_price: Option<String>,
+    pub unrealized_gross_quote: Option<String>,
+    pub realized_gross_quote: String,
+    pub trade_fees_quote: Option<String>,
+    pub funding_pnl_quote: Option<String>,
+    pub net_pnl_quote: Option<String>,
+    pub fees_complete: bool,
+    pub funding_complete: bool,
+    pub last_fill_at: Option<DateTime<Utc>>,
+    pub last_funding_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct EngineStatus {
+    pub pid: u32,
+    pub started_at: Option<DateTime<Utc>>,
+    pub network: String,
+    pub subaccount: String,
+    pub market: String,
+    pub product: String,
+    pub phase: String,
+    pub engine_phase: EnginePhase,
+    pub program_version: String,
+    pub last_cycle_at: Option<DateTime<Utc>>,
+    pub mid: Option<String>,
+    pub matched: Option<usize>,
+    pub missing: Option<usize>,
+    pub unmanaged: Option<usize>,
+    pub last_error: Option<String>,
+    pub pfs_base_symbol: Option<String>,
+    pub pfs_base_balance: Option<String>,
+    pub pfs_quote_symbol: Option<String>,
+    pub pfs_quote_balance: Option<String>,
+    pub realized_pnl: Option<String>,
+    pub perp_pnl: Option<PerpPnlStatus>,
+    pub perp_mode: Option<String>,
+    pub perp_bootstrap_status: Option<String>,
+    pub max_position: Option<String>,
+    pub position: Option<String>,
+    pub available_margin: Option<String>,
+    pub estimated_margin: Option<String>,
+    pub planning_price: Option<String>,
+    pub target_position: Option<String>,
+    pub convergence_delta: Option<String>,
+    pub worst_long: Option<String>,
+    pub worst_short: Option<String>,
+    pub perp_blocked_reason: Option<String>,
+    pub out_of_range_action: Option<String>,
+    pub paused_by_out_of_range: bool,
+    /// Absolute path of this engine process's stdout/stderr log file, when logging is enabled.
+    pub log_path: Option<String>,
+    pub ladder: Vec<LadderLevel>,
+    pub events: Vec<EngineEvent>,
+}
+
+#[derive(Clone)]
+pub struct EngineHandle {
+    cancel: Arc<AtomicBool>,
+    stop_mode: Arc<Mutex<Option<ExitMode>>>,
+    status: Arc<RwLock<EngineStatus>>,
+    updates: broadcast::Sender<EngineStatus>,
+}
+
+impl EngineHandle {
+    pub fn new(status: EngineStatus) -> Self {
+        let (updates, _) = broadcast::channel(256);
+        Self {
+            cancel: Arc::new(AtomicBool::new(false)),
+            stop_mode: Arc::new(Mutex::new(None)),
+            status: Arc::new(RwLock::new(status)),
+            updates,
+        }
+    }
+
+    pub fn cancel(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.cancel)
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.cancel.load(Ordering::Relaxed)
+    }
+
+    pub fn request_stop(&self, exit_mode: ExitMode) {
+        *self.stop_mode.lock().expect("stop mode mutex poisoned") = Some(exit_mode);
+        self.cancel.store(true, Ordering::Relaxed);
+    }
+
+    pub fn requested_exit_mode(&self) -> Option<ExitMode> {
+        *self.stop_mode.lock().expect("stop mode mutex poisoned")
+    }
+
+    pub async fn status(&self) -> EngineStatus {
+        self.status.read().await.clone()
+    }
+
+    pub async fn update_status(&self, update: impl FnOnce(&mut EngineStatus)) {
+        let mut status = self.status.write().await;
+        update(&mut status);
+        // A slow or disconnected subscriber may miss intermediate updates; it receives the
+        // latest complete status on the next broadcast or reconnect snapshot.
+        let _ = self.updates.send(status.clone());
+    }
+
+    fn subscribe(&self) -> broadcast::Receiver<EngineStatus> {
+        self.updates.subscribe()
+    }
+}
+
+fn control_directory() -> PathBuf {
+    #[cfg(unix)]
+    {
+        PathBuf::from("/tmp/grid-bot")
+    }
+    #[cfg(not(unix))]
+    {
+        std::env::temp_dir().join("grid-bot")
+    }
+}
+
+fn control_endpoint(directory: &Path, account: &str) -> PathBuf {
+    #[cfg(windows)]
+    {
+        let _ = directory;
+        PathBuf::from(format!(r"\\.\pipe\grid-bot-{account}"))
+    }
+    #[cfg(not(windows))]
+    {
+        directory.join(format!("{account}.sock"))
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct ControlPaths {
+    pub directory: PathBuf,
+    pub socket: PathBuf,
+    pub pid: PathBuf,
+    pub log: PathBuf,
+}
+
+impl ControlPaths {
+    /// Socket names deliberately key only on the normalized subaccount, as requested: one
+    /// account must never have two engines independently issuing bulk sequence numbers.
+    pub fn for_subaccount(subaccount: &str) -> Result<Self> {
+        let account = subaccount
+            .trim()
+            .trim_start_matches("0x")
+            .trim_start_matches('0')
+            .to_ascii_lowercase();
+        if account.is_empty() || !account.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            bail!("SUBACCOUNT_ADDRESS must be a non-empty hexadecimal Aptos address")
+        }
+        let directory = control_directory();
+        Ok(Self {
+            socket: control_endpoint(&directory, &account),
+            pid: directory.join(format!("{account}.pid")),
+            log: directory.join(format!("{account}.log")),
+            directory,
+        })
+    }
+
+    pub fn ensure_directory(&self) -> Result<()> {
+        fs::create_dir_all(&self.directory)
+            .with_context(|| format!("create control directory {}", self.directory.display()))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&self.directory, fs::Permissions::from_mode(0o700)).with_context(
+                || format!("protect control directory {}", self.directory.display()),
+            )?;
+        }
+        Ok(())
+    }
+
+    pub fn read_pid(&self) -> Result<Option<u32>> {
+        match fs::read_to_string(&self.pid) {
+            Ok(raw) => Ok(Some(raw.trim().parse().with_context(|| {
+                format!("invalid engine pid file {}", self.pid.display())
+            })?)),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => {
+                Err(error).with_context(|| format!("read pid file {}", self.pid.display()))
+            }
+        }
+    }
+
+    pub fn remove_runtime_files(&self) {
+        // Named pipes are not filesystem objects; only the Unix socket path should be unlinked.
+        #[cfg(not(windows))]
+        let _ = fs::remove_file(&self.socket);
+        let _ = fs::remove_file(&self.pid);
+    }
+
+    pub fn write_pid(&self, pid: u32) -> Result<()> {
+        self.ensure_directory()?;
+        fs::write(&self.pid, format!("{pid}\n"))
+            .with_context(|| format!("write pid file {}", self.pid.display()))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&self.pid, fs::Permissions::from_mode(0o600))
+                .with_context(|| format!("protect pid file {}", self.pid.display()))?;
+        }
+        Ok(())
+    }
+}
+
+mod protocol {
+    use super::*;
+    use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
+
+    const MAX_LINE_BYTES: usize = 16 * 1024;
+
+    pub async fn handle_client<R, W>(reader: R, mut writer: W, handle: EngineHandle) -> Result<()>
+    where
+        R: AsyncRead + Unpin,
+        W: AsyncWrite + Unpin,
+    {
+        let mut reader = BufReader::new(reader);
+        let mut line = String::new();
+        let bytes = reader
+            .read_line(&mut line)
+            .await
+            .context("read control request")?;
+        if bytes > 0
+            && matches!(
+                serde_json::from_str(line.trim_end()),
+                Ok(Request::Subscribe)
+            )
+        {
+            return stream_updates(writer, handle).await;
+        }
+        let response = if bytes == 0 {
+            Response::Error {
+                message: "empty control request".to_owned(),
+            }
+        } else if bytes > MAX_LINE_BYTES {
+            Response::Error {
+                message: "control request exceeds 16 KiB".to_owned(),
+            }
+        } else {
+            match serde_json::from_str::<Request>(line.trim_end()) {
+                Ok(Request::Ping) => Response::Pong,
+                Ok(Request::Status) => Response::Status {
+                    status: Box::new(handle.status().await),
+                },
+                Ok(Request::Subscribe) => Response::Error {
+                    message: "subscribe request was not upgraded".to_owned(),
+                },
+                Ok(Request::Stop { exit_mode }) => {
+                    handle.request_stop(exit_mode);
+                    Response::Accepted {
+                        message: "graceful shutdown requested".to_owned(),
+                    }
+                }
+                Err(error) => Response::Error {
+                    message: format!("invalid control request: {error}"),
+                },
+            }
+        };
+        write_line(&mut writer, &response)
+            .await
+            .context("write control response")?;
+        writer.shutdown().await.context("close control response")?;
+        Ok(())
+    }
+
+    async fn stream_updates<W>(mut writer: W, handle: EngineHandle) -> Result<()>
+    where
+        W: AsyncWrite + Unpin,
+    {
+        let mut updates = handle.subscribe();
+        write_line(
+            &mut writer,
+            &Response::Status {
+                status: Box::new(handle.status().await),
+            },
+        )
+        .await?;
+        loop {
+            match updates.recv().await {
+                Ok(status) => {
+                    write_line(
+                        &mut writer,
+                        &Response::Update {
+                            status: Box::new(status),
+                        },
+                    )
+                    .await?
+                }
+                Err(broadcast::error::RecvError::Lagged(_)) => {
+                    write_line(
+                        &mut writer,
+                        &Response::Update {
+                            status: Box::new(handle.status().await),
+                        },
+                    )
+                    .await?;
+                }
+                Err(broadcast::error::RecvError::Closed) => break,
+            }
+        }
+        Ok(())
+    }
+
+    async fn write_line<W>(writer: &mut W, response: &Response) -> Result<()>
+    where
+        W: AsyncWrite + Unpin,
+    {
+        writer
+            .write_all(format!("{}\n", serde_json::to_string(response)?).as_bytes())
+            .await
+            .context("write status update")?;
+        writer.flush().await.context("flush status update")?;
+        Ok(())
+    }
+
+    pub async fn exchange_oneshot<R, W>(
+        mut writer: W,
+        reader: R,
+        request: &Request,
+    ) -> Result<Response>
+    where
+        R: AsyncRead + Unpin,
+        W: AsyncWrite + Unpin,
+    {
+        writer
+            .write_all(format!("{}\n", serde_json::to_string(request)?).as_bytes())
+            .await
+            .context("write control request")?;
+        writer.shutdown().await.context("close control request")?;
+        let mut reader = BufReader::new(reader);
+        let mut line = String::new();
+        let bytes = reader
+            .read_line(&mut line)
+            .await
+            .context("read control response")?;
+        if bytes == 0 || bytes > MAX_LINE_BYTES {
+            bail!("engine returned an empty or oversized control response")
+        }
+        serde_json::from_str(line.trim_end()).context("decode control response")
+    }
+
+    pub async fn spawn_subscribe_stream<R, W>(
+        mut writer: W,
+        reader: R,
+    ) -> Result<mpsc::Receiver<Result<EngineStatus>>>
+    where
+        R: AsyncRead + Unpin + Send + 'static,
+        W: AsyncWrite + Unpin + Send + 'static,
+    {
+        writer
+            .write_all(format!("{}\n", serde_json::to_string(&Request::Subscribe)?).as_bytes())
+            .await
+            .context("write subscribe request")?;
+        writer.flush().await.context("flush subscribe request")?;
+        let (sender, receiver) = mpsc::channel(16);
+        tokio::spawn(async move {
+            let _writer = writer;
+            let mut reader = BufReader::new(reader);
+            loop {
+                let mut line = String::new();
+                match reader.read_line(&mut line).await {
+                    Ok(0) => break,
+                    Ok(_) => match serde_json::from_str::<Response>(line.trim_end()) {
+                        Ok(Response::Status { status } | Response::Update { status }) => {
+                            if sender.send(Ok(*status)).await.is_err() {
+                                break;
+                            }
+                        }
+                        Ok(Response::Error { message }) => {
+                            let _ = sender.send(Err(anyhow::anyhow!(message))).await;
+                            break;
+                        }
+                        Ok(_) => {}
+                        Err(error) => {
+                            let _ = sender.send(Err(anyhow::Error::from(error))).await;
+                            break;
+                        }
+                    },
+                    Err(error) => {
+                        let _ = sender.send(Err(anyhow::Error::from(error))).await;
+                        break;
+                    }
+                }
+            }
+        });
+        Ok(receiver)
+    }
+}
+
+#[cfg(unix)]
+mod unix {
+    use super::*;
+    use tokio::{
+        net::{UnixListener, UnixStream},
+        task::JoinHandle,
+    };
+
+    pub async fn start_server(
+        paths: &ControlPaths,
+        handle: EngineHandle,
+    ) -> Result<JoinHandle<Result<()>>> {
+        paths.ensure_directory()?;
+        let _ = fs::remove_file(&paths.socket);
+        let listener = UnixListener::bind(&paths.socket)
+            .with_context(|| format!("bind control socket {}", paths.socket.display()))?;
+        let socket = paths.socket.clone();
+        Ok(tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    accepted = listener.accept() => {
+                        let (stream, _) = accepted.context("accept control socket client")?;
+                        let client_handle = handle.clone();
+                        tokio::spawn(async move {
+                            let (reader, writer) = stream.into_split();
+                            if let Err(error) = protocol::handle_client(reader, writer, client_handle).await {
+                                eprintln!("control socket client failed: {error:#}");
+                            }
+                        });
+                    }
+                    _ = tokio::time::sleep(Duration::from_millis(200)) => {
+                        if handle.is_cancelled() {
+                            break;
+                        }
+                    }
+                }
+            }
+            let _ = fs::remove_file(&socket);
+            Ok(())
+        }))
+    }
+
+    pub async fn request(paths: &ControlPaths, request: &Request) -> Result<Response> {
+        let stream = UnixStream::connect(&paths.socket)
+            .await
+            .with_context(|| format!("connect to grid engine at {}", paths.socket.display()))?;
+        let (reader, writer) = stream.into_split();
+        protocol::exchange_oneshot(writer, reader, request).await
+    }
+
+    pub async fn subscribe(paths: &ControlPaths) -> Result<mpsc::Receiver<Result<EngineStatus>>> {
+        let stream = UnixStream::connect(&paths.socket)
+            .await
+            .with_context(|| format!("connect to grid engine at {}", paths.socket.display()))?;
+        let (reader, writer) = stream.into_split();
+        protocol::spawn_subscribe_stream(writer, reader).await
+    }
+}
+
+#[cfg(windows)]
+mod windows {
+    use super::*;
+    use tokio::{
+        io::split,
+        net::windows::named_pipe::{ClientOptions, NamedPipeClient, ServerOptions},
+        task::JoinHandle,
+    };
+
+    const ERROR_PIPE_BUSY: i32 = 231;
+
+    pub async fn start_server(
+        paths: &ControlPaths,
+        handle: EngineHandle,
+    ) -> Result<JoinHandle<Result<()>>> {
+        paths.ensure_directory()?;
+        let pipe_name = paths.socket.clone();
+        let mut server = ServerOptions::new()
+            .first_pipe_instance(true)
+            .reject_remote_clients(true)
+            .create(&pipe_name)
+            .with_context(|| format!("bind control pipe {}", pipe_name.display()))?;
+        Ok(tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    connected = server.connect() => {
+                        connected.context("accept control pipe client")?;
+                        let client = server;
+                        server = ServerOptions::new()
+                            .reject_remote_clients(true)
+                            .create(&pipe_name)
+                            .context("create next control pipe instance")?;
+                        let client_handle = handle.clone();
+                        tokio::spawn(async move {
+                            let (reader, writer) = split(client);
+                            if let Err(error) = protocol::handle_client(reader, writer, client_handle).await {
+                                eprintln!("control pipe client failed: {error:#}");
+                            }
+                        });
+                    }
+                    _ = tokio::time::sleep(Duration::from_millis(200)) => {
+                        if handle.is_cancelled() {
+                            break;
+                        }
+                    }
+                }
+            }
+            Ok(())
+        }))
+    }
+
+    async fn connect(paths: &ControlPaths) -> Result<NamedPipeClient> {
+        let mut last_busy = None;
+        for _ in 0..50 {
+            match ClientOptions::new().open(&paths.socket) {
+                Ok(client) => return Ok(client),
+                Err(error) if error.raw_os_error() == Some(ERROR_PIPE_BUSY) => {
+                    last_busy = Some(error);
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+                Err(error) => {
+                    return Err(error).with_context(|| {
+                        format!("connect to grid engine at {}", paths.socket.display())
+                    });
+                }
+            }
+        }
+        Err(last_busy.expect("pipe busy retry exhausted without an error"))
+            .with_context(|| format!("connect to grid engine at {}", paths.socket.display()))
+    }
+
+    pub async fn request(paths: &ControlPaths, request: &Request) -> Result<Response> {
+        let stream = connect(paths).await?;
+        let (reader, writer) = split(stream);
+        protocol::exchange_oneshot(writer, reader, request).await
+    }
+
+    pub async fn subscribe(paths: &ControlPaths) -> Result<mpsc::Receiver<Result<EngineStatus>>> {
+        let stream = connect(paths).await?;
+        let (reader, writer) = split(stream);
+        protocol::spawn_subscribe_stream(writer, reader).await
+    }
+}
+
+#[cfg(unix)]
+pub use unix::{request, start_server, subscribe};
+
+#[cfg(windows)]
+pub use windows::{request, start_server, subscribe};
+
+#[cfg(not(any(unix, windows)))]
+pub async fn request(_paths: &ControlPaths, _request: &Request) -> Result<Response> {
+    Err(anyhow!(
+        "the local grid control plane requires Unix-domain sockets or Windows named pipes"
+    ))
+}
+
+#[cfg(not(any(unix, windows)))]
+pub async fn start_server(
+    _paths: &ControlPaths,
+    _handle: EngineHandle,
+) -> Result<tokio::task::JoinHandle<Result<()>>> {
+    Err(anyhow!(
+        "the local grid control plane requires Unix-domain sockets or Windows named pipes"
+    ))
+}
+
+#[cfg(not(any(unix, windows)))]
+pub async fn subscribe(_paths: &ControlPaths) -> Result<mpsc::Receiver<Result<EngineStatus>>> {
+    Err(anyhow!(
+        "the local grid control plane requires Unix-domain sockets or Windows named pipes"
+    ))
+}
+
+pub fn process_is_alive(pid: u32) -> bool {
+    #[cfg(unix)]
+    {
+        let result = unsafe { libc::kill(pid as i32, 0) };
+        result == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+    }
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::Foundation::{CloseHandle, ERROR_ACCESS_DENIED, GetLastError};
+        use windows_sys::Win32::System::Threading::{
+            GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+        };
+        const STILL_ACTIVE: u32 = 259;
+        unsafe {
+            let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+            if handle.is_null() {
+                return GetLastError() == ERROR_ACCESS_DENIED;
+            }
+            let mut code = 0u32;
+            let ok = GetExitCodeProcess(handle, &mut code);
+            CloseHandle(handle);
+            ok != 0 && code == STILL_ACTIVE
+        }
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = pid;
+        false
+    }
+}
+
+pub fn tail_lines(path: &Path, limit: usize) -> Result<String> {
+    match fs::read_to_string(path) {
+        Ok(content) => Ok(content
+            .lines()
+            .rev()
+            .take(limit)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect::<Vec<_>>()
+            .join("\n")),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            bail!("engine log {} does not exist", path.display())
+        }
+        Err(error) => {
+            Err(anyhow!(error)).with_context(|| format!("read engine log {}", path.display()))
+        }
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod tests;
