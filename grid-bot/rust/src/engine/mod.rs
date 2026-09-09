@@ -1967,6 +1967,66 @@ journal.append(&event)?;
                         } else {
                             last_perp_submission_block_reason = None;
                             last_bulk_lifecycle_blocked_operation = None;
+
+                            // ---- pre-submission race guard ----
+                            // A resting entry may have filled between risk evaluation and this
+                            // point. Re-read the account position and active ladder, then
+                            // rebuild and re-check worst-case exposure before signing.
+                            if snapshot.market.product == Product::Perp {
+                                match api
+                                    .account(Some(&settings.subaccount), &snapshot.market)
+                                    .await
+                                {
+                                    Ok(refreshed) => {
+                                        let latest_position = refreshed.position.size;
+                                        let latest_margin = refreshed.available_margin;
+                                        if (latest_position - snapshot.account.position.size).abs()
+                                            > snapshot.market.lot_size
+                                        {
+                                            println!(
+                                                "Pre-submit position changed: {} → {}. Rebuilding plan.",
+                                                snapshot.account.position.size, latest_position
+                                            );
+                                        }
+                                        snapshot.account = refreshed;
+                                        exec_plan = decibel_grid_tui::strategy::perp::runtime::finalize_perp_executable_plan(
+                                            &config,
+                                            exec_plan.clone(),
+                                            latest_position,
+                                            latest_margin,
+                                        )?;
+                                        // Re-check submission gates.
+                                        if let Some(reason) =
+                                            decibel_grid_tui::strategy::perp::runtime::perp_submission_blocked(
+                                                &config,
+                                                &exec_plan,
+                                                latest_position,
+                                                latest_margin,
+                                                snapshot.market.lot_size,
+                                                perp_runtime.bootstrap_status
+                                                    == journal::PerpBootstrapStatus::Pending,
+                                            )
+                                        {
+                                            eprintln!("PRE-SUBMIT BLOCKED: {reason}");
+                                            decibel_grid_tui::strategy::perp::runtime::record_perp_risk_rejection(
+                                                reason.clone(),
+                                                journal.as_ref(),
+                                                &mut run_state,
+                                            )?;
+                                            last_perp_submission_block_reason = Some(reason);
+                                            tokio::time::sleep(config.refresh).await;
+                                            continue;
+                                        }
+                                    }
+                                    Err(error) => {
+                                        eprintln!(
+                                            "PRE-SUBMIT account refresh failed: {error:#}; submitting with stale position {}",
+                                            snapshot.account.position.size
+                                        );
+                                    }
+                                }
+                            }
+
                             let observed = ws_state::active_bulk_ladder(&ws_state)?;
                             let sequence = ws_state::next_bulk_sequence(&ws_state)?;
                             let intent = bulk_ladder_intent(
