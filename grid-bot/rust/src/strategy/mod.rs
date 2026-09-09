@@ -61,5 +61,6 @@ pub fn resolve(config: &GridConfig) -> &'static dyn GridStrategy {
         (Product::Perp, PerpMode::Neutral) => &perp::neutral::STRATEGY,
         (Product::Perp, PerpMode::Long) => &perp::long::STRATEGY,
         (Product::Perp, PerpMode::Short) => &perp::short::STRATEGY,
+        (Product::Perp, PerpMode::Rotate) => &perp::rotate::STRATEGY,
     }
 }

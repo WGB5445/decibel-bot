@@ -4,8 +4,11 @@ pub mod long;
 pub mod neutral;
 pub mod planning;
 pub mod risk;
+pub mod rotate;
 pub mod runtime;
 pub mod short;
+
+pub use rotate::RotatingGridState;
 
 use super::StrategyContext;
 use crate::{GridConfig, GridPlan, Market, Result};

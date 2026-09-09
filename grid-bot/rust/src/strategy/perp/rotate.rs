@@ -2,6 +2,7 @@ use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 
 use crate::strategy::{GridStrategy, StrategyContext};
+use crate::strategy::perp::accounting::{FillSide, PerpFill};
 use crate::{GridConfig, GridLevel, GridPlan, LevelState, Market, PerpMode, Product, Result, Side};
 
 pub struct PerpRotateStrategy;
@@ -101,6 +102,22 @@ impl RotatingGridState {
         }
     }
 
+    /// Called when a fill arrives on `filled_side`. If the fill matches an exit order (i.e. the
+    /// exit price for some open lot), close that lot. Returns true if a lot was closed.
+    pub fn try_close_exit_fill(&mut self, filled_side: Side, price: Decimal) -> bool {
+        let before = self.open_lot_count(filled_side.opposite());
+        for lot in self.lots.iter_mut().rev() {
+            if lot.status == LotStatus::Open
+                && lot.entry_side == filled_side.opposite()
+                && lot.exit_price == price
+            {
+                lot.status = LotStatus::Closed;
+                return true;
+            }
+        }
+        before != self.open_lot_count(filled_side.opposite())
+    }
+
     pub fn derive_exit_price(&self, entry_side: Side, entry_price: Decimal, grid_size: Decimal) -> Decimal {
         let grid_step = self
             .pinned_ask_prices
@@ -170,6 +187,43 @@ impl RotatingGridState {
             .copied()
             .collect()
     }
+}
+
+/// Apply a PerpFill to the rotating state: entry fills create open lots, exit fills close them.
+pub fn apply_fill_to_rotating_state(
+    state: &mut RotatingGridState,
+    fill: &PerpFill,
+    grid_size: Decimal,
+) {
+    let fill_side = match fill.side {
+        FillSide::Buy => Side::Bid,
+        FillSide::Sell => Side::Ask,
+    };
+    if !state.try_close_exit_fill(fill_side, fill.price) {
+        state.record_fill(fill_side, fill.price, fill.quantity, grid_size);
+    }
+}
+
+/// Build a full ladder plan for Rotate mode: entry orders from the pinned grid, plus any open
+/// exit orders from filled lots. Entry levels that collide with exit prices are filtered out.
+pub fn build_rotate_ladder(
+    config: &GridConfig,
+    market: &Market,
+    planning_price: Decimal,
+    rotating_state: &RotatingGridState,
+) -> Result<GridPlan> {
+    let mut plan = super::planning::build_perp_plan(config, market, planning_price)?;
+    let exit_orders = rotating_state.derive_exit_orders();
+    let exit_prices: Vec<Decimal> = exit_orders.iter().map(|l| l.price).collect();
+    plan.bids.retain(|level| !exit_prices.contains(&level.price));
+    plan.asks.retain(|level| !exit_prices.contains(&level.price));
+    plan.bids
+        .extend(exit_orders.iter().filter(|l| l.side == Side::Bid).cloned());
+    plan.asks
+        .extend(exit_orders.iter().filter(|l| l.side == Side::Ask).cloned());
+    plan.bids.sort_by(|a, b| b.price.cmp(&a.price));
+    plan.asks.sort_by(|a, b| a.price.cmp(&b.price));
+    Ok(plan)
 }
 
 #[cfg(test)]

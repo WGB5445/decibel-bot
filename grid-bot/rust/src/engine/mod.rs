@@ -769,25 +769,34 @@ pub async fn run_cli(
                             &snapshot.market,
                             perp_accounting.history_cursor(),
                         )
-                        .await
-                    {
-                        Ok(fills) => {
-                            for fill in fills {
-                                if !perp_accounting.has_processed_fill(&fill.id) {
-                                    let event = journal::JournalEvent::PerpFillApplied {
-                                        at: Utc::now(),
-                                        fill: fill.clone(),
-                                    };
-                                    let journal = journal
-                                        .as_ref()
-                                        .expect("live Perp execution always has a durable journal");
-                                    journal.append(&event)?;
-                                    run_state.apply(&event);
-                                    perp_accounting.apply_fill(&fill)?;
-                                    journal.save_state(&run_state)?;
-                                }
-                            }
-                        }
+.await
+                         {
+                             Ok(fills) => {
+                                 for fill in fills {
+                                     if !perp_accounting.has_processed_fill(&fill.id) {
+                                         let event = journal::JournalEvent::PerpFillApplied {
+                                             at: Utc::now(),
+                                             fill: fill.clone(),
+                                         };
+                                         let journal = journal
+                                             .as_ref()
+                                             .expect("live Perp execution always has a durable journal");
+journal.append(&event)?;
+                             run_state.apply(&event);
+                             perp_accounting.apply_fill(&fill)?;
+                             if config.perp_mode == decibel_grid_tui::PerpMode::Rotate {
+                                 if let Some(ref mut rot_state) = perp_runtime.rotating_state {
+                                     decibel_grid_tui::strategy::perp::rotate::apply_fill_to_rotating_state(
+                                         rot_state,
+                                         &fill,
+                                         snapshot.market.lot_size,
+                                     );
+                                 }
+                             }
+                             journal.save_state(&run_state)?;
+                                     }
+                                 }
+                             }
                         Err(error) => {
                             perp_accounting_blocked = Some(format!(
                                 "Perp trade backfill after WS reconnect failed: {error:#}"
@@ -967,16 +976,55 @@ pub async fn run_cli(
                     if let Some(pinned) = &perp_runtime.pinned_plan {
                         snapshot.plan = pinned.clone();
                         snapshot.plan.raw_planning_price = fresh_plan.raw_planning_price;
-                    } else {
-                        perp_runtime.pinned_plan = Some(fresh_plan);
-                        perp_runtime.accounting = perp_accounting.clone();
-                        run_state.perp_runtime = Some(perp_runtime.clone());
-                        if let Some(journal) = &journal {
-                            journal.save_state(&run_state)?;
-                        }
-                    }
-                }
-                snapshot.plan =
+} else {
+                         perp_runtime.pinned_plan = Some(fresh_plan);
+                         perp_runtime.accounting = perp_accounting.clone();
+                         if config.perp_mode == decibel_grid_tui::PerpMode::Rotate
+                             && perp_runtime.rotating_state.is_none()
+                         {
+                             let bid_prices: Vec<_> = snapshot
+                                 .plan
+                                 .bids
+                                 .iter()
+                                 .map(|l| l.price)
+                                 .collect();
+                             let ask_prices: Vec<_> = snapshot
+                                 .plan
+                                 .asks
+                                 .iter()
+                                 .map(|l| l.price)
+                                 .collect();
+                             perp_runtime.rotating_state = Some(
+                                 decibel_grid_tui::strategy::perp::rotate::RotatingGridState::new_with_pinned_prices(
+                                     bid_prices, ask_prices,
+                                 ),
+                             );
+                         }
+                         run_state.perp_runtime = Some(perp_runtime.clone());
+                         if let Some(journal) = &journal {
+                             journal.save_state(&run_state)?;
+                         }
+}
+                 }
+                 if config.perp_mode == decibel_grid_tui::PerpMode::Rotate
+                     && let Some(ref rot_state) = perp_runtime.rotating_state
+                 {
+                     let planning_price = snapshot.plan.planning_price.unwrap_or(snapshot.plan.mid);
+                     match decibel_grid_tui::strategy::perp::rotate::build_rotate_ladder(
+                         &config,
+                         &snapshot.market,
+                         planning_price,
+                         rot_state,
+                     ) {
+                         Ok(rotate_plan) => {
+                             snapshot.plan = rotate_plan;
+                         }
+                         Err(error) => {
+                             eprintln!("Rotate ladder build failed: {error:#}; falling back to pinned plan");
+                         }
+                     }
+                 }
+                 snapshot.plan =
                     match decibel_grid_tui::strategy::perp::runtime::finalize_perp_executable_plan(
                         &config,
                         snapshot.plan.clone(),

@@ -811,9 +811,10 @@ impl App {
             }
             Field::PerpMode => {
                 self.settings.perp_mode = match (self.settings.perp_mode, direction >= 0) {
-                    (PerpMode::Neutral, true) | (PerpMode::Short, false) => PerpMode::Long,
+                    (PerpMode::Neutral, true) | (PerpMode::Rotate, false) => PerpMode::Long,
                     (PerpMode::Long, true) | (PerpMode::Neutral, false) => PerpMode::Short,
-                    _ => PerpMode::Neutral,
+                    (PerpMode::Short, true) | (PerpMode::Long, false) => PerpMode::Rotate,
+                    (PerpMode::Rotate, true) | (PerpMode::Short, false) => PerpMode::Neutral,
                 }
             }
             Field::OutOfRangeAction => {

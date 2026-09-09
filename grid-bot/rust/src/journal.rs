@@ -14,6 +14,7 @@ use crate::{
     GridPlan, Product, Side,
     reconcile::ActualOrder,
     strategy::perp::accounting::{PerpAccounting, PerpFill},
+    strategy::perp::rotate::RotatingGridState,
 };
 use rust_decimal::Decimal;
 
@@ -255,6 +256,9 @@ pub struct PerpRuntimeState {
     pub bootstrap_status: PerpBootstrapStatus,
     #[serde(default)]
     pub bootstrap_target_position: Option<Decimal>,
+    /// Strategy-specific state for rotating grid (fill→exit lifecycle tracking).
+    #[serde(default)]
+    pub rotating_state: Option<RotatingGridState>,
 }
 
 impl PerpRuntimeState {
@@ -264,6 +268,7 @@ impl PerpRuntimeState {
             pinned_plan: None,
             bootstrap_status: PerpBootstrapStatus::Pending,
             bootstrap_target_position: None,
+            rotating_state: None,
         }
     }
 
@@ -273,6 +278,7 @@ impl PerpRuntimeState {
             pinned_plan: None,
             bootstrap_status: PerpBootstrapStatus::LegacyUnknown,
             bootstrap_target_position: None,
+            rotating_state: None,
         }
     }
 

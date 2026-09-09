@@ -664,6 +664,7 @@ impl Settings {
             "long" => self.perp_mode = PerpMode::Long,
             "short" => self.perp_mode = PerpMode::Short,
             "neutral" => self.perp_mode = PerpMode::Neutral,
+            "rotate" => self.perp_mode = PerpMode::Rotate,
             _ => {}
         }
         match data.out_of_range_action.as_str() {

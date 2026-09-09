@@ -14,7 +14,7 @@ pub(crate) fn compute_perp_target(
     match mode {
         PerpMode::Long => Decimal::from(ask_levels) * grid_size,
         PerpMode::Short => -Decimal::from(bid_levels) * grid_size,
-        PerpMode::Neutral => {
+        PerpMode::Neutral | PerpMode::Rotate => {
             Decimal::from(ask_levels.saturating_sub(bid_levels)) * grid_size / Decimal::TWO
         }
     }
@@ -48,7 +48,7 @@ pub(crate) fn perp_theoretical_limits(
         // opposite endpoint is zero.
         PerpMode::Long => (Decimal::from(total) * grid_size, Decimal::ZERO),
         PerpMode::Short => (Decimal::ZERO, Decimal::from(total) * grid_size),
-        PerpMode::Neutral => {
+        PerpMode::Neutral | PerpMode::Rotate => {
             let max_side = Decimal::from(total) * grid_size / Decimal::TWO;
             (max_side, max_side)
         }
@@ -98,7 +98,7 @@ fn mode_constraints_hold(
     match mode {
         PerpMode::Long => worst_short >= Decimal::ZERO && worst_long <= max_long,
         PerpMode::Short => worst_long <= Decimal::ZERO && worst_short >= -max_short,
-        PerpMode::Neutral => worst_long <= max_long && worst_short >= -max_short,
+        PerpMode::Neutral | PerpMode::Rotate => worst_long <= max_long && worst_short >= -max_short,
     }
 }
 
@@ -158,7 +158,7 @@ fn trim_violation_side(
                 None
             }
         }
-        PerpMode::Neutral => {
+        PerpMode::Neutral | PerpMode::Rotate => {
             if worst_long > max_long {
                 Some(TrimSide::Bid)
             } else if worst_short < -max_short {
@@ -236,7 +236,7 @@ fn side_constraint_broken(config: &GridConfig, plan: &GridPlan) -> bool {
         PerpMode::Short => {
             plan.bids.is_empty() && plan.target_position.is_some_and(|t| t < Decimal::ZERO)
         }
-        PerpMode::Neutral => false,
+        PerpMode::Neutral | PerpMode::Rotate => false,
     }
 }
 

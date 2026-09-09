@@ -81,6 +81,7 @@ pub enum PerpMode {
     Neutral,
     Long,
     Short,
+    Rotate,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
@@ -2059,6 +2060,13 @@ impl Side {
         match self {
             Self::Bid => "BID",
             Self::Ask => "ASK",
+        }
+    }
+
+    pub fn opposite(self) -> Self {
+        match self {
+            Self::Bid => Self::Ask,
+            Self::Ask => Self::Bid,
         }
     }
 }
@@ -5578,6 +5586,7 @@ mod tests {
             (PerpMode::Long, dec!(100), dec!(0.02)),
             (PerpMode::Short, dec!(100), dec!(-0.02)),
             (PerpMode::Neutral, dec!(100), Decimal::ZERO),
+            (PerpMode::Rotate, dec!(100), Decimal::ZERO),
         ];
         for (mode, mid, expected_target) in cases {
             let plan = build_plan(

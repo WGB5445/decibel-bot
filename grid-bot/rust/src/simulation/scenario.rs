@@ -69,6 +69,7 @@ pub enum ScenarioPerpMode {
     Neutral,
     Long,
     Short,
+    Rotate,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -203,6 +204,7 @@ impl Scenario {
             ScenarioPerpMode::Neutral => PerpMode::Neutral,
             ScenarioPerpMode::Long => PerpMode::Long,
             ScenarioPerpMode::Short => PerpMode::Short,
+            ScenarioPerpMode::Rotate => PerpMode::Rotate,
         };
         let range = match self.config.range.clone() {
             ScenarioRange::Percent { percent } => RangeSpec::Percent { percent },
